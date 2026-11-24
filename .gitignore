@@ -1,0 +1,20 @@
+# Rust
+/target/
+
+# SQLite databases & journals
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Runtime logs & secrets
+/logs/
+client_secret.json
+gphotos_token.json
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
