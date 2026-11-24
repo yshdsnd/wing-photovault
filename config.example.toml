@@ -1,0 +1,69 @@
+# WING PhotoVault 設定サンプル
+# コピーして wing-photovault.toml として編集してください。
+
+[general]
+db_path = "./wing-photovault.db"
+log_dir = "./logs"
+# 最優先: JPEG, Canon RAW (CR3, CR2, CRW), 任意: HEIF
+image_exts = [".jpg", ".jpeg", ".cr3", ".cr2", ".crw", ".hif", ".heif", ".heic"]
+video_exts = [".mp4", ".mov", ".m4v"]
+
+[scan]
+incremental = true
+follow_symlinks = false
+
+[hash]
+# "blake3" (高速・推奨) または "sha256"
+algorithm = "blake3"
+partial_hash_enabled = true
+
+[performance]
+ssd_io_workers = 4
+hdd_io_workers = 1
+nas_io_workers = 2
+cpu_workers = 0
+db_batch_size = 1000
+
+[exif]
+# "auto" (ネイティブ優先 + ExifToolフォールバック) | "native" | "exiftool" | "none"
+backend = "auto"
+exiftool_path = ""
+
+[exif.lens_aliases]
+# "Canon RF200-800mm F6.3-9 IS USM" = "RF200-800mm F6.3-9 IS USM"
+
+# 複数ストレージ定義（同一階層に複数ドライブ登録可能、UNCパス対応）
+[[storages]]
+id = "hdd_archive_f"
+root = 'F:\Photos'
+media = "hdd"
+tier = "archive"
+exclude_paths = []
+
+[[storages]]
+id = "ssd_hot_g"
+root = 'G:\Photos'
+media = "nvme"
+tier = "hot"
+exclude_paths = []
+
+[[storages]]
+id = "ssd_hot_i"
+root = 'I:\Photos'
+media = "nvme"
+tier = "hot"
+exclude_paths = []
+
+[[storages]]
+id = "ssd_hot_j"
+root = 'J:\Photos'
+media = "nvme"
+tier = "hot"
+exclude_paths = []
+
+[[storages]]
+id = "nas_backup_eagle"
+root = '\\eagle\photos'
+media = "nas"
+tier = "backup"
+exclude_paths = []

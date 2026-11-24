@@ -1,0 +1,17 @@
+[package]
+name = "wing-photovault-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+wing-photovault-core = { path = "../wing-photovault-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

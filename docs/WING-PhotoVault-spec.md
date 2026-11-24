@@ -58,7 +58,11 @@ WING-UIはGUIフロントエンド、WING-CLI / WING-Coreは独立して動作�
 - Maintainability: 過度な抽象化を避け、性能上の複雑化は測定に基づく。
 
 ## 4. 技術要件
-WING-CLI / WING-Core: Windows 11 x64、Rust Stable、Cargo、ネイティブCLI（`wingpv`）、SQLite WAL、TOML、JSON/JSONL、構造化ログ。同期I/Oとワーカースレッドを基本とし、unsafeは原則使用しない。
+WING-CLI / WING-Core: Windows 11 x64（主対象）、Rust Stable、Cargo、ネイティブCLI（`wingpv`）、SQLite WAL、TOML、JSON/JSONL、構造化ログ。同期I/Oとワーカースレッドを基本とし、unsafeは原則使用しない。
+
+NAS ローカルスキャン / リモートエージェント想定環境:
+- **FreeBSD 15.x**（`eagle`: メインバックアップNAS。Rustネイティブビルドによりローカルスキャン・将来の常駐エージェントに対応）
+- **Linux（旧カーネル / `armv7l`）**（`Saturn`: ASUSTOR NAS, Linux 3.10 / armv7l。32bit環境を意識しファイルサイズ等は `u64` で扱い、`musl` 静的ビルドによるローカルスキャンまたは Windows からの SMB 経由スキャンをフォールバックとする）
 
 WING-UI: Windows 11 x64、Python 3.12+ / PySide6 / uvを候補とする（未確定）。初期連携はCLI。
 
@@ -66,10 +70,10 @@ WING-UI: Windows 11 x64、Python 3.12+ / PySide6 / uvを候補とする（未確
 
 ## 5. WING-Core / WING-CLI 機能仕様
 ### 5.1 スキャン
-複数ドライブを横断し、パス、名前、サイズ、作成・更新日時、形式、ハッシュ、EXIF、階層、存在状態を登録する。初回・差分・完全検証に対応し、未変更ファイルの再解析を省略する。アクセス不能なストレージを削除済みとみなさない。スキャンは写真ファイルを変更しない。
+複数のストレージ（複数NVMe SSD、HDD、NAS等）を横断し、パス、名前、サイズ、作成・更新日時、形式、ハッシュ、EXIF、階層、存在状態を登録する。既存のフォルダ構造（`YYYY/YYYY_MM_DD/`、`100EOSR5` 等のカメラサブフォルダ、NAS上の旧形式 `YYYY/MM_DD/` や `JPEG/`・`RAW/` 分割など）は原則そのまま維持し、まずはどのストレージにどのファイルがあるかを非破壊でマッピングする。レタッチ済み観賞用ワークフォルダ等は初期は除外設定で対象外とし、将来的にファイル名やEXIFからオリジナルAssetと関連付け（derivativeマッピング）できる拡張余地を残す。初回・差分・完全検証に対応し、未変更ファイルの再解析を省略する。アクセス不能なストレージを削除済みとみなさない。スキャンは写真ファイルを変更しない。
 
 ### 5.2 取り込み
-カード、カメラ、任意ディレクトリからSSD Hotへコピーする。標準配置は `YYYY/YYYY_MM_DD/`。日付はEXIF、mtime、実行日、明示指定から選択。サイズ・ハッシュ検証後DB登録。元ファイルはデフォルトで保持し、異内容の同名ファイルを上書きしない。
+カード、カメラ、任意ディレクトリからSSD Hotへコピーする。標準配置は `YYYY/YYYY_MM_DD/` とし、カメラサブフォルダ（`100EOSR5` 等）によるファイル名衝突回避も考慮する。日付はEXIF、mtime、実行日、明示指定から選択。サイズ・ハッシュ検証後DB登録。元ファイルはデフォルトで保持し、異内容の同名ファイルを上書きしない。
 
 ### 5.3 重複検出・隔離
 サイズ→必要に応じ部分ハッシュ→全体ハッシュ→必要に応じバイト比較。SHA-256/BLAKE3は実測で選定しアルゴリズム識別子も保存する。検出と隔離を分離し、保持ポリシーまたは明示指定に従う。意図的なNASバックアップは除外。直接削除せず隔離し、元パス、理由、日時、保持ファイルを記録して復元可能にする。
@@ -89,13 +93,22 @@ WING-UI: Windows 11 x64、Python 3.12+ / PySide6 / uvを候補とする（未確
 | Backup | NASバックアップ |
 | Quarantine | 重複・不要ファイルの隔離 |
 
-撮影日時等とSSD容量上限を基準にHotからArchiveへ移動する。Hot固定に対応し、Asset IDは維持する。
+撮影日時等とSSD容量上限を基準にHotからArchiveへ移動する。Hot固定に対応し、Asset IDは維持する。同一階層に複数のストレージ（例: 複数台のNVMe SSD）を登録可能とする。
 
-### 5.7 NASバックアップ
-SMB/UNC/マップ済みドライブへの増分コピー。未バックアップ、処理中、完了、検証済み、更新あり、エラー、アクセス不能を管理する。階層移動でNASコピーを不要に再作成しない。デフォルトでは削除を伝播させない。robocopy利用はファイル単位の結果・検証管理が可能なことを条件とする。
+### 5.7 NASバックアップ・リモートスキャン
+SMB/UNC（例: `\\eagle\...`）およびマップ済みドライブの両方に対応した増分コピー。ドライブ文字の変更に影響されにくいよう、設定上の固定ストレージIDとボリューム/共有識別情報で管理する。バックアップ済み判定は相対パス一致ではなく Content（ハッシュ）一致を基本とし、過去データのフォルダ構造差（`YYYY/MM_DD` や `JPEG/`・`RAW/` 分割等）があっても二重バックアップを防ぐ。未バックアップ、処理中、完了、検証済み、更新あり、エラー、アクセス不能を管理する。階層移動でNASコピーを不要に再作成しない。デフォルトでは削除を伝播させない。robocopy利用はファイル単位の結果・検証管理が可能なことを条件とする。
 
-### 5.8 EXIF
-撮影日時・サブ秒、カメラメーカー・機種・識別情報、レンズ、焦点距離・35mm換算、F値、シャッター速度、ISO、露出補正、画像サイズ、GPS、形式、動画解像度・fps・時間等を取得。表記ゆらぎを正規化する。Rustネイティブ解析とExifToolを候補とし、CR3/MakerNote対応を重点検証する。
+NAS上の大量ファイルのスキャン・ハッシュ検証は、SMB越しの全量転送を避けるため NAS ホスト側でのローカル実行を想定する:
+- **Step 1（JSONL連携）**: NAS 上で `wingpv` をローカル実行してスキャン結果（パス・サイズ・更新日時・ハッシュ・EXIF）を標準 JSONL 形式で出力し、Windows 側 DB へ取り込む（SSH 経由パイプ取り込みを含む）。
+- **Step 2（常駐エージェント）**: 必要に応じて FreeBSD（`rc.d`）/ Linux（`systemd` 等）向けの常駐エージェントデーモン（`wingpv-agent`）を実装し、差分スキャン指示・進捗取得・コピー後ハッシュ検証をリモート実行できるようにする。
+
+### 5.8 EXIF・対応ファイル形式
+対応形式の優先度:
+- **最優先**: JPEG（`.jpg`, `.jpeg`）、Canon RAW（`.cr3`, `.cr2`）、および `.crw`（優先度低め）
+- **可能なら対応**: HEIF（`.heif`, `.heic`, `.hif`）、動画（`.mp4`, `.mov`, `.m4v`）
+- **初期対象外（拡張余地を残す）**: Canon 以外のメーカーの RAW（実機検証不可のため初期は対象外とするが、拡張子設定とパーサ抽象化により将来追加可能にする）
+
+撮影日時・サブ秒、カメラメーカー・機種・識別情報、レンズ、焦点距離・35mm換算、F値、シャッター速度、ISO、露出補正、画像サイズ、GPS、形式、動画解像度・fps・時間等を取得。表記ゆらぎを正規化する。速度を最重視しつつ、Rustネイティブ解析（JPEG / CR2 / CR3 の高速パス）と ExifTool 常駐モード（網羅性・フォールバック・比較検証用）を実験・ベンチマークしながら選定・併用する。
 
 ### 5.9 検索・統計
 撮影期間、機材、焦点距離、F値、シャッター速度、ISO、形式、階層、バックアップ状態、評価、タグ、連写グループで検索する。JSON/CSV出力、指定先へのコピー・移動に対応する。
@@ -175,15 +188,44 @@ CLIから検索・統計・進捗・結果・エラーを構造化出力し、�
 [general]
 db_path = "./wing-photovault.db"
 log_dir = "./logs"
-image_exts = [".jpg", ".jpeg", ".cr3", ".cr2", ".dng", ".arw", ".nef"]
+image_exts = [".jpg", ".jpeg", ".cr3", ".cr2", ".crw", ".hif", ".heif", ".heic"]
 video_exts = [".mp4", ".mov", ".m4v"]
 [paths]
-scan_roots = ['D:\Photos\Inbox', 'E:\CameraImport']
-ssd_hot_dir = 'D:\PhotoVault\Hot_SSD'
-hdd_archive_dir = 'H:\PhotoVault\Archive_HDD'
-quarantine_dir = 'D:\PhotoVault\_Quarantine'
-nas_backup_dir = '\\nas\photo_backup'
-gphotos_temp_dir = 'D:\PhotoVault\_GPhotosQueue'
+quarantine_dir = 'G:\PhotoVault\_Quarantine'
+gphotos_temp_dir = 'G:\PhotoVault\_GPhotosQueue'
+
+# 複数ストレージ定義（同一階層に複数ドライブ登録可能、UNCパス対応）
+[[storages]]
+id = "hdd_archive_f"
+root = 'F:\Photos'
+media = "hdd"
+tier = "archive"
+exclude_paths = ['F:\Photos\_Showcase']
+
+[[storages]]
+id = "ssd_hot_g"
+root = 'G:\Photos'
+media = "nvme"
+tier = "hot"
+exclude_paths = ['G:\Photos\_Showcase']
+
+[[storages]]
+id = "ssd_hot_i"
+root = 'I:\Photos'
+media = "nvme"
+tier = "hot"
+
+[[storages]]
+id = "ssd_hot_j"
+root = 'J:\Photos'
+media = "nvme"
+tier = "hot"
+
+[[storages]]
+id = "nas_backup_eagle"
+root = '\\eagle\photos'
+media = "nas"
+tier = "backup"
 [import]
 directory_template = "%Y/%Y_%m_%d"
 date_source = "exif"
