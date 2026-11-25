@@ -47,6 +47,12 @@ pub struct UpsertFileInput {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct PairReport {
+    pub pairs_merged: u64,
+    pub ambiguous_skipped: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ScanRunSummary {
     pub scan_run_id: i64,
     pub storage_id: String,
@@ -59,6 +65,7 @@ pub struct ScanRunSummary {
     pub files_missing: u64,
     pub bytes_hashed: u64,
     pub error_count: u64,
+    pub raw_jpeg_merged: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -622,6 +629,174 @@ impl Database {
         Ok(n as u64)
     }
 
+    /// Pair high-confidence RAW + JPEG/HEIF files within a storage into a single logical Asset.
+    ///
+    /// Rules (Fail Closed / never merge when ambiguous):
+    /// - Same directory OR sibling `RAW` / `JPEG` (`JPG`) directories under the same parent.
+    /// - Case-insensitive `file_stem` match.
+    /// - Both files have non-null identical `captured_at`.
+    /// - If both have `camera_model`, `camera_serial`, or `captured_subsec`, they must match.
+    /// - Exactly 1 RAW asset and 1 Image asset must match for a given bucket; otherwise skipped.
+    pub fn pair_raw_jpeg_assets(&mut self, storage_id: &str) -> DbResult<PairReport> {
+        #[derive(Debug, Clone)]
+        struct Candidate {
+            asset_id: i64,
+            media_kind: String,
+            rel_path: String,
+            file_stem: String,
+            captured_at: Option<String>,
+            captured_subsec: Option<String>,
+            camera_model: Option<String>,
+            camera_serial: Option<String>,
+            priority_score: i64,
+        }
+
+        let candidates: Vec<Candidate> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.asset_id, c.media_kind, f.rel_path, f.file_stem,
+                        a.captured_at, a.captured_subsec, a.camera_model, a.camera_serial,
+                        (CASE WHEN a.rating > 0 OR a.pick_status != 'unreviewed' OR a.is_favorite != 0 OR a.hot_pinned != 0 THEN 1 ELSE 0 END)
+                 FROM files f
+                 JOIN contents c ON c.id = f.content_id
+                 JOIN assets a ON a.id = f.asset_id
+                 WHERE f.storage_id = ?1
+                   AND f.presence = 'present'
+                   AND c.media_kind IN ('raw', 'image')",
+            )?;
+            let rows = stmt.query_map(params![storage_id], |r| {
+                Ok(Candidate {
+                    asset_id: r.get(0)?,
+                    media_kind: r.get(1)?,
+                    rel_path: r.get(2)?,
+                    file_stem: r.get(3)?,
+                    captured_at: r.get(4)?,
+                    captured_subsec: r.get(5)?,
+                    camera_model: r.get(6)?,
+                    camera_serial: r.get(7)?,
+                    priority_score: r.get(8)?,
+                })
+            })?;
+            let mut list = Vec::new();
+            for row in rows {
+                list.push(row?);
+            }
+            list
+        };
+
+        // Group by (pairing_folder_key, lowercase_stem)
+        let mut buckets: HashMap<(String, String), (Vec<Candidate>, Vec<Candidate>)> = HashMap::new();
+        for cand in candidates {
+            let folder_key = pairing_folder_key(&cand.rel_path, &cand.media_kind);
+            let stem_key = cand.file_stem.to_ascii_lowercase();
+            let entry = buckets.entry((folder_key, stem_key)).or_default();
+            if cand.media_kind == "raw" {
+                entry.0.push(cand);
+            } else {
+                entry.1.push(cand);
+            }
+        }
+
+        let mut report = PairReport::default();
+        let mut merges: Vec<(i64, i64)> = Vec::new(); // (keep_asset_id, absorb_asset_id)
+
+        for (_key, (raws, images)) in buckets {
+            if raws.is_empty() || images.is_empty() {
+                continue;
+            }
+            // Must be unambiguous 1-to-1 within this folder+stem bucket
+            if raws.len() != 1 || images.len() != 1 {
+                report.ambiguous_skipped += 1;
+                continue;
+            }
+            let r = &raws[0];
+            let i = &images[0];
+            if r.asset_id == i.asset_id {
+                continue; // Already merged
+            }
+
+            // Require non-null identical captured_at
+            let (Some(r_dt), Some(i_dt)) = (&r.captured_at, &i.captured_at) else {
+                report.ambiguous_skipped += 1;
+                continue;
+            };
+            if r_dt != i_dt {
+                report.ambiguous_skipped += 1;
+                continue;
+            }
+
+            // If both sides have camera_model / camera_serial / captured_subsec, they must match
+            if !opt_eq_if_both(&r.camera_model, &i.camera_model)
+                || !opt_eq_if_both(&r.camera_serial, &i.camera_serial)
+                || !opt_eq_if_both(&r.captured_subsec, &i.captured_subsec)
+            {
+                report.ambiguous_skipped += 1;
+                continue;
+            }
+
+            // Prefer asset with user curation (rating/pick/favorite/pin), then smaller id for determinism
+            let (keep, absorb) = if r.priority_score > i.priority_score
+                || (r.priority_score == i.priority_score && r.asset_id < i.asset_id)
+            {
+                (r.asset_id, i.asset_id)
+            } else {
+                (i.asset_id, r.asset_id)
+            };
+            merges.push((keep, absorb));
+        }
+
+        if merges.is_empty() {
+            return Ok(report);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        for (keep, absorb) in merges {
+            // Backfill any NULL metadata on the surviving asset from the absorbed asset
+            tx.execute(
+                "UPDATE assets SET
+                    captured_at = COALESCE(captured_at, (SELECT captured_at FROM assets WHERE id = ?2)),
+                    captured_subsec = COALESCE(captured_subsec, (SELECT captured_subsec FROM assets WHERE id = ?2)),
+                    camera_make = COALESCE(camera_make, (SELECT camera_make FROM assets WHERE id = ?2)),
+                    camera_model = COALESCE(camera_model, (SELECT camera_model FROM assets WHERE id = ?2)),
+                    camera_serial = COALESCE(camera_serial, (SELECT camera_serial FROM assets WHERE id = ?2)),
+                    lens_model_raw = COALESCE(lens_model_raw, (SELECT lens_model_raw FROM assets WHERE id = ?2)),
+                    lens_model = COALESCE(lens_model, (SELECT lens_model FROM assets WHERE id = ?2)),
+                    focal_length_mm = COALESCE(focal_length_mm, (SELECT focal_length_mm FROM assets WHERE id = ?2)),
+                    focal_length_35mm = COALESCE(focal_length_35mm, (SELECT focal_length_35mm FROM assets WHERE id = ?2)),
+                    f_number = COALESCE(f_number, (SELECT f_number FROM assets WHERE id = ?2)),
+                    shutter_speed_s = COALESCE(shutter_speed_s, (SELECT shutter_speed_s FROM assets WHERE id = ?2)),
+                    shutter_speed_str = COALESCE(shutter_speed_str, (SELECT shutter_speed_str FROM assets WHERE id = ?2)),
+                    iso = COALESCE(iso, (SELECT iso FROM assets WHERE id = ?2)),
+                    exposure_bias = COALESCE(exposure_bias, (SELECT exposure_bias FROM assets WHERE id = ?2)),
+                    width = COALESCE(width, (SELECT width FROM assets WHERE id = ?2)),
+                    height = COALESCE(height, (SELECT height FROM assets WHERE id = ?2)),
+                    orientation = COALESCE(orientation, (SELECT orientation FROM assets WHERE id = ?2)),
+                    gps_lat = COALESCE(gps_lat, (SELECT gps_lat FROM assets WHERE id = ?2)),
+                    gps_lon = COALESCE(gps_lon, (SELECT gps_lon FROM assets WHERE id = ?2)),
+                    updated_at = ?3
+                 WHERE id = ?1",
+                params![keep, absorb, now],
+            )?;
+
+            // Re-point all files (across all storages, including NAS backups) from absorb -> keep
+            tx.execute(
+                "UPDATE files SET asset_id = ?1, updated_at = ?3 WHERE asset_id = ?2",
+                params![keep, absorb, now],
+            )?;
+
+            // Delete the absorbed asset only if no files still reference it
+            tx.execute(
+                "DELETE FROM assets WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM files WHERE asset_id = ?1)",
+                params![absorb],
+            )?;
+
+            report.pairs_merged += 1;
+        }
+        tx.commit()?;
+
+        Ok(report)
+    }
+
     pub fn status(&self) -> DbResult<StatusReport> {
         let schema_version: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -838,6 +1013,37 @@ impl Database {
     }
 }
 
+fn opt_eq_if_both(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+/// Normalize parent directory for RAW+JPEG pairing.
+/// Supports both same-directory pairs (`2026/2026_11_24/IMG_0001.{CR3,JPG}`)
+/// and legacy sibling `RAW/` + `JPEG/` (`JPG/`) folders (`2015/08_10/RAW/IMG_0001.CR2` + `2015/08_10/JPEG/IMG_0001.JPG`).
+fn pairing_folder_key(rel_path: &str, media_kind: &str) -> String {
+    let dir = match rel_path.rfind('/') {
+        Some(idx) => &rel_path[..idx],
+        None => "",
+    };
+    let (parent, leaf) = match dir.rfind('/') {
+        Some(idx) => (&dir[..idx], &dir[idx + 1..]),
+        None => ("", dir),
+    };
+    let leaf_lower = leaf.to_ascii_lowercase();
+    let is_split_dir = (media_kind == "raw" && leaf_lower == "raw")
+        || (media_kind == "image" && (leaf_lower == "jpeg" || leaf_lower == "jpg"));
+
+    let chosen = if is_split_dir { parent } else { dir };
+    if cfg!(windows) {
+        chosen.to_ascii_lowercase()
+    } else {
+        chosen.to_string()
+    }
+}
+
 fn configure_connection(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -1007,5 +1213,177 @@ mod tests {
             )
             .unwrap();
         assert_eq!(verified_before, verified_after);
+    }
+
+    #[test]
+    fn pairs_same_dir_and_sibling_raw_jpeg_and_rejects_mismatches() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("main-pc", "Main PC", "windows").unwrap();
+        let hot = StorageConfig {
+            id: "ssd_hot_g".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Nvme,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&hot, "main-pc", StorageStatus::Online)
+            .unwrap();
+        let run1 = db.start_scan_run(&hot.id, "incremental").unwrap();
+
+        let make_item = |rel_path: &str,
+                         stem: &str,
+                         ext: &str,
+                         kind: MediaKind,
+                         fmt: &str,
+                         hash: &str,
+                         dt: Option<&str>,
+                         cam: Option<&str>,
+                         lens: Option<&str>| UpsertFileInput {
+            storage_id: hot.id.clone(),
+            rel_path: rel_path.into(),
+            file_name: format!("{stem}{ext}"),
+            file_stem: stem.into(),
+            ext: ext.into(),
+            byte_size: 1000,
+            mtime_ns: 1000,
+            ctime_ns: None,
+            media_kind: kind,
+            format: fmt.into(),
+            role: FileRole::Original,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: dt.map(|d| ExtractedMetadata {
+                extractor: "native".into(),
+                captured_at: Some(d.into()),
+                camera_model: cam.map(String::from),
+                lens_model: lens.map(String::from),
+                ..Default::default()
+            }),
+        };
+
+        let items = vec![
+            // Pair 1: same directory (CR3 missing lens, JPG has lens -> backfill)
+            make_item(
+                "2026/2026_11_22/1M5A1060.CR3",
+                "1M5A1060",
+                ".cr3",
+                MediaKind::Raw,
+                "cr3",
+                "h1",
+                Some("2026-11-22T11:58:45"),
+                Some("Canon EOS R5m2"),
+                None,
+            ),
+            make_item(
+                "2026/2026_11_22/1M5A1060.JPG",
+                "1M5A1060",
+                ".jpg",
+                MediaKind::Image,
+                "jpeg",
+                "h2",
+                Some("2026-11-22T11:58:45"),
+                Some("Canon EOS R5m2"),
+                Some("RF200-800mm F6.3-9 IS USM"),
+            ),
+            // Pair 2: legacy sibling RAW/ and JPEG/ directories
+            make_item(
+                "2015/08_10/RAW/IMG_0002.CR2",
+                "IMG_0002",
+                ".cr2",
+                MediaKind::Raw,
+                "cr2",
+                "h3",
+                Some("2015-08-10T09:00:00"),
+                Some("Canon EOS 7D Mark II"),
+                Some("EF100-400mm"),
+            ),
+            make_item(
+                "2015/08_10/JPEG/IMG_0002.JPG",
+                "IMG_0002",
+                ".jpg",
+                MediaKind::Image,
+                "jpeg",
+                "h4",
+                Some("2015-08-10T09:00:00"),
+                Some("Canon EOS 7D Mark II"),
+                Some("EF100-400mm"),
+            ),
+            // Mismatch 1: different camera models -> must NOT pair
+            make_item(
+                "2026/2026_11_22/IMG_9999.CR3",
+                "IMG_9999",
+                ".cr3",
+                MediaKind::Raw,
+                "cr3",
+                "h5",
+                Some("2026-11-22T12:00:00"),
+                Some("Canon EOS R5"),
+                None,
+            ),
+            make_item(
+                "2026/2026_11_22/IMG_9999.JPG",
+                "IMG_9999",
+                ".jpg",
+                MediaKind::Image,
+                "jpeg",
+                "h6",
+                Some("2026-11-22T12:00:00"),
+                Some("Canon EOS R6"),
+                None,
+            ),
+            // Mismatch 2: missing EXIF date on CRW -> must NOT pair
+            make_item(
+                "2004/2004_05_01/CRW_0010.CRW",
+                "CRW_0010",
+                ".crw",
+                MediaKind::Raw,
+                "crw",
+                "h7",
+                None,
+                None,
+                None,
+            ),
+            make_item(
+                "2004/2004_05_01/CRW_0010.JPG",
+                "CRW_0010",
+                ".jpg",
+                MediaKind::Image,
+                "jpeg",
+                "h8",
+                Some("2004-05-01T10:00:00"),
+                Some("Canon EOS 10D"),
+                None,
+            ),
+        ];
+
+        db.upsert_scanned_batch(&items, run1).unwrap();
+        assert_eq!(db.stats().unwrap().total_assets, 8);
+
+        let rep = db.pair_raw_jpeg_assets(&hot.id).unwrap();
+        assert_eq!(rep.pairs_merged, 2);
+        assert_eq!(rep.ambiguous_skipped, 2);
+
+        let st = db.stats().unwrap();
+        assert_eq!(st.total_present_files, 8);
+        assert_eq!(st.total_contents, 8); // RAW and JPEG remain distinct contents
+        assert_eq!(st.total_assets, 6); // 8 - 2 merged = 6 logical assets
+
+        // Verify lens backfill on Pair 1
+        let pair1_rows = db
+            .find(&FindFilter {
+                lens: Some("RF200-800".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(pair1_rows.len(), 2);
+        assert_eq!(pair1_rows[0].asset_id, pair1_rows[1].asset_id);
+
+        // Idempotent second run
+        let rep2 = db.pair_raw_jpeg_assets(&hot.id).unwrap();
+        assert_eq!(rep2.pairs_merged, 0);
     }
 }

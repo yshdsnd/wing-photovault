@@ -457,6 +457,8 @@ fn cmd_scan(
         scan_pb.finish_and_clear();
 
         summary.files_missing = db.mark_unseen_as_missing(&storage.id, scan_run_id)?;
+        let pair_report = db.pair_raw_jpeg_assets(&storage.id)?;
+        summary.raw_jpeg_merged = pair_report.pairs_merged;
         db.finish_scan_run(&summary, None)?;
 
         info!(
@@ -467,6 +469,7 @@ fn cmd_scan(
             updated = summary.files_updated,
             skipped = summary.files_skipped,
             missing = summary.files_missing,
+            raw_jpeg_merged = summary.raw_jpeg_merged,
             "scan completed"
         );
         summaries.push(summary);
@@ -483,7 +486,7 @@ fn cmd_scan(
             OutputFormat::Text => {
                 for s in &summaries {
                     println!(
-                        "[{}] mode={} scanned={} added={} updated={} skipped={} missing={} hashed={} errors={}",
+                        "[{}] mode={} scanned={} added={} updated={} skipped={} missing={} paired={} hashed={} errors={}",
                         s.storage_id,
                         s.mode,
                         s.files_scanned,
@@ -491,6 +494,7 @@ fn cmd_scan(
                         s.files_updated,
                         s.files_skipped,
                         s.files_missing,
+                        s.raw_jpeg_merged,
                         human_bytes(s.bytes_hashed),
                         s.error_count,
                     );
