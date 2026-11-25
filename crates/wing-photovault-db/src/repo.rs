@@ -433,14 +433,21 @@ impl Database {
                 )?;
             }
 
-            // 3. Resolve asset_id: reuse existing asset linked to this content (e.g. backup copy on NAS)
-            let existing_asset_id: Option<i64> = tx
+            // 3. Resolve asset_id:
+            //    (a) reuse existing asset linked to this exact content (e.g. backup copy on NAS)
+            //    (b) otherwise, perform O(1) indexed in-batch RAW+JPEG pairing so even an
+            //        interrupted scan commits already-paired logical assets.
+            let mut existing_asset_id: Option<i64> = tx
                 .query_row(
                     "SELECT asset_id FROM files WHERE content_id = ?1 AND asset_id IS NOT NULL LIMIT 1",
                     params![content_id],
                     |r| r.get(0),
                 )
                 .optional()?;
+
+            if existing_asset_id.is_none() {
+                existing_asset_id = find_in_batch_raw_jpeg_asset(&tx, item)?;
+            }
 
             let asset_id = if let Some(aid) = existing_asset_id {
                 if let Some(meta) = item.metadata.as_ref() {
@@ -1020,6 +1027,83 @@ fn opt_eq_if_both(a: &Option<String>, b: &Option<String>) -> bool {
     }
 }
 
+/// Fast O(1) indexed lookup for a confident RAW<->JPEG partner already present in the DB
+/// (including earlier items in the same `upsert_scanned_batch` transaction).
+/// Returns `Some(asset_id)` only when exactly one unambiguous partner matches.
+fn find_in_batch_raw_jpeg_asset(
+    tx: &rusqlite::Transaction<'_>,
+    item: &UpsertFileInput,
+) -> DbResult<Option<i64>> {
+    let partner_kind = match item.media_kind {
+        MediaKind::Raw => "image",
+        MediaKind::Image => "raw",
+        _ => return Ok(None),
+    };
+    let Some(meta) = item.metadata.as_ref() else {
+        return Ok(None);
+    };
+    let Some(captured_at) = meta.captured_at.as_deref() else {
+        return Ok(None);
+    };
+
+    let stem_upper = item.file_stem.to_ascii_uppercase();
+    let stem_lower = item.file_stem.to_ascii_lowercase();
+    let target_folder = pairing_folder_key(&item.rel_path, item.media_kind.as_str());
+
+    let mut stmt = tx.prepare_cached(
+        "SELECT f.asset_id, f.rel_path, a.camera_model, a.camera_serial, a.captured_subsec
+         FROM files f
+         JOIN contents c ON c.id = f.content_id
+         JOIN assets a ON a.id = f.asset_id
+         WHERE f.file_stem IN (?1, ?2, ?3)
+           AND f.storage_id = ?4
+           AND f.presence = 'present'
+           AND c.media_kind = ?5
+           AND a.captured_at = ?6",
+    )?;
+
+    let rows = stmt.query_map(
+        params![
+            item.file_stem,
+            stem_upper,
+            stem_lower,
+            item.storage_id,
+            partner_kind,
+            captured_at,
+        ],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        },
+    )?;
+
+    let mut matched_asset_id: Option<i64> = None;
+    for row in rows {
+        let (aid, rel_path, cam, serial, subsec) = row?;
+        if pairing_folder_key(&rel_path, partner_kind) != target_folder {
+            continue;
+        }
+        if !opt_eq_if_both(&meta.camera_model, &cam)
+            || !opt_eq_if_both(&meta.camera_serial, &serial)
+            || !opt_eq_if_both(&meta.captured_subsec, &subsec)
+        {
+            continue;
+        }
+        match matched_asset_id {
+            None => matched_asset_id = Some(aid),
+            Some(prev) if prev == aid => {}
+            Some(_) => return Ok(None), // Ambiguous: multiple distinct partner assets
+        }
+    }
+
+    Ok(matched_asset_id)
+}
+
 /// Normalize parent directory for RAW+JPEG pairing.
 /// Supports both same-directory pairs (`2026/2026_11_24/IMG_0001.{CR3,JPG}`)
 /// and legacy sibling `RAW/` + `JPEG/` (`JPG/`) folders (`2015/08_10/RAW/IMG_0001.CR2` + `2015/08_10/JPEG/IMG_0001.JPG`).
@@ -1361,10 +1445,16 @@ mod tests {
         ];
 
         db.upsert_scanned_batch(&items, run1).unwrap();
-        assert_eq!(db.stats().unwrap().total_assets, 8);
+        // In-batch pairing already merged Pair 1 (same dir) and Pair 2 (sibling RAW/JPEG)
+        // while keeping the 2 mismatches separate: 8 files -> 6 logical assets immediately!
+        let st_immediate = db.stats().unwrap();
+        assert_eq!(st_immediate.total_present_files, 8);
+        assert_eq!(st_immediate.total_contents, 8);
+        assert_eq!(st_immediate.total_assets, 6);
 
+        // Post-scan sweep is idempotent and reports 0 additional merges
         let rep = db.pair_raw_jpeg_assets(&hot.id).unwrap();
-        assert_eq!(rep.pairs_merged, 2);
+        assert_eq!(rep.pairs_merged, 0);
         assert_eq!(rep.ambiguous_skipped, 2);
 
         let st = db.stats().unwrap();
