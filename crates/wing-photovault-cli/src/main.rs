@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
 use tracing::{info, warn};
@@ -126,7 +128,14 @@ fn main() -> Result<()> {
             storage,
             full,
             export_jsonl,
-        } => cmd_scan(&cli.config, storage.as_deref(), full, export_jsonl, cli.format),
+        } => cmd_scan(
+            &cli.config,
+            storage.as_deref(),
+            full,
+            export_jsonl,
+            cli.quiet,
+            cli.format,
+        ),
         Commands::Status => cmd_status(&cli.config, cli.format),
         Commands::Stats => cmd_stats(&cli.config, cli.format),
         Commands::Find {
@@ -240,6 +249,7 @@ fn cmd_scan(
     storage_filter: Option<&str>,
     full: bool,
     export_jsonl: bool,
+    quiet: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let cfg = Config::load(config_path)
@@ -281,7 +291,21 @@ fn cmd_scan(
         let started = Instant::now();
 
         let existing = db.load_storage_file_index(&storage.id)?;
+
+        let discover_pb = if quiet {
+            ProgressBar::hidden()
+        } else {
+            let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} [{prefix}] Discovering files... {elapsed_precise}")
+                    .unwrap(),
+            );
+            pb.set_prefix(storage.id.clone());
+            pb.enable_steady_tick(Duration::from_millis(120));
+            pb
+        };
         let discovery = discover_storage_files(storage, &allowed_exts, cfg.scan.follow_symlinks);
+        discover_pb.finish_and_clear();
         let mut summary = ScanRunSummary {
             scan_run_id,
             storage_id: storage.id.clone(),
@@ -326,6 +350,28 @@ fn cmd_scan(
         let batch_size = cfg.performance.db_batch_size.max(1);
         let role = storage.tier.default_file_role();
 
+        let total_to_process = to_process.len() as u64;
+        let scan_pb = if quiet || total_to_process == 0 {
+            ProgressBar::hidden()
+        } else {
+            let pb = ProgressBar::with_draw_target(
+                Some(total_to_process),
+                ProgressDrawTarget::stderr(),
+            );
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{prefix}] [{bar:30.cyan/blue}] {pos}/{len} files ({msg}) ETA {eta}",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            pb.set_prefix(storage.id.clone());
+            pb.set_message("0 B");
+            pb
+        };
+        let bytes_counter = AtomicU64::new(0);
+        let proc_started = Instant::now();
+
         for chunk in to_process.chunks(batch_size) {
             let results: Vec<Result<(UpsertFileInput, u64)>> = pool.install(|| {
                 chunk
@@ -337,6 +383,17 @@ fn cmd_scan(
                             cfg.hash.partial_hash_enabled,
                         )?;
                         let meta = extract_metadata(&f.abs_path, &f.ext, &cfg.exif);
+                        let done_bytes =
+                            bytes_counter.fetch_add(hash.bytes_read, Ordering::Relaxed)
+                                + hash.bytes_read;
+                        scan_pb.inc(1);
+                        let secs = proc_started.elapsed().as_secs_f64().max(0.001);
+                        let mb_s = (done_bytes as f64 / 1_000_000.0) / secs;
+                        scan_pb.set_message(format!(
+                            "{}, {:.1} MB/s",
+                            human_bytes(done_bytes),
+                            mb_s
+                        ));
                         let input = UpsertFileInput {
                             storage_id: storage.id.clone(),
                             rel_path: f.rel_path.clone(),
@@ -396,6 +453,8 @@ fn cmd_scan(
             summary.files_added += added;
             summary.files_updated += updated;
         }
+
+        scan_pb.finish_and_clear();
 
         summary.files_missing = db.mark_unseen_as_missing(&storage.id, scan_run_id)?;
         db.finish_scan_run(&summary, None)?;
