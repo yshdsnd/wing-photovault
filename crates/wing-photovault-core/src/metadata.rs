@@ -126,7 +126,11 @@ fn extract_cr3_native(path: &Path) -> Option<ExtractedMetadata> {
                 if file.read_exact(&mut raw).is_ok() {
                     let mut cur = Cursor::new(raw);
                     if let Ok(exif) = exif::Reader::new().read_from_container(&mut cur) {
-                        populate_from_exif(&exif, &mut meta);
+                        if &box_type == b"CMT2" {
+                            populate_from_cr3_cmt2(&exif, &mut meta);
+                        } else {
+                            populate_from_exif(&exif, &mut meta);
+                        }
                         parsed_any = true;
                     }
                 }
@@ -186,6 +190,118 @@ fn read_box_header(file: &mut File, pos: u64, limit: u64) -> Option<([u8; 4], u6
         return None;
     }
     Some((box_type, payload_start, box_end))
+}
+
+/// Canon CR3 stores ExifIFD tags directly in IFD0 of the `CMT2` TIFF box (without an ExifIFD pointer),
+/// so `kamadak-exif` tags them with `Context::Tiff`. Match by raw EXIF tag number here.
+fn populate_from_cr3_cmt2(exif: &exif::Exif, meta: &mut ExtractedMetadata) {
+    for field in exif.fields() {
+        if field.ifd_num != In::PRIMARY {
+            continue;
+        }
+        match field.tag.number() {
+            0x9003 => {
+                // DateTimeOriginal takes precedence over CMT1 DateTime
+                if let Some(dt) = value_as_ascii(&field.value) {
+                    meta.captured_at = Some(normalize_exif_datetime(&dt));
+                }
+            }
+            0x9004 if meta.captured_at.is_none() => {
+                if let Some(dt) = value_as_ascii(&field.value) {
+                    meta.captured_at = Some(normalize_exif_datetime(&dt));
+                }
+            }
+            0x9291 => {
+                if let Some(s) = value_as_ascii(&field.value) {
+                    meta.captured_subsec = Some(s);
+                }
+            }
+            0x9292 if meta.captured_subsec.is_none() => {
+                if let Some(s) = value_as_ascii(&field.value) {
+                    meta.captured_subsec = Some(s);
+                }
+            }
+            0x829A => {
+                if let Value::Rational(v) = &field.value {
+                    if let Some(r) = v.first() {
+                        if r.denom != 0 {
+                            meta.shutter_speed_s = Some(r.num as f64 / r.denom as f64);
+                            meta.shutter_speed_str = Some(format_shutter(r.num, r.denom));
+                        }
+                    }
+                }
+            }
+            0x829D => {
+                if let Value::Rational(v) = &field.value {
+                    if let Some(r) = v.first() {
+                        if r.denom != 0 {
+                            meta.f_number = Some(r.num as f64 / r.denom as f64);
+                        }
+                    }
+                }
+            }
+            0x8827 => {
+                if let Some(iso) = field.value.get_uint(0) {
+                    meta.iso = Some(iso as i64);
+                }
+            }
+            0x9204 => {
+                if let Value::SRational(v) = &field.value {
+                    if let Some(r) = v.first() {
+                        if r.denom != 0 {
+                            meta.exposure_bias = Some(r.num as f64 / r.denom as f64);
+                        }
+                    }
+                }
+            }
+            0x920A => {
+                if let Value::Rational(v) = &field.value {
+                    if let Some(r) = v.first() {
+                        if r.denom != 0 {
+                            meta.focal_length_mm = Some(r.num as f64 / r.denom as f64);
+                        }
+                    }
+                }
+            }
+            0xA002 => {
+                if let Some(w) = field.value.get_uint(0) {
+                    meta.width = Some(w as i64);
+                }
+            }
+            0xA003 => {
+                if let Some(h) = field.value.get_uint(0) {
+                    meta.height = Some(h as i64);
+                }
+            }
+            0xA405 => {
+                if let Some(fl35) = field.value.get_uint(0) {
+                    meta.focal_length_35mm = Some(fl35 as f64);
+                }
+            }
+            0xA431 => {
+                if let Some(serial) = value_as_ascii(&field.value) {
+                    meta.camera_serial = Some(serial);
+                }
+            }
+            0xA434 => {
+                if let Some(lens) = value_as_ascii(&field.value) {
+                    meta.lens_model_raw = Some(lens);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn value_as_ascii(value: &Value) -> Option<String> {
+    match value {
+        Value::Ascii(items) => items
+            .first()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(|s| s.trim_matches('\0').trim().to_string())
+            .filter(|s| !s.is_empty()),
+        _ => None,
+    }
 }
 
 fn populate_from_exif(exif: &exif::Exif, meta: &mut ExtractedMetadata) {
@@ -421,5 +537,52 @@ mod tests {
     fn formats_shutter_speeds() {
         assert_eq!(format_shutter(1, 2000), "1/2000");
         assert_eq!(format_shutter(2, 1), "2s");
+    }
+
+    #[test]
+    fn parses_cr3_cmt2_exif_tags_stored_in_ifd0() {
+        // Minimal little-endian TIFF (CMT2 layout) with ISO (0x8827) and LensModel (0xA434) in IFD0
+        let lens = b"RF200-800mm F6.3-9 IS USM\0";
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II"); // Little endian
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset = 8
+
+        let num_entries: u16 = 2;
+        tiff.extend_from_slice(&num_entries.to_le_bytes());
+        // Value data offset = 8 + 2 + 2*12 + 4 = 38
+        let lens_offset: u32 = 38;
+
+        // Entry 1: ISO (0x8827), SHORT (3), count 1, value 2500
+        tiff.extend_from_slice(&0x8827u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&2500u16.to_le_bytes());
+        tiff.extend_from_slice(&0u16.to_le_bytes());
+
+        // Entry 2: LensModel (0xA434), ASCII (2), count lens.len(), offset lens_offset
+        tiff.extend_from_slice(&0xA434u16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(lens.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&lens_offset.to_le_bytes());
+
+        // Next IFD offset = 0
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(tiff.len(), lens_offset as usize);
+        tiff.extend_from_slice(lens);
+
+        let mut cur = Cursor::new(tiff);
+        let exif = exif::Reader::new().read_from_container(&mut cur).unwrap();
+        let mut meta = ExtractedMetadata {
+            extractor: "native-cr3".into(),
+            ..Default::default()
+        };
+        populate_from_cr3_cmt2(&exif, &mut meta);
+
+        assert_eq!(meta.iso, Some(2500));
+        assert_eq!(
+            meta.lens_model_raw.as_deref(),
+            Some("RF200-800mm F6.3-9 IS USM")
+        );
     }
 }

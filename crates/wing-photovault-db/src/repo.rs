@@ -436,6 +436,59 @@ impl Database {
                 .optional()?;
 
             let asset_id = if let Some(aid) = existing_asset_id {
+                if let Some(meta) = item.metadata.as_ref() {
+                    tx.execute(
+                        "UPDATE assets SET
+                            captured_at = COALESCE(?1, captured_at),
+                            captured_subsec = COALESCE(?2, captured_subsec),
+                            camera_make = COALESCE(?3, camera_make),
+                            camera_model = COALESCE(?4, camera_model),
+                            camera_serial = COALESCE(?5, camera_serial),
+                            lens_model_raw = COALESCE(?6, lens_model_raw),
+                            lens_model = COALESCE(?7, lens_model),
+                            focal_length_mm = COALESCE(?8, focal_length_mm),
+                            focal_length_35mm = COALESCE(?9, focal_length_35mm),
+                            f_number = COALESCE(?10, f_number),
+                            shutter_speed_s = COALESCE(?11, shutter_speed_s),
+                            shutter_speed_str = COALESCE(?12, shutter_speed_str),
+                            iso = COALESCE(?13, iso),
+                            exposure_bias = COALESCE(?14, exposure_bias),
+                            width = COALESCE(?15, width),
+                            height = COALESCE(?16, height),
+                            orientation = COALESCE(?17, orientation),
+                            gps_lat = COALESCE(?18, gps_lat),
+                            gps_lon = COALESCE(?19, gps_lon),
+                            duration_ms = COALESCE(?20, duration_ms),
+                            fps = COALESCE(?21, fps),
+                            updated_at = ?22
+                         WHERE id = ?23",
+                        params![
+                            meta.captured_at.as_deref(),
+                            meta.captured_subsec.as_deref(),
+                            meta.camera_make.as_deref(),
+                            meta.camera_model.as_deref(),
+                            meta.camera_serial.as_deref(),
+                            meta.lens_model_raw.as_deref(),
+                            meta.lens_model.as_deref(),
+                            meta.focal_length_mm,
+                            meta.focal_length_35mm,
+                            meta.f_number,
+                            meta.shutter_speed_s,
+                            meta.shutter_speed_str.as_deref(),
+                            meta.iso,
+                            meta.exposure_bias,
+                            meta.width,
+                            meta.height,
+                            meta.orientation,
+                            meta.gps_lat,
+                            meta.gps_lon,
+                            meta.duration_ms,
+                            meta.fps,
+                            now,
+                            aid,
+                        ],
+                    )?;
+                }
                 aid
             } else {
                 let public_id = Uuid::now_v7().to_string();
