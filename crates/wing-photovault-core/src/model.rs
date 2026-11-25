@@ -65,6 +65,95 @@ impl fmt::Display for StorageTier {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessMode {
+    #[default]
+    Managed,
+    ReadOnly,
+}
+
+impl AccessMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::ReadOnly => "read_only",
+        }
+    }
+}
+
+impl fmt::Display for AccessMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupMode {
+    #[default]
+    None,
+    Managed,
+    External,
+}
+
+impl BackupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Managed => "managed",
+            Self::External => "external",
+        }
+    }
+}
+
+impl fmt::Display for BackupMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageStatus {
+    #[default]
+    Online,
+    Offline,
+    Failed,
+    Retired,
+}
+
+impl StorageStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+            Self::Failed => "failed",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+impl fmt::Display for StorageStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn current_host_os() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "other"
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileRole {
@@ -72,6 +161,7 @@ pub enum FileRole {
     Backup,
     Quarantined,
     Exported,
+    Sidecar,
 }
 
 impl FileRole {
@@ -81,16 +171,18 @@ impl FileRole {
             Self::Backup => "backup",
             Self::Quarantined => "quarantined",
             Self::Exported => "exported",
+            Self::Sidecar => "sidecar",
         }
     }
 }
 
+/// File-level presence, strictly separated from StorageStatus (online/offline/failed/retired).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Presence {
     Present,
     Missing,
-    Offline,
+    Corrupted,
 }
 
 impl Presence {
@@ -98,7 +190,7 @@ impl Presence {
         match self {
             Self::Present => "present",
             Self::Missing => "missing",
-            Self::Offline => "offline",
+            Self::Corrupted => "corrupted",
         }
     }
 }

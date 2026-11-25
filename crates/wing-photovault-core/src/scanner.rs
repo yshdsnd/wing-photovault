@@ -159,7 +159,7 @@ fn normalize_for_prefix_match(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MediaType, StorageTier};
+    use crate::model::{AccessMode, BackupMode, MediaType, StorageTier};
     use std::fs;
     use tempfile::tempdir;
 
@@ -181,6 +181,9 @@ mod tests {
             root: dir.path().to_path_buf(),
             media: MediaType::Nvme,
             tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: Some("pc-nvme-test".into()),
             exclude_paths: vec![skip_dir],
         };
         let exts: HashSet<String> = [".jpg", ".cr3"].into_iter().map(String::from).collect();

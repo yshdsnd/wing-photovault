@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
-use crate::model::{HashAlgorithm, MediaType, StorageTier};
+use crate::model::{AccessMode, BackupMode, HashAlgorithm, MediaType, StorageTier};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub host: HostConfig,
     #[serde(default)]
     pub general: GeneralConfig,
     #[serde(default)]
@@ -21,6 +23,23 @@ pub struct Config {
     pub exif: ExifConfig,
     #[serde(default)]
     pub storages: Vec<StorageConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostConfig {
+    #[serde(default = "default_host_id")]
+    pub id: String,
+    #[serde(default = "default_host_name")]
+    pub name: String,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            id: default_host_id(),
+            name: default_host_name(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,7 +173,25 @@ pub struct StorageConfig {
     pub media: MediaType,
     pub tier: StorageTier,
     #[serde(default)]
+    pub access_mode: AccessMode,
+    #[serde(default)]
+    pub backup_mode: BackupMode,
+    #[serde(default)]
+    pub failure_domain: Option<String>,
+    #[serde(default)]
     pub exclude_paths: Vec<PathBuf>,
+}
+
+impl StorageConfig {
+    /// Core invariant (Fail Closed): read_only or external backup storages are never mutable by WING.
+    pub fn allows_mutation(&self) -> bool {
+        self.access_mode == AccessMode::Managed && self.backup_mode != BackupMode::External
+    }
+
+    /// Core invariant: read_only, backup tier, or external backup storages are excluded from duplicate quarantine.
+    pub fn allows_duplicate_quarantine(&self) -> bool {
+        self.allows_mutation() && self.tier != StorageTier::Backup
+    }
 }
 
 impl Config {
@@ -165,21 +202,33 @@ impl Config {
         })?;
         let cfg: Config = toml::from_str(&raw).map_err(|source| CoreError::ConfigParse {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })?;
         cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn validate(&self) -> CoreResult<()> {
+        if self.host.id.trim().is_empty() {
+            return Err(CoreError::ConfigInvalid("host.id must not be empty".into()));
+        }
         let mut ids = HashSet::new();
         for s in &self.storages {
             if s.id.trim().is_empty() {
-                return Err(CoreError::ConfigInvalid("storage id must not be empty".into()));
+                return Err(CoreError::ConfigInvalid(
+                    "storage id must not be empty".into(),
+                ));
             }
             if !ids.insert(s.id.as_str()) {
                 return Err(CoreError::ConfigInvalid(format!(
                     "duplicate storage id: {}",
+                    s.id
+                )));
+            }
+            // Fail Closed: external backups must never be configured as writable/managed
+            if s.backup_mode == BackupMode::External && s.access_mode != AccessMode::ReadOnly {
+                return Err(CoreError::ConfigInvalid(format!(
+                    "storage '{}' has backup_mode = 'external' and must set access_mode = 'read_only'",
                     s.id
                 )));
             }
@@ -202,6 +251,19 @@ impl Config {
             })
             .collect()
     }
+}
+
+fn default_host_id() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "local-host".to_string())
+        .to_ascii_lowercase()
+}
+
+fn default_host_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "local-host".to_string())
 }
 
 fn default_db_path() -> PathBuf {
@@ -246,4 +308,61 @@ fn default_nas_workers() -> usize {
 
 fn default_db_batch_size() -> usize {
     1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_external_backup_with_managed_access_mode() {
+        let cfg = Config {
+            host: HostConfig::default(),
+            general: GeneralConfig::default(),
+            scan: ScanConfig::default(),
+            hash: HashConfig::default(),
+            performance: PerformanceConfig::default(),
+            exif: ExifConfig::default(),
+            storages: vec![StorageConfig {
+                id: "nas_ext".into(),
+                root: PathBuf::from(r"\\eagle\photos"),
+                media: MediaType::Nas,
+                tier: StorageTier::Backup,
+                access_mode: AccessMode::Managed,
+                backup_mode: BackupMode::External,
+                failure_domain: Some("nas-eagle".into()),
+                exclude_paths: vec![],
+            }],
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn enforces_read_only_and_backup_invariants() {
+        let ext = StorageConfig {
+            id: "nas_ext".into(),
+            root: PathBuf::from(r"\\eagle\photos"),
+            media: MediaType::Nas,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: Some("nas-eagle".into()),
+            exclude_paths: vec![],
+        };
+        assert!(!ext.allows_mutation());
+        assert!(!ext.allows_duplicate_quarantine());
+
+        let managed_backup = StorageConfig {
+            id: "nas_mgr".into(),
+            root: PathBuf::from(r"\\eagle\photos2"),
+            media: MediaType::Nas,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::Managed,
+            failure_domain: Some("nas-eagle".into()),
+            exclude_paths: vec![],
+        };
+        assert!(managed_backup.allows_mutation());
+        assert!(!managed_backup.allows_duplicate_quarantine());
+    }
 }

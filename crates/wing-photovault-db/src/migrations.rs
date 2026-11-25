@@ -3,7 +3,14 @@ use rusqlite::{params, Connection};
 
 use crate::error::DbResult;
 
-const MIGRATIONS: &[(i64, &str, &str)] = &[(1, "v1_initial_schema", V1_INITIAL_SCHEMA)];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "v1_initial_schema", V1_INITIAL_SCHEMA),
+    (
+        2,
+        "v2_multihost_permissions_and_verification",
+        V2_MULTIHOST_PERMISSIONS_AND_VERIFICATION,
+    ),
+];
 
 const V1_INITIAL_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS storages (
@@ -134,6 +141,42 @@ CREATE INDEX IF NOT EXISTS idx_contents_format ON contents(format);
 CREATE INDEX IF NOT EXISTS idx_assets_captured_at ON assets(captured_at);
 CREATE INDEX IF NOT EXISTS idx_assets_camera_lens ON assets(camera_model, lens_model);
 CREATE INDEX IF NOT EXISTS idx_assets_rating_pick ON assets(rating, pick_status);
+"#;
+
+const V2_MULTIHOST_PERMISSIONS_AND_VERIFICATION: &str = r#"
+CREATE TABLE IF NOT EXISTS hosts (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    os              TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS storage_mounts (
+    storage_id      TEXT NOT NULL REFERENCES storages(id) ON DELETE CASCADE,
+    host_id         TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    root_path       TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (storage_id, host_id)
+);
+
+ALTER TABLE storages ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'managed';
+ALTER TABLE storages ADD COLUMN backup_mode TEXT NOT NULL DEFAULT 'none';
+ALTER TABLE storages ADD COLUMN status TEXT NOT NULL DEFAULT 'online';
+ALTER TABLE storages ADD COLUMN failure_domain TEXT;
+
+ALTER TABLE assets ADD COLUMN public_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_public_id ON assets(public_id);
+
+ALTER TABLE files ADD COLUMN last_seen_at TEXT;
+ALTER TABLE files ADD COLUMN last_verified_at TEXT;
+
+-- Separate storage offline state from file-level presence
+UPDATE files SET presence = 'present' WHERE presence = 'offline';
+
+CREATE INDEX IF NOT EXISTS idx_assets_captured_id ON assets(captured_at DESC, id ASC);
+CREATE INDEX IF NOT EXISTS idx_files_last_verified ON files(storage_id, last_verified_at);
 "#;
 
 pub fn run_migrations(conn: &mut Connection) -> DbResult<()> {

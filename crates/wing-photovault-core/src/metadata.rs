@@ -14,6 +14,9 @@ const CANON_CR3_UUID: [u8; 16] = [
     0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48,
 ];
 
+/// Hard upper bound on ISOBMFF box iterations to guard against malformed/malicious CR3 inputs.
+const MAX_BOX_ITERATIONS: usize = 1024;
+
 pub fn extract_metadata(path: &Path, ext: &str, cfg: &ExifConfig) -> Option<ExtractedMetadata> {
     let mut meta = match cfg.backend {
         ExifBackend::None => None,
@@ -83,8 +86,10 @@ fn extract_cr3_native(path: &Path) -> Option<ExtractedMetadata> {
     let (moov_start, moov_end) = find_box(&mut file, 0, file_len, b"moov")?;
     let mut cursor = moov_start;
     let mut uuid_payload_range = None;
+    let mut iter_count = 0usize;
 
-    while cursor + 8 <= moov_end {
+    while cursor + 8 <= moov_end && iter_count < MAX_BOX_ITERATIONS {
+        iter_count += 1;
         let (box_type, payload_start, box_end) = read_box_header(&mut file, cursor, moov_end)?;
         if &box_type == b"uuid" && box_end - payload_start >= 16 {
             file.seek(SeekFrom::Start(payload_start)).ok()?;
@@ -109,7 +114,9 @@ fn extract_cr3_native(path: &Path) -> Option<ExtractedMetadata> {
     let mut parsed_any = false;
 
     let mut pos = cmt_start;
-    while pos + 8 <= cmt_end {
+    let mut cmt_iters = 0usize;
+    while pos + 8 <= cmt_end && cmt_iters < MAX_BOX_ITERATIONS {
+        cmt_iters += 1;
         let (box_type, payload_start, box_end) = read_box_header(&mut file, pos, cmt_end)?;
         if &box_type == b"CMT1" || &box_type == b"CMT2" || &box_type == b"CMT4" {
             let size = (box_end - payload_start) as usize;
@@ -140,7 +147,9 @@ fn extract_cr3_native(path: &Path) -> Option<ExtractedMetadata> {
 
 fn find_box(file: &mut File, start: u64, end: u64, target: &[u8; 4]) -> Option<(u64, u64)> {
     let mut pos = start;
-    while pos + 8 <= end {
+    let mut iters = 0usize;
+    while pos + 8 <= end && iters < MAX_BOX_ITERATIONS {
+        iters += 1;
         let (box_type, payload_start, box_end) = read_box_header(file, pos, end)?;
         if &box_type == target {
             return Some((payload_start, box_end));
@@ -332,7 +341,7 @@ pub fn extract_exiftool(path: &Path, exiftool_path: &str) -> Option<ExtractedMet
     };
 
     let output = Command::new(bin)
-        .args(["-json", "-n", "-charset", "filename=UTF8"])
+        .args(["-json", "-n", "-charset", "filename=UTF8", "--"])
         .arg(path)
         .output()
         .ok()?;

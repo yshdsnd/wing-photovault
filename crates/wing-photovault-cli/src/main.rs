@@ -12,7 +12,10 @@ use tracing_subscriber::EnvFilter;
 use wing_photovault_core::config::{Config, ExifBackend, StorageConfig};
 use wing_photovault_core::hashing::hash_file;
 use wing_photovault_core::metadata::{extract_exiftool, extract_metadata, extract_native};
-use wing_photovault_core::model::{HashAlgorithm, MediaType, ScanManifestRecord, StorageTier};
+use wing_photovault_core::model::{
+    current_host_os, AccessMode, BackupMode, HashAlgorithm, MediaType, ScanManifestRecord,
+    StorageStatus, StorageTier,
+};
 use wing_photovault_core::scanner::{discover_storage_files, DiscoveredFile};
 use wing_photovault_db::{Database, FindFilter, ScanRunSummary, UpsertFileInput};
 
@@ -175,6 +178,7 @@ fn load_config_or_default(path: &Path) -> Result<Config> {
         Config::load(path).with_context(|| format!("failed to load config: {}", path.display()))
     } else {
         Ok(Config {
+            host: Default::default(),
             general: Default::default(),
             scan: Default::default(),
             hash: Default::default(),
@@ -197,9 +201,15 @@ fn cmd_init(config_path: &Path, write_config: bool, format: OutputFormat) -> Res
     let db = Database::open(&cfg.general.db_path)
         .with_context(|| format!("failed to open DB: {}", cfg.general.db_path.display()))?;
 
+    db.upsert_host(&cfg.host.id, &cfg.host.name, current_host_os())?;
+
     for s in &cfg.storages {
-        let accessible = s.root.exists();
-        db.upsert_storage(s, accessible)?;
+        let status = if s.root.exists() {
+            StorageStatus::Online
+        } else {
+            StorageStatus::Offline
+        };
+        db.upsert_storage(s, &cfg.host.id, status)?;
     }
 
     #[derive(Serialize)]
@@ -235,12 +245,13 @@ fn cmd_scan(
     let cfg = Config::load(config_path)
         .with_context(|| format!("failed to load config: {}", config_path.display()))?;
     let mut db = Database::open(&cfg.general.db_path)?;
+    db.upsert_host(&cfg.host.id, &cfg.host.name, current_host_os())?;
     let allowed_exts = cfg.normalized_extensions();
 
     let targets: Vec<&StorageConfig> = cfg
         .storages
         .iter()
-        .filter(|s| storage_filter.map_or(true, |id| s.id == id))
+        .filter(|s| storage_filter.is_none_or(|id| s.id == id))
         .collect();
 
     if targets.is_empty() {
@@ -259,13 +270,13 @@ fn cmd_scan(
             warn!(
                 storage_id = %storage.id,
                 root = %storage.root.display(),
-                "storage root is not accessible; skipping without marking files missing"
+                "storage root is offline/inaccessible; skipping without marking files missing"
             );
-            db.upsert_storage(storage, false)?;
+            db.upsert_storage(storage, &cfg.host.id, StorageStatus::Offline)?;
             continue;
         }
 
-        db.upsert_storage(storage, true)?;
+        db.upsert_storage(storage, &cfg.host.id, StorageStatus::Online)?;
         let scan_run_id = db.start_scan_run(&storage.id, mode)?;
         let started = Instant::now();
 
@@ -454,13 +465,16 @@ fn cmd_status(config_path: &Path, format: OutputFormat) -> Result<()> {
             println!("\nStorages:");
             for s in &st.storages {
                 println!(
-                    "  - {:<18} [{:<7} / {:<4}] present={:<7} missing={:<5} size={:<10} root={}",
+                    "  - {:<18} [{:<7} / {:<4} / {:<9} / {:<7}] present={:<7} missing={:<5} size={:<10} domain={} root={}",
                     s.storage_id,
                     s.tier,
                     s.media_type,
+                    s.access_mode,
+                    s.status,
                     s.present_files,
                     s.missing_files,
                     human_bytes(s.total_bytes.max(0) as u64),
+                    s.failure_domain.as_deref().unwrap_or("-"),
                     s.root_path
                 );
             }
@@ -560,6 +574,9 @@ fn cmd_benchmark(
         root: target_path.to_path_buf(),
         media: MediaType::Nvme,
         tier: StorageTier::Hot,
+        access_mode: AccessMode::ReadOnly,
+        backup_mode: BackupMode::None,
+        failure_domain: None,
         exclude_paths: Vec::new(),
     };
 

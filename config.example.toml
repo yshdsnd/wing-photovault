@@ -1,6 +1,11 @@
 # WING PhotoVault 設定サンプル
 # コピーして wing-photovault.toml として編集してください。
 
+[host]
+# マルチホスト識別用の固定ID（空の場合はホスト名ベースで自動設定）
+id = "main-pc"
+name = "Main Windows PC"
+
 [general]
 db_path = "./wing-photovault.db"
 log_dir = "./logs"
@@ -33,11 +38,17 @@ exiftool_path = ""
 # "Canon RF200-800mm F6.3-9 IS USM" = "RF200-800mm F6.3-9 IS USM"
 
 # 複数ストレージ定義（同一階層に複数ドライブ登録可能、UNCパス対応）
+# access_mode: "managed" | "read_only"
+# backup_mode: "none" | "managed" | "external"
+# failure_domain: 同一物理ディスク・同一筐体の識別子
 [[storages]]
 id = "hdd_archive_f"
 root = 'F:\Photos'
 media = "hdd"
 tier = "archive"
+access_mode = "managed"
+backup_mode = "none"
+failure_domain = "pc-hdd-f"
 exclude_paths = []
 
 [[storages]]
@@ -45,6 +56,9 @@ id = "ssd_hot_g"
 root = 'G:\Photos'
 media = "nvme"
 tier = "hot"
+access_mode = "managed"
+backup_mode = "none"
+failure_domain = "pc-nvme-g"
 exclude_paths = []
 
 [[storages]]
@@ -52,6 +66,9 @@ id = "ssd_hot_i"
 root = 'I:\Photos'
 media = "nvme"
 tier = "hot"
+access_mode = "managed"
+backup_mode = "none"
+failure_domain = "pc-nvme-i"
 exclude_paths = []
 
 [[storages]]
@@ -59,6 +76,9 @@ id = "ssd_hot_j"
 root = 'J:\Photos'
 media = "nvme"
 tier = "hot"
+access_mode = "managed"
+backup_mode = "none"
+failure_domain = "pc-nvme-j"
 exclude_paths = []
 
 [[storages]]
@@ -66,4 +86,7 @@ id = "nas_backup_eagle"
 root = '\\eagle\photos'
 media = "nas"
 tier = "backup"
+access_mode = "read_only"
+backup_mode = "external"
+failure_domain = "nas-eagle"
 exclude_paths = []

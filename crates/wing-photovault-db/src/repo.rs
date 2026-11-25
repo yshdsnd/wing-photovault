@@ -5,8 +5,11 @@ use std::path::Path;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use uuid::Uuid;
 use wing_photovault_core::config::StorageConfig;
-use wing_photovault_core::model::{ExtractedMetadata, FileRole, HashAlgorithm, MediaKind};
+use wing_photovault_core::model::{
+    ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, StorageStatus,
+};
 
 use crate::error::DbResult;
 use crate::migrations::run_migrations;
@@ -64,6 +67,10 @@ pub struct StorageStatsRow {
     pub root_path: String,
     pub media_type: String,
     pub tier: String,
+    pub access_mode: String,
+    pub backup_mode: String,
+    pub status: String,
+    pub failure_domain: Option<String>,
     pub present_files: i64,
     pub missing_files: i64,
     pub total_bytes: i64,
@@ -116,6 +123,7 @@ pub struct FindFilter {
 pub struct FindRow {
     pub file_id: i64,
     pub asset_id: Option<i64>,
+    pub asset_public_id: Option<String>,
     pub storage_id: String,
     pub rel_path: String,
     pub format: String,
@@ -149,17 +157,47 @@ impl Database {
         Ok(Self { conn })
     }
 
-    pub fn upsert_storage(&self, storage: &StorageConfig, seen_now: bool) -> DbResult<()> {
+    pub fn upsert_host(&self, host_id: &str, name: &str, os: &str) -> DbResult<()> {
         let now = Utc::now().to_rfc3339();
-        let last_seen = if seen_now { Some(now.as_str()) } else { None };
+        self.conn.execute(
+            "INSERT INTO hosts (id, name, os, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               os = excluded.os,
+               updated_at = excluded.updated_at",
+            params![host_id, name, os, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_storage(
+        &self,
+        storage: &StorageConfig,
+        host_id: &str,
+        status: StorageStatus,
+    ) -> DbResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let last_seen = if status == StorageStatus::Online {
+            Some(now.as_str())
+        } else {
+            None
+        };
         let root_str = storage.root.to_string_lossy();
         self.conn.execute(
-            "INSERT INTO storages (id, root_path, media_type, tier, last_seen_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            "INSERT INTO storages (
+                id, root_path, media_type, tier, access_mode, backup_mode,
+                status, failure_domain, last_seen_at, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
              ON CONFLICT(id) DO UPDATE SET
                root_path = excluded.root_path,
                media_type = excluded.media_type,
                tier = excluded.tier,
+               access_mode = excluded.access_mode,
+               backup_mode = excluded.backup_mode,
+               status = excluded.status,
+               failure_domain = COALESCE(excluded.failure_domain, storages.failure_domain),
                last_seen_at = COALESCE(excluded.last_seen_at, storages.last_seen_at),
                updated_at = excluded.updated_at",
             params![
@@ -167,9 +205,22 @@ impl Database {
                 root_str,
                 storage.media.as_str(),
                 storage.tier.as_str(),
+                storage.access_mode.as_str(),
+                storage.backup_mode.as_str(),
+                status.as_str(),
+                storage.failure_domain,
                 last_seen,
                 now
             ],
+        )?;
+
+        self.conn.execute(
+            "INSERT INTO storage_mounts (storage_id, host_id, root_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(storage_id, host_id) DO UPDATE SET
+               root_path = excluded.root_path,
+               updated_at = excluded.updated_at",
+            params![storage.id, host_id, root_str, now],
         )?;
         Ok(())
     }
@@ -244,6 +295,7 @@ impl Database {
         Ok(map)
     }
 
+    /// Updates existence check timestamp (`last_seen_at`) WITHOUT overwriting `last_verified_at`.
     pub fn touch_unchanged_files(&mut self, file_ids: &[i64], scan_run_id: i64) -> DbResult<()> {
         if file_ids.is_empty() {
             return Ok(());
@@ -252,7 +304,12 @@ impl Database {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "UPDATE files SET presence = 'present', last_seen_scan_id = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE files SET
+                    presence = 'present',
+                    last_seen_scan_id = ?1,
+                    last_seen_at = ?2,
+                    updated_at = ?2
+                 WHERE id = ?3",
             )?;
             for &fid in file_ids {
                 stmt.execute(params![scan_run_id, now, fid])?;
@@ -381,19 +438,21 @@ impl Database {
             let asset_id = if let Some(aid) = existing_asset_id {
                 aid
             } else {
+                let public_id = Uuid::now_v7().to_string();
                 let meta = item.metadata.as_ref();
                 tx.execute(
                     "INSERT INTO assets (
-                        captured_at, captured_subsec, camera_make, camera_model, camera_serial,
-                        lens_model_raw, lens_model, focal_length_mm, focal_length_35mm,
-                        f_number, shutter_speed_s, shutter_speed_str, iso, exposure_bias,
-                        width, height, orientation, gps_lat, gps_lon, duration_ms, fps,
-                        created_at, updated_at
+                        public_id, captured_at, captured_subsec, camera_make, camera_model,
+                        camera_serial, lens_model_raw, lens_model, focal_length_mm,
+                        focal_length_35mm, f_number, shutter_speed_s, shutter_speed_str,
+                        iso, exposure_bias, width, height, orientation, gps_lat, gps_lon,
+                        duration_ms, fps, created_at, updated_at
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                        ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22
+                        ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23
                      )",
                     params![
+                        public_id,
                         meta.and_then(|m| m.captured_at.as_deref()),
                         meta.and_then(|m| m.captured_subsec.as_deref()),
                         meta.and_then(|m| m.camera_make.as_deref()),
@@ -421,7 +480,7 @@ impl Database {
                 tx.last_insert_rowid()
             };
 
-            // 4. Upsert physical file record
+            // 4. Upsert physical file record (sets both last_seen_at and last_verified_at since content was hashed)
             let existed: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM files WHERE storage_id = ?1 AND rel_path = ?2",
@@ -444,6 +503,8 @@ impl Database {
                         role = ?9,
                         presence = 'present',
                         last_seen_scan_id = ?10,
+                        last_seen_at = ?11,
+                        last_verified_at = ?11,
                         updated_at = ?11
                      WHERE storage_id = ?12 AND rel_path = ?13",
                     params![
@@ -468,9 +529,10 @@ impl Database {
                     "INSERT INTO files (
                         storage_id, rel_path, file_name, file_stem, ext,
                         byte_size, mtime_ns, ctime_ns, content_id, asset_id,
-                        role, presence, last_seen_scan_id, created_at, updated_at
+                        role, presence, last_seen_scan_id, last_seen_at, last_verified_at,
+                        created_at, updated_at
                      ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'present', ?12, ?13, ?13
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'present', ?12, ?13, ?13, ?13, ?13
                      )",
                     params![
                         item.storage_id,
@@ -599,7 +661,7 @@ impl Database {
 
     pub fn find(&self, filter: &FindFilter) -> DbResult<Vec<FindRow>> {
         let mut sql = String::from(
-            "SELECT f.id, f.asset_id, f.storage_id, f.rel_path,
+            "SELECT f.id, f.asset_id, a.public_id, f.storage_id, f.rel_path,
                     COALESCE(c.format, f.ext), f.byte_size,
                     a.captured_at, a.camera_model, a.lens_model,
                     a.focal_length_mm, a.f_number, a.shutter_speed_str, a.iso
@@ -647,17 +709,18 @@ impl Database {
             Ok(FindRow {
                 file_id: r.get(0)?,
                 asset_id: r.get(1)?,
-                storage_id: r.get(2)?,
-                rel_path: r.get(3)?,
-                format: r.get(4)?,
-                byte_size: r.get(5)?,
-                captured_at: r.get(6)?,
-                camera_model: r.get(7)?,
-                lens_model: r.get(8)?,
-                focal_length_mm: r.get(9)?,
-                f_number: r.get(10)?,
-                shutter_speed_str: r.get(11)?,
-                iso: r.get(12)?,
+                asset_public_id: r.get(2)?,
+                storage_id: r.get(3)?,
+                rel_path: r.get(4)?,
+                format: r.get(5)?,
+                byte_size: r.get(6)?,
+                captured_at: r.get(7)?,
+                camera_model: r.get(8)?,
+                lens_model: r.get(9)?,
+                focal_length_mm: r.get(10)?,
+                f_number: r.get(11)?,
+                shutter_speed_str: r.get(12)?,
+                iso: r.get(13)?,
             })
         })?;
 
@@ -671,6 +734,7 @@ impl Database {
     fn storage_stats(&self) -> DbResult<Vec<StorageStatsRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.root_path, s.media_type, s.tier,
+                    s.access_mode, s.backup_mode, s.status, s.failure_domain,
                     COALESCE(SUM(CASE WHEN f.presence = 'present' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN f.presence = 'missing' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN f.presence = 'present' THEN f.byte_size ELSE 0 END), 0),
@@ -686,10 +750,14 @@ impl Database {
                 root_path: r.get(1)?,
                 media_type: r.get(2)?,
                 tier: r.get(3)?,
-                present_files: r.get(4)?,
-                missing_files: r.get(5)?,
-                total_bytes: r.get(6)?,
-                last_seen_at: r.get(7)?,
+                access_mode: r.get(4)?,
+                backup_mode: r.get(5)?,
+                status: r.get(6)?,
+                failure_domain: r.get(7)?,
+                present_files: r.get(8)?,
+                missing_files: r.get(9)?,
+                total_bytes: r.get(10)?,
+                last_seen_at: r.get(11)?,
             })
         })?;
 
@@ -732,30 +800,57 @@ fn configure_connection(conn: &Connection) -> DbResult<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use wing_photovault_core::model::{MediaType, StorageTier};
+    use wing_photovault_core::model::{AccessMode, BackupMode, MediaType, StorageTier};
 
     #[test]
     fn shares_content_and_asset_across_hot_and_backup_storages() {
         let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("main-pc", "Main PC", "windows").unwrap();
+        db.upsert_host("eagle", "Eagle NAS", "freebsd").unwrap();
+
         let hot = StorageConfig {
             id: "ssd_hot_g".into(),
             root: PathBuf::from(r"G:\Photos"),
             media: MediaType::Nvme,
             tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: Some("pc-nvme-g".into()),
             exclude_paths: vec![],
         };
-        let nas = StorageConfig {
+        let nas_win = StorageConfig {
             id: "nas_backup_eagle".into(),
             root: PathBuf::from(r"\\eagle\photos"),
             media: MediaType::Nas,
             tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: Some("nas-eagle".into()),
             exclude_paths: vec![],
         };
-        db.upsert_storage(&hot, true).unwrap();
-        db.upsert_storage(&nas, true).unwrap();
+        let mut nas_bsd = nas_win.clone();
+        nas_bsd.root = PathBuf::from("/tank/photos");
+
+        db.upsert_storage(&hot, "main-pc", StorageStatus::Online)
+            .unwrap();
+        db.upsert_storage(&nas_win, "main-pc", StorageStatus::Online)
+            .unwrap();
+        // Same storage mounted on FreeBSD host under POSIX path
+        db.upsert_storage(&nas_bsd, "eagle", StorageStatus::Online)
+            .unwrap();
+
+        let mount_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM storage_mounts WHERE storage_id = 'nas_backup_eagle'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mount_count, 2);
 
         let run1 = db.start_scan_run(&hot.id, "incremental").unwrap();
-        let run2 = db.start_scan_run(&nas.id, "incremental").unwrap();
+        let run2 = db.start_scan_run(&nas_win.id, "incremental").unwrap();
 
         let item_hot = UpsertFileInput {
             storage_id: hot.id.clone(),
@@ -781,9 +876,8 @@ mod tests {
             }),
         };
 
-        // Same content stored under legacy NAS folder layout
         let mut item_nas = item_hot.clone();
-        item_nas.storage_id = nas.id.clone();
+        item_nas.storage_id = nas_win.id.clone();
         item_nas.rel_path = "2026/11_24/RAW/IMG_0001.CR3".into();
         item_nas.role = FileRole::Backup;
 
@@ -795,5 +889,70 @@ mod tests {
         assert_eq!(stats.total_contents, 1);
         assert_eq!(stats.total_assets, 1);
         assert_eq!(stats.backed_up_contents, 1);
+
+        let rows = db.find(&FindFilter::default()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].asset_public_id.is_some());
+        assert_eq!(rows[0].asset_public_id, rows[1].asset_public_id);
+    }
+
+    #[test]
+    fn touch_unchanged_preserves_last_verified_at() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("main-pc", "Main PC", "windows").unwrap();
+        let hot = StorageConfig {
+            id: "ssd_hot_g".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Nvme,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&hot, "main-pc", StorageStatus::Online)
+            .unwrap();
+        let run1 = db.start_scan_run(&hot.id, "incremental").unwrap();
+
+        let item = UpsertFileInput {
+            storage_id: hot.id.clone(),
+            rel_path: "a.jpg".into(),
+            file_name: "a.jpg".into(),
+            file_stem: "a".into(),
+            ext: ".jpg".into(),
+            byte_size: 100,
+            mtime_ns: 1000,
+            ctime_ns: None,
+            media_kind: MediaKind::Image,
+            format: "jpeg".into(),
+            role: FileRole::Original,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: "00112233".into(),
+            partial_hash: None,
+            metadata: None,
+        };
+        db.upsert_scanned_batch(&[item], run1).unwrap();
+
+        let (fid, verified_before): (i64, String) = db
+            .conn
+            .query_row(
+                "SELECT id, last_verified_at FROM files WHERE rel_path = 'a.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        let run2 = db.start_scan_run(&hot.id, "incremental").unwrap();
+        db.touch_unchanged_files(&[fid], run2).unwrap();
+
+        let verified_after: String = db
+            .conn
+            .query_row(
+                "SELECT last_verified_at FROM files WHERE id = ?1",
+                params![fid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(verified_before, verified_after);
     }
 }

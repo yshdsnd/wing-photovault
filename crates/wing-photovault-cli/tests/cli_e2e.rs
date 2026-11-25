@@ -7,7 +7,7 @@ fn wingpv_bin() -> &'static str {
 }
 
 #[test]
-fn end_to_end_init_scan_incremental_and_queries() {
+fn end_to_end_init_scan_incremental_offline_and_queries() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     let hot_root = tmp.path().join("hot_ssd");
@@ -20,7 +20,7 @@ fn end_to_end_init_scan_incremental_and_queries() {
     fs::create_dir_all(&nas_day).unwrap();
     fs::create_dir_all(&showcase_dir).unwrap();
 
-    // Same CR3 payload stored on Hot SSD and legacy-layout NAS
+    // Same CR3 payload stored on Hot SSD and legacy-layout external read_only NAS
     fs::write(hot_day.join("IMG_0001.CR3"), b"dummy-cr3-payload-0001").unwrap();
     fs::write(nas_day.join("IMG_0001.CR3"), b"dummy-cr3-payload-0001").unwrap();
     // JPEG on Hot SSD only
@@ -31,6 +31,10 @@ fn end_to_end_init_scan_incremental_and_queries() {
     let config_path = tmp.path().join("wing-photovault.toml");
     let cfg = format!(
         r#"
+[host]
+id = "test-pc"
+name = "Test Windows PC"
+
 [general]
 db_path = '{}'
 
@@ -42,6 +46,9 @@ id = "ssd_hot"
 root = '{}'
 media = "nvme"
 tier = "hot"
+access_mode = "managed"
+backup_mode = "none"
+failure_domain = "pc-nvme-1"
 exclude_paths = ['{}']
 
 [[storages]]
@@ -49,6 +56,9 @@ id = "nas_backup"
 root = '{}'
 media = "nas"
 tier = "backup"
+access_mode = "read_only"
+backup_mode = "external"
+failure_domain = "nas-eagle"
 "#,
         db_path.display(),
         hot_root.display(),
@@ -114,7 +124,7 @@ tier = "backup"
     assert_eq!(stats["total_contents"], 2);
     assert_eq!(stats["backed_up_contents"], 1);
 
-    // 5. find --ext-format cr3
+    // 5. find --ext-format cr3 should include persistent asset_public_id
     let out = Command::new(wingpv_bin())
         .args([
             "--config",
@@ -129,9 +139,54 @@ tier = "backup"
         .unwrap();
     assert!(out.status.success());
     let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(rows.as_array().unwrap().len(), 2);
+    let arr = rows.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr[0]["asset_public_id"].as_str().is_some());
+    assert_eq!(arr[0]["asset_public_id"], arr[1]["asset_public_id"]);
 
-    // 6. benchmark
+    // 6. Invariant: offline storage must NOT mark its files as missing
+    let nas_hidden = tmp.path().join("nas_backup_offline");
+    fs::rename(&nas_root, &nas_hidden).unwrap();
+
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "scan",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["schema_version"], 2);
+    assert_eq!(status["total_missing_files"], 0);
+    let nas_row = status["storages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["storage_id"] == "nas_backup")
+        .unwrap();
+    assert_eq!(nas_row["status"], "offline");
+    assert_eq!(nas_row["access_mode"], "read_only");
+    assert_eq!(nas_row["backup_mode"], "external");
+    assert_eq!(nas_row["present_files"], 1);
+    assert_eq!(nas_row["missing_files"], 0);
+
+    // 7. benchmark
     let out = Command::new(wingpv_bin())
         .args([
             "--config",

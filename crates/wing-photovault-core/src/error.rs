@@ -14,7 +14,7 @@ pub enum CoreError {
     ConfigParse {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 
     #[error("invalid configuration: {0}")]

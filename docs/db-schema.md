@@ -36,7 +36,7 @@ erDiagram
 
 > **実装状況の注記**:
 > - **Migration v1**（実装済み）: `schema_migrations`, `storages`, `assets`, `contents`, `content_metadata`, `scan_runs`, `files` の基本構造。
-> - **Migration v2**（Step 2 で実装予定）: `hosts`, `storage_mounts`, `storages` の権限/状態/障害ドメイン、`assets.public_id`、`files` の `last_seen_at` / `last_verified_at` および `presence` の純化（`offline` をストレージ側へ分離）。
+> - **Migration v2**（実装済み）: `hosts`, `storage_mounts`, `storages` の権限/状態/障害ドメイン、`assets.public_id`、`files` の `last_seen_at` / `last_verified_at` および `presence` の純化（`offline` をストレージ側へ分離）。
 
 ### 3.1 `schema_migrations`
 適用済みマイグレーションのバージョン履歴を管理する。
