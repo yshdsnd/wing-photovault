@@ -300,3 +300,33 @@ pub struct ScanManifestRecord {
     pub partial_hash: Option<String>,
     pub metadata: Option<ExtractedMetadata>,
 }
+
+impl ScanManifestRecord {
+    /// Validate an imported manifest record as untrusted input (Security by Design).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.storage_id.trim().is_empty() || self.storage_id.len() > 128 {
+            return Err("invalid storage_id".into());
+        }
+        if self.rel_path.is_empty()
+            || self.rel_path.len() > 4096
+            || self.rel_path.starts_with('/')
+            || self.rel_path.starts_with('\\')
+            || self.rel_path.contains('\0')
+            || self.rel_path.contains('\\')
+        {
+            return Err(format!("invalid rel_path: {}", self.rel_path));
+        }
+        for comp in self.rel_path.split('/') {
+            if comp == ".." || comp == "." || comp.is_empty() {
+                return Err(format!("unsafe path component in rel_path: {}", self.rel_path));
+            }
+        }
+        if self.hash_hex.len() < 16
+            || self.hash_hex.len() > 128
+            || !self.hash_hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err("invalid hash_hex".into());
+        }
+        Ok(())
+    }
+}

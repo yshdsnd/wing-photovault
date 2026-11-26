@@ -8,7 +8,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use wing_photovault_core::config::StorageConfig;
 use wing_photovault_core::model::{
-    ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, StorageStatus,
+    ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, ScanManifestRecord, StorageStatus,
 };
 
 use crate::error::DbResult;
@@ -802,6 +802,101 @@ impl Database {
         tx.commit()?;
 
         Ok(report)
+    }
+
+    /// Stream all present files of a storage (with hash + metadata) to a callback as `ScanManifestRecord`s.
+    /// Avoids loading the entire catalog into memory (32-bit and million-file safe).
+    pub fn stream_storage_manifest<F>(
+        &self,
+        storage_id: &str,
+        mut on_record: F,
+    ) -> DbResult<u64>
+    where
+        F: FnMut(ScanManifestRecord) -> std::io::Result<()>,
+    {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.storage_id, f.rel_path, f.file_name, f.file_stem, f.ext,
+                    f.byte_size, f.mtime_ns, f.ctime_ns,
+                    c.media_kind, c.format, c.hash_algo, c.hash_hex, c.partial_hash,
+                    m.extractor, m.captured_at, m.captured_subsec,
+                    m.camera_make, m.camera_model, m.camera_serial,
+                    m.lens_model_raw, m.lens_model,
+                    m.focal_length_mm, m.focal_length_35mm, m.f_number,
+                    m.shutter_speed_s, m.shutter_speed_str, m.iso, m.exposure_bias,
+                    m.width, m.height, m.orientation, m.gps_lat, m.gps_lon,
+                    m.duration_ms, m.fps
+             FROM files f
+             JOIN contents c ON c.id = f.content_id
+             LEFT JOIN content_metadata m ON m.content_id = c.id
+             WHERE f.storage_id = ?1 AND f.presence = 'present'
+             ORDER BY f.id ASC",
+        )?;
+
+        let mut rows = stmt.query(params![storage_id])?;
+        let mut count = 0u64;
+
+        while let Some(r) = rows.next()? {
+            let kind_str: String = r.get(8)?;
+            let media_kind = match kind_str.as_str() {
+                "image" => MediaKind::Image,
+                "raw" => MediaKind::Raw,
+                "video" => MediaKind::Video,
+                _ => MediaKind::Other,
+            };
+            let algo_str: String = r.get(10)?;
+            let hash_algo = match algo_str.as_str() {
+                "sha256" => HashAlgorithm::Sha256,
+                _ => HashAlgorithm::Blake3,
+            };
+            let extractor: Option<String> = r.get(13)?;
+            let metadata = extractor.map(|ext_name| ExtractedMetadata {
+                extractor: ext_name,
+                captured_at: r.get(14).unwrap_or(None),
+                captured_subsec: r.get(15).unwrap_or(None),
+                camera_make: r.get(16).unwrap_or(None),
+                camera_model: r.get(17).unwrap_or(None),
+                camera_serial: r.get(18).unwrap_or(None),
+                lens_model_raw: r.get(19).unwrap_or(None),
+                lens_model: r.get(20).unwrap_or(None),
+                focal_length_mm: r.get(21).unwrap_or(None),
+                focal_length_35mm: r.get(22).unwrap_or(None),
+                f_number: r.get(23).unwrap_or(None),
+                shutter_speed_s: r.get(24).unwrap_or(None),
+                shutter_speed_str: r.get(25).unwrap_or(None),
+                iso: r.get(26).unwrap_or(None),
+                exposure_bias: r.get(27).unwrap_or(None),
+                width: r.get(28).unwrap_or(None),
+                height: r.get(29).unwrap_or(None),
+                orientation: r.get(30).unwrap_or(None),
+                gps_lat: r.get(31).unwrap_or(None),
+                gps_lon: r.get(32).unwrap_or(None),
+                duration_ms: r.get(33).unwrap_or(None),
+                fps: r.get(34).unwrap_or(None),
+                raw_json: None,
+            });
+
+            let rec = ScanManifestRecord {
+                storage_id: r.get(0)?,
+                rel_path: r.get(1)?,
+                file_name: r.get(2)?,
+                file_stem: r.get(3)?,
+                ext: r.get(4)?,
+                byte_size: r.get::<_, i64>(5)? as u64,
+                mtime_ns: r.get(6)?,
+                ctime_ns: r.get(7)?,
+                media_kind,
+                format: r.get(9)?,
+                hash_algo,
+                hash_hex: r.get(11)?,
+                partial_hash: r.get(12)?,
+                metadata,
+            };
+
+            on_record(rec)?;
+            count += 1;
+        }
+
+        Ok(count)
     }
 
     pub fn status(&self) -> DbResult<StatusReport> {

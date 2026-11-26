@@ -202,3 +202,177 @@ failure_domain = "nas-eagle"
     let bench: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(bench["blake3_ok"], 3);
 }
+
+#[test]
+fn nas_export_and_windows_import_manifest_tracks_backups_and_rejects_traversal() {
+    let tmp = tempdir().unwrap();
+
+    // Simulate NAS local scan DB
+    let nas_db = tmp.path().join("eagle.db");
+    let nas_root = tmp.path().join("eagle_tank_photos");
+    let nas_day = nas_root.join("2015").join("08_10").join("RAW");
+    fs::create_dir_all(&nas_day).unwrap();
+    fs::write(nas_day.join("IMG_0001.CR2"), b"same-photo-bytes-on-nas-and-pc").unwrap();
+
+    let nas_cfg_path = tmp.path().join("eagle.toml");
+    fs::write(
+        &nas_cfg_path,
+        format!(
+            r#"
+[host]
+id = "eagle"
+name = "Eagle FreeBSD NAS"
+
+[general]
+db_path = '{}'
+
+[exif]
+backend = "none"
+
+[[storages]]
+id = "nas_backup_eagle"
+root = '{}'
+media = "hdd"
+tier = "backup"
+access_mode = "read_only"
+backup_mode = "external"
+failure_domain = "nas-eagle"
+"#,
+            nas_db.display(),
+            nas_root.display()
+        ),
+    )
+    .unwrap();
+
+    // NAS local scan (with --cooldown-every and --max-files exercised)
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            nas_cfg_path.to_str().unwrap(),
+            "scan",
+            "--cooldown-every",
+            "1",
+            "--cooldown-secs",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "nas scan failed: {:?}", out);
+
+    // Export manifest from NAS DB
+    let manifest_path = tmp.path().join("eagle-manifest.jsonl");
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            nas_cfg_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "export-manifest",
+            "--storage",
+            "nas_backup_eagle",
+            "--output",
+            manifest_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export-manifest failed: {:?}", out);
+
+    // Append a malicious path-traversal record to verify untrusted-input rejection
+    let mut manifest_text = fs::read_to_string(&manifest_path).unwrap();
+    manifest_text.push_str(
+        r#"{"storage_id":"nas_backup_eagle","rel_path":"../evil.cr2","file_name":"evil.cr2","file_stem":"evil","ext":".cr2","byte_size":10,"mtime_ns":1,"ctime_ns":null,"media_kind":"raw","format":"cr2","hash_algo":"blake3","hash_hex":"0123456789abcdef0123456789abcdef","partial_hash":null,"metadata":null}"#,
+    );
+    manifest_text.push('\n');
+    fs::write(&manifest_path, manifest_text).unwrap();
+
+    // Simulate Windows PC DB with local Hot SSD copy (and offline/unmounted NAS root)
+    let win_db = tmp.path().join("win.db");
+    let win_hot = tmp.path().join("win_hot_ssd");
+    let win_day = win_hot.join("2015").join("2015_08_10");
+    fs::create_dir_all(&win_day).unwrap();
+    fs::write(win_day.join("IMG_0001.CR2"), b"same-photo-bytes-on-nas-and-pc").unwrap();
+    let offline_nas_unc = tmp.path().join("unmounted_eagle_share");
+
+    let win_cfg_path = tmp.path().join("win.toml");
+    fs::write(
+        &win_cfg_path,
+        format!(
+            r#"
+[host]
+id = "main-pc"
+name = "Main Windows PC"
+
+[general]
+db_path = '{}'
+
+[exif]
+backend = "none"
+
+[[storages]]
+id = "ssd_hot"
+root = '{}'
+media = "nvme"
+tier = "hot"
+access_mode = "managed"
+backup_mode = "none"
+failure_domain = "pc-nvme-1"
+
+[[storages]]
+id = "nas_backup_eagle"
+root = '{}'
+media = "nas"
+tier = "backup"
+access_mode = "read_only"
+backup_mode = "external"
+failure_domain = "nas-eagle"
+"#,
+            win_db.display(),
+            win_hot.display(),
+            offline_nas_unc.display()
+        ),
+    )
+    .unwrap();
+
+    // Scan Windows local SSD
+    let out = Command::new(wingpv_bin())
+        .args(["--config", win_cfg_path.to_str().unwrap(), "scan"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Import NAS manifest into Windows DB (zero SMB hashing!)
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            win_cfg_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "import-manifest",
+            manifest_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "import-manifest failed: {:?}", out);
+    let imp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(imp["records_read"], 1);
+    assert_eq!(imp["files_added"], 1);
+    assert_eq!(imp["records_rejected"], 1);
+
+    // Windows stats must now show 1 logical asset, 1 content, 1 backed-up content, 2 physical files!
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            win_cfg_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "stats",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stats: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(stats["total_assets"], 1);
+    assert_eq!(stats["total_contents"], 1);
+    assert_eq!(stats["backed_up_contents"], 1);
+    assert_eq!(stats["total_present_files"], 2);
+}
