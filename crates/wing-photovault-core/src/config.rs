@@ -152,6 +152,8 @@ pub struct ExifConfig {
     pub backend: ExifBackend,
     #[serde(default)]
     pub exiftool_path: String,
+    #[serde(default = "default_true")]
+    pub persistent_exiftool: bool,
     #[serde(default)]
     pub lens_aliases: HashMap<String, String>,
 }
@@ -161,6 +163,7 @@ impl Default for ExifConfig {
         Self {
             backend: ExifBackend::Auto,
             exiftool_path: String::new(),
+            persistent_exiftool: true,
             lens_aliases: HashMap::new(),
         }
     }

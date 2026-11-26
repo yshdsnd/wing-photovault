@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use wing_photovault_core::config::{Config, ExifBackend, StorageConfig};
 use wing_photovault_core::hashing::hash_file;
-use wing_photovault_core::metadata::{extract_exiftool, extract_metadata, extract_native};
+use wing_photovault_core::metadata::{extract_native, MetadataSession};
 use wing_photovault_core::model::{
     current_host_os, AccessMode, BackupMode, HashAlgorithm, MediaType, ScanManifestRecord,
     StorageStatus, StorageTier,
@@ -371,6 +371,7 @@ fn cmd_scan(
         };
         let bytes_counter = AtomicU64::new(0);
         let proc_started = Instant::now();
+        let meta_session = MetadataSession::new(cfg.exif.clone());
 
         for chunk in to_process.chunks(batch_size) {
             let results: Vec<Result<(UpsertFileInput, u64)>> = pool.install(|| {
@@ -382,7 +383,7 @@ fn cmd_scan(
                             cfg.hash.algorithm,
                             cfg.hash.partial_hash_enabled,
                         )?;
-                        let meta = extract_metadata(&f.abs_path, &f.ext, &cfg.exif);
+                        let meta = meta_session.extract(&f.abs_path, &f.ext);
                         let done_bytes =
                             bytes_counter.fetch_add(hash.bytes_read, Ordering::Relaxed)
                                 + hash.bytes_read;
@@ -679,11 +680,12 @@ fn cmd_benchmark(
 
     let (exiftool_ok, exiftool_secs) = if with_exiftool || cfg.exif.backend == ExifBackend::ExifTool
     {
+        let session = MetadataSession::new(cfg.exif.clone());
         let t = Instant::now();
         let ok = discovery
             .files
             .iter()
-            .filter(|f| extract_exiftool(&f.abs_path, &cfg.exif.exiftool_path).is_some())
+            .filter(|f| session.extract_via_exiftool(&f.abs_path).is_some())
             .count();
         (Some(ok), Some(t.elapsed().as_secs_f64().max(1e-9)))
     } else {

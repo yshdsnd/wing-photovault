@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 
 use exif::{In, Tag, Value};
 
@@ -17,6 +18,125 @@ const CANON_CR3_UUID: [u8; 16] = [
 /// Hard upper bound on ISOBMFF box iterations to guard against malformed/malicious CR3 inputs.
 const MAX_BOX_ITERATIONS: usize = 1024;
 
+/// Hard upper bound on a single ExifTool JSON response (untrusted input safety bound).
+const MAX_EXIFTOOL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Thread-safe extraction session that keeps a lazy persistent ExifTool (`-stay_open True`)
+/// worker alive for legacy formats (old CR2 missing LensModel, CRW, videos, HEIF) while
+/// serving modern JPEG/CR2/CR3 purely via lock-free Rust native parsing.
+pub struct MetadataSession {
+    cfg: ExifConfig,
+    persistent: Mutex<Option<PersistentExifTool>>,
+}
+
+impl MetadataSession {
+    pub fn new(cfg: ExifConfig) -> Self {
+        Self {
+            cfg,
+            persistent: Mutex::new(None),
+        }
+    }
+
+    pub fn extract(&self, path: &Path, ext: &str) -> Option<ExtractedMetadata> {
+        let mut meta = match self.cfg.backend {
+            ExifBackend::None => None,
+            ExifBackend::Native => extract_native(path, ext),
+            ExifBackend::ExifTool => self.extract_via_exiftool(path),
+            ExifBackend::Auto => {
+                let native = extract_native(path, ext);
+                if needs_exiftool_fallback(ext, native.as_ref()) {
+                    match self.extract_via_exiftool(path) {
+                        Some(et) => Some(merge_metadata(et, native)),
+                        None => native,
+                    }
+                } else {
+                    native
+                }
+            }
+        };
+
+        if let Some(m) = meta.as_mut() {
+            normalize_lens(m, &self.cfg.lens_aliases);
+        }
+        meta
+    }
+
+    pub fn extract_via_exiftool(&self, path: &Path) -> Option<ExtractedMetadata> {
+        if !self.cfg.persistent_exiftool {
+            return extract_exiftool(path, &self.cfg.exiftool_path);
+        }
+        let mut guard = self.persistent.lock().ok()?;
+        if guard.is_none() {
+            *guard = PersistentExifTool::spawn(&self.cfg.exiftool_path).ok();
+        }
+        if let Some(proc) = guard.as_mut() {
+            if let Some(meta) = proc.extract(path) {
+                return Some(meta);
+            }
+            // If the persistent process died or errored, reset and fall back once
+            *guard = None;
+        }
+        extract_exiftool(path, &self.cfg.exiftool_path)
+    }
+}
+
+fn needs_exiftool_fallback(ext: &str, native: Option<&ExtractedMetadata>) -> bool {
+    let Some(m) = native else {
+        return true;
+    };
+    if m.captured_at.is_none() || m.camera_model.is_none() {
+        return true;
+    }
+    // Legacy Canon CR2 (e.g. EOS 20D) and CRW store lens info only in Canon MakerNote,
+    // not in standard Exif 2.3 LensModel (0xA434).
+    if matches!(ext, ".cr2" | ".crw") && m.lens_model_raw.is_none() {
+        return true;
+    }
+    false
+}
+
+/// Prefer primary (ExifTool) fields while keeping any non-null fallback (native) fields.
+fn merge_metadata(
+    mut primary: ExtractedMetadata,
+    fallback: Option<ExtractedMetadata>,
+) -> ExtractedMetadata {
+    let Some(fb) = fallback else {
+        return primary;
+    };
+    if primary.captured_at.is_none() {
+        primary.captured_at = fb.captured_at;
+    }
+    if primary.captured_subsec.is_none() {
+        primary.captured_subsec = fb.captured_subsec;
+    }
+    if primary.camera_make.is_none() {
+        primary.camera_make = fb.camera_make;
+    }
+    if primary.camera_model.is_none() {
+        primary.camera_model = fb.camera_model;
+    }
+    if primary.camera_serial.is_none() {
+        primary.camera_serial = fb.camera_serial;
+    }
+    if primary.lens_model_raw.is_none() {
+        primary.lens_model_raw = fb.lens_model_raw;
+    }
+    if primary.focal_length_mm.is_none() {
+        primary.focal_length_mm = fb.focal_length_mm;
+    }
+    if primary.f_number.is_none() {
+        primary.f_number = fb.f_number;
+    }
+    if primary.shutter_speed_s.is_none() {
+        primary.shutter_speed_s = fb.shutter_speed_s;
+        primary.shutter_speed_str = fb.shutter_speed_str;
+    }
+    if primary.iso.is_none() {
+        primary.iso = fb.iso;
+    }
+    primary
+}
+
 pub fn extract_metadata(path: &Path, ext: &str, cfg: &ExifConfig) -> Option<ExtractedMetadata> {
     let mut meta = match cfg.backend {
         ExifBackend::None => None,
@@ -24,13 +144,13 @@ pub fn extract_metadata(path: &Path, ext: &str, cfg: &ExifConfig) -> Option<Extr
         ExifBackend::ExifTool => extract_exiftool(path, &cfg.exiftool_path),
         ExifBackend::Auto => {
             let native = extract_native(path, ext);
-            if native
-                .as_ref()
-                .is_some_and(|m| m.captured_at.is_some() || m.camera_model.is_some())
-            {
-                native
+            if needs_exiftool_fallback(ext, native.as_ref()) {
+                match extract_exiftool(path, &cfg.exiftool_path) {
+                    Some(et) => Some(merge_metadata(et, native)),
+                    None => native,
+                }
             } else {
-                extract_exiftool(path, &cfg.exiftool_path).or(native)
+                native
             }
         }
     };
@@ -57,13 +177,29 @@ fn normalize_lens(meta: &mut ExtractedMetadata, aliases: &HashMap<String, String
     }
 }
 
-/// Fast Rust-native EXIF extraction for JPEG, CR2/TIFF, and Canon CR3 (ISOBMFF CMT1/CMT2).
+/// Fast Rust-native EXIF extraction for JPEG, CR2/TIFF, Canon CR3 (ISOBMFF CMT1/CMT2),
+/// and Canon CRW via companion `.THM` (standard JPEG EXIF sidecar).
 pub fn extract_native(path: &Path, ext: &str) -> Option<ExtractedMetadata> {
     match ext {
         ".cr3" => extract_cr3_native(path),
+        ".crw" => extract_crw_companion_thm(path),
         ".jpg" | ".jpeg" | ".cr2" | ".dng" | ".nef" | ".arw" => extract_container_native(path),
         _ => None,
     }
+}
+
+/// Old Canon CRW cameras write a companion `.THM` file that is a standard EXIF JPEG.
+fn extract_crw_companion_thm(crw_path: &Path) -> Option<ExtractedMetadata> {
+    for ext_candidate in ["THM", "thm"] {
+        let thm_path = crw_path.with_extension(ext_candidate);
+        if thm_path.is_file() {
+            if let Some(mut meta) = extract_container_native(&thm_path) {
+                meta.extractor = "native-thm".to_string();
+                return Some(meta);
+            }
+        }
+    }
+    None
 }
 
 fn extract_container_native(path: &Path) -> Option<ExtractedMetadata> {
@@ -448,7 +584,106 @@ fn normalize_exif_datetime(raw: &str) -> String {
     }
 }
 
-/// Fallback / reference extractor using ExifTool CLI (`exiftool -json -n`).
+/// Persistent ExifTool process using `-stay_open True -@ -` to avoid per-file process spawn overhead.
+pub struct PersistentExifTool {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    seq: u64,
+}
+
+impl PersistentExifTool {
+    pub fn spawn(exiftool_path: &str) -> std::io::Result<Self> {
+        let bin = if exiftool_path.trim().is_empty() {
+            "exiftool"
+        } else {
+            exiftool_path.trim()
+        };
+
+        let mut child = Command::new(bin)
+            .args([
+                "-stay_open",
+                "True",
+                "-@",
+                "-",
+                "-common_args",
+                "-json",
+                "-charset",
+                "filename=UTF8",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to capture exiftool stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to capture exiftool stdout"))?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            seq: 0,
+        })
+    }
+
+    pub fn extract(&mut self, path: &Path) -> Option<ExtractedMetadata> {
+        let raw_str = path.to_str()?;
+        // Reject paths containing newlines to prevent protocol injection into `-@ -` argfile stream.
+        if raw_str.contains('\n') || raw_str.contains('\r') {
+            return None;
+        }
+
+        // Guard against option injection without using `--` (which would swallow `-execute<seq>` in `-@ -` mode).
+        let safe_path = if raw_str.starts_with('-') {
+            format!("./{raw_str}")
+        } else {
+            raw_str.to_string()
+        };
+
+        self.seq = self.seq.wrapping_add(1);
+        let marker = format!("{{ready{}}}", self.seq);
+
+        writeln!(self.stdin, "{safe_path}").ok()?;
+        writeln!(self.stdin, "-execute{}", self.seq).ok()?;
+        self.stdin.flush().ok()?;
+
+        let mut buf = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.stdout.read_line(&mut line).ok()?;
+            if n == 0 {
+                return None; // EOF: child exited unexpectedly
+            }
+            if line.trim_end_matches(&['\r', '\n'][..]) == marker {
+                break;
+            }
+            if buf.len().saturating_add(line.len()) > MAX_EXIFTOOL_RESPONSE_BYTES {
+                return None;
+            }
+            buf.extend_from_slice(line.as_bytes());
+        }
+
+        parse_exiftool_json(&buf, "exiftool-stay-open")
+    }
+}
+
+impl Drop for PersistentExifTool {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin, "-stay_open\nFalse");
+        let _ = self.stdin.flush();
+        let _ = self.child.wait();
+    }
+}
+
+/// Fallback / reference extractor using one-shot ExifTool CLI (`exiftool -json`).
 pub fn extract_exiftool(path: &Path, exiftool_path: &str) -> Option<ExtractedMetadata> {
     let bin = if exiftool_path.trim().is_empty() {
         "exiftool"
@@ -457,7 +692,7 @@ pub fn extract_exiftool(path: &Path, exiftool_path: &str) -> Option<ExtractedMet
     };
 
     let output = Command::new(bin)
-        .args(["-json", "-n", "-charset", "filename=UTF8", "--"])
+        .args(["-json", "-charset", "filename=UTF8", "--"])
         .arg(path)
         .output()
         .ok()?;
@@ -466,42 +701,54 @@ pub fn extract_exiftool(path: &Path, exiftool_path: &str) -> Option<ExtractedMet
         return None;
     }
 
-    let arr: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).ok()?;
+    parse_exiftool_json(&output.stdout, "exiftool")
+}
+
+fn parse_exiftool_json(bytes: &[u8], extractor_name: &str) -> Option<ExtractedMetadata> {
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(bytes).ok()?;
     let obj = arr.first()?.as_object()?;
 
     let get_str = |k: &str| {
         obj.get(k)
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.trim().to_string()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
             .filter(|s| !s.is_empty())
     };
-    let get_f64 = |k: &str| obj.get(k).and_then(|v| v.as_f64());
+    let get_f64 = |k: &str| obj.get(k).and_then(value_to_f64);
     let get_i64 = |k: &str| {
-        obj.get(k)
-            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
+        obj.get(k).and_then(|v| {
+            v.as_i64()
+                .or_else(|| value_to_f64(v).map(|f| f.round() as i64))
+        })
     };
 
     let captured_at = get_str("DateTimeOriginal")
         .or_else(|| get_str("CreateDate"))
+        .or_else(|| get_str("MediaCreateDate"))
         .map(|s| normalize_exif_datetime(&s));
 
-    let shutter_speed_s = get_f64("ExposureTime").or_else(|| get_f64("ShutterSpeed"));
-    let shutter_speed_str = shutter_speed_s.map(|s| {
-        if s > 0.0 && s < 1.0 {
-            format!("1/{}", (1.0 / s).round() as u64)
-        } else {
-            format!("{s:.2}s")
-        }
-    });
+    let (shutter_speed_s, shutter_speed_str) =
+        parse_exiftool_shutter(obj.get("ExposureTime").or_else(|| obj.get("ShutterSpeed")));
+
+    // Prefer LensModel, then LensID (decoded MakerNote name on EOS 20D/CRW), then Lens
+    let lens_model_raw = get_str("LensModel")
+        .or_else(|| get_str("LensID"))
+        .or_else(|| get_str("Lens"))
+        .filter(|s| !s.eq_ignore_ascii_case("Unknown") && !s.starts_with("Unknown ("));
+
+    let duration_ms = obj.get("Duration").and_then(parse_duration_ms);
 
     Some(ExtractedMetadata {
-        extractor: "exiftool".to_string(),
+        extractor: extractor_name.to_string(),
         captured_at,
         captured_subsec: get_str("SubSecTimeOriginal"),
         camera_make: get_str("Make"),
         camera_model: get_str("Model"),
         camera_serial: get_str("SerialNumber").or_else(|| get_str("InternalSerialNumber")),
-        lens_model_raw: get_str("LensModel").or_else(|| get_str("LensID")),
+        lens_model_raw,
         lens_model: None,
         focal_length_mm: get_f64("FocalLength"),
         focal_length_35mm: get_f64("FocalLengthIn35mmFormat"),
@@ -515,10 +762,69 @@ pub fn extract_exiftool(path: &Path, exiftool_path: &str) -> Option<ExtractedMet
         orientation: get_i64("Orientation"),
         gps_lat: get_f64("GPSLatitude"),
         gps_lon: get_f64("GPSLongitude"),
-        duration_ms: get_f64("Duration").map(|s| (s * 1000.0).round() as i64),
+        duration_ms,
         fps: get_f64("VideoFrameRate"),
         raw_json: serde_json::to_string(obj).ok(),
     })
+}
+
+fn value_to_f64(v: &serde_json::Value) -> Option<f64> {
+    if let Some(f) = v.as_f64() {
+        return Some(f);
+    }
+    let s = v.as_str()?.trim();
+    // Parse leading numeric token (e.g. "400.0 mm", "+0.33", "29.97")
+    let token = s.split_whitespace().next()?;
+    if let Some((num, den)) = token.split_once('/') {
+        let n: f64 = num.parse().ok()?;
+        let d: f64 = den.parse().ok()?;
+        if d != 0.0 {
+            return Some(n / d);
+        }
+    }
+    token.parse::<f64>().ok()
+}
+
+fn parse_exiftool_shutter(val: Option<&serde_json::Value>) -> (Option<f64>, Option<String>) {
+    let Some(v) = val else {
+        return (None, None);
+    };
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        let secs = value_to_f64(v);
+        return (secs, Some(trimmed.to_string()));
+    }
+    if let Some(secs) = v.as_f64() {
+        let label = if secs > 0.0 && secs < 1.0 {
+            format!("1/{}", (1.0 / secs).round() as u64)
+        } else {
+            format!("{secs:.2}s")
+        };
+        return (Some(secs), Some(label));
+    }
+    (None, None)
+}
+
+fn parse_duration_ms(v: &serde_json::Value) -> Option<i64> {
+    if let Some(secs) = v.as_f64() {
+        return Some((secs * 1000.0).round() as i64);
+    }
+    let s = v.as_str()?.trim();
+    // Format "12.34 s"
+    if let Some(first) = s.split_whitespace().next() {
+        if let Ok(secs) = first.parse::<f64>() {
+            return Some((secs * 1000.0).round() as i64);
+        }
+    }
+    // Format "H:MM:SS" or "MM:SS"
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() == 3 {
+        let h: f64 = parts[0].parse().ok()?;
+        let m: f64 = parts[1].parse().ok()?;
+        let sec: f64 = parts[2].parse().ok()?;
+        return Some(((h * 3600.0 + m * 60.0 + sec) * 1000.0).round() as i64);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -584,5 +890,51 @@ mod tests {
             meta.lens_model_raw.as_deref(),
             Some("RF200-800mm F6.3-9 IS USM")
         );
+    }
+
+    #[test]
+    fn parses_exiftool_json_for_legacy_cr2_and_video() {
+        let json = br#"[{
+            "Make": "Canon",
+            "Model": "Canon EOS 20D",
+            "DateTimeOriginal": "2005:08:10 10:15:30",
+            "LensID": "Canon EF 100-400mm f/4.5-5.6L IS USM",
+            "FocalLength": "400.0 mm",
+            "FNumber": 5.6,
+            "ExposureTime": "1/1000",
+            "ISO": 400,
+            "Duration": "0:00:12"
+        }]"#;
+        let meta = parse_exiftool_json(json, "exiftool-stay-open").unwrap();
+        assert_eq!(meta.camera_model.as_deref(), Some("Canon EOS 20D"));
+        assert_eq!(
+            meta.lens_model_raw.as_deref(),
+            Some("Canon EF 100-400mm f/4.5-5.6L IS USM")
+        );
+        assert_eq!(meta.focal_length_mm, Some(400.0));
+        assert_eq!(meta.f_number, Some(5.6));
+        assert_eq!(meta.shutter_speed_str.as_deref(), Some("1/1000"));
+        assert_eq!(meta.iso, Some(400));
+        assert_eq!(meta.duration_ms, Some(12_000));
+    }
+
+    #[test]
+    fn auto_fallback_triggers_for_legacy_cr2_missing_lens_but_not_complete_cr3() {
+        let complete_cr3 = ExtractedMetadata {
+            captured_at: Some("2026-11-22T11:58:45".into()),
+            camera_model: Some("Canon EOS R5m2".into()),
+            lens_model_raw: Some("RF200-800mm F6.3-9 IS USM".into()),
+            ..Default::default()
+        };
+        assert!(!needs_exiftool_fallback(".cr3", Some(&complete_cr3)));
+
+        let legacy_20d_cr2 = ExtractedMetadata {
+            captured_at: Some("2005-08-10T10:15:30".into()),
+            camera_model: Some("Canon EOS 20D".into()),
+            lens_model_raw: None,
+            ..Default::default()
+        };
+        assert!(needs_exiftool_fallback(".cr2", Some(&legacy_20d_cr2)));
+        assert!(needs_exiftool_fallback(".crw", None));
     }
 }
