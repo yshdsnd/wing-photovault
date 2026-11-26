@@ -33,8 +33,13 @@ db_batch_size = 1000
 # "auto" (ネイティブ優先 + ExifToolフォールバック) | "native" | "exiftool" | "none"
 backend = "auto"
 exiftool_path = ""
+persistent_exiftool = true
 
 [exif.lens_aliases]
+# 旧型機種(EOS 10D/20D等)で焦点距離レンジのみ記録されるレンズの正規化例:
+# "Unknown 100-400mm" = "EF100-400mm f/4.5-5.6L IS USM"
+# "Unknown 28-75mm" = "SP AF28-75mm F/2.8 XR Di"
+# "Unknown 17-85mm" = "EF-S17-85mm f/4-5.6 IS USM"
 # "Canon RF200-800mm F6.3-9 IS USM" = "RF200-800mm F6.3-9 IS USM"
 
 # 複数ストレージ定義（同一階層に複数ドライブ登録可能、UNCパス対応）

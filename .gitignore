@@ -8,7 +8,9 @@
 *.sqlite
 *.sqlite3
 
-# Runtime logs & secrets
+# Local configs & runtime logs / secrets
+wing-photovault.toml
+test-*.toml
 /logs/
 client_secret.json
 gphotos_token.json
