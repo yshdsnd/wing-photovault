@@ -2,8 +2,10 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,7 +23,7 @@ use wing_photovault_core::model::{
     current_host_os, AccessMode, BackupMode, HashAlgorithm, MediaType, ScanManifestRecord,
     StorageStatus, StorageTier,
 };
-use wing_photovault_core::scanner::{discover_storage_files, DiscoveredFile};
+use wing_photovault_core::scanner::{discover_storage_files, walk_storage_files, DiscoveredFile};
 use wing_photovault_db::{Database, FindCursor, FindFilter, ScanRunSummary, UpsertFileInput};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -355,6 +357,58 @@ fn cmd_init(config_path: &Path, write_config: bool, format: OutputFormat) -> Res
     Ok(())
 }
 
+struct PauseGate {
+    paused: Mutex<bool>,
+    cvar: Condvar,
+    stop: AtomicBool,
+}
+
+impl PauseGate {
+    fn new() -> Self {
+        Self {
+            paused: Mutex::new(false),
+            cvar: Condvar::new(),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    fn wait_if_paused(&self) -> bool {
+        if self.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut paused = self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        while *paused && !self.stop.load(Ordering::Acquire) {
+            paused = self.cvar.wait(paused).unwrap_or_else(|e| e.into_inner());
+        }
+        !self.stop.load(Ordering::Acquire)
+    }
+
+    fn pause(&self) {
+        if let Ok(mut paused) = self.paused.lock() {
+            *paused = true;
+        }
+    }
+
+    fn resume(&self) {
+        if let Ok(mut paused) = self.paused.lock() {
+            *paused = false;
+        }
+        self.cvar.notify_all();
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.cvar.notify_all();
+    }
+}
+
+enum PipelineMsg {
+    Unchanged(i64),
+    DiscoveryError(String),
+    Processed(Box<UpsertFileInput>, u64),
+    ProcessError(String),
+}
+
 struct ScanOpts<'a> {
     storage_filter: Option<&'a str>,
     full: bool,
@@ -417,69 +471,15 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
 
         let existing = db.load_storage_file_index(&storage.id)?;
 
-        let discover_pb = if quiet {
-            ProgressBar::hidden()
-        } else {
-            let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
-            pb.set_style(
-                ProgressStyle::with_template("{spinner:.cyan} [{prefix}] Discovering files... {elapsed_precise}")
-                    .unwrap(),
-            );
-            pb.set_prefix(storage.id.clone());
-            pb.enable_steady_tick(Duration::from_millis(120));
-            pb
-        };
-        let discovery = discover_storage_files(storage, &allowed_exts, cfg.scan.follow_symlinks);
-        discover_pb.finish_and_clear();
         let mut summary = ScanRunSummary {
             scan_run_id,
             storage_id: storage.id.clone(),
             mode: mode.to_string(),
             status: "completed".to_string(),
-            files_scanned: discovery.files.len() as u64,
-            error_count: discovery.errors.len() as u64,
             ..Default::default()
         };
 
-        for err in &discovery.errors {
-            warn!(storage_id = %storage.id, error = %err, "discovery error");
-        }
-
-        let mut unchanged_ids: Vec<i64> = Vec::new();
-        let mut to_process: Vec<DiscoveredFile> = Vec::new();
-
-        for f in discovery.files {
-            if mode == "incremental" {
-                if let Some(prev) = existing.get(&f.rel_path) {
-                    if prev.byte_size == f.byte_size
-                        && prev.mtime_ns == f.mtime_ns
-                        && prev.content_id.is_some()
-                    {
-                        unchanged_ids.push(prev.file_id);
-                        continue;
-                    }
-                }
-            }
-            to_process.push(f);
-        }
-
-        summary.files_skipped = unchanged_ids.len() as u64;
-        db.touch_unchanged_files(&unchanged_ids, scan_run_id)?;
-
-        let mut truncated_by_max_files = false;
-        if let Some(limit) = max_files {
-            if to_process.len() > limit {
-                to_process.truncate(limit);
-                truncated_by_max_files = true;
-            }
-        }
-
         let workers = cfg.performance.workers_for(storage.media);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .context("failed to build worker pool")?;
-
         let cooldown_enabled = cooldown_every > 0 && cooldown_secs > 0;
         let base_batch = cfg.performance.db_batch_size.max(1);
         let batch_size = if cooldown_enabled {
@@ -489,138 +489,304 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
         };
         let role = storage.tier.default_file_role();
 
-        let total_to_process = to_process.len() as u64;
-        let scan_pb = if quiet || total_to_process == 0 {
+        // Bounded channel capacities keep peak memory O(batch_size) even for 1M+ files (32-bit safe).
+        // When thermal cooldown is active, keep work queue tight so HDD I/O pauses immediately.
+        let work_cap = if cooldown_enabled {
+            (workers * 2).max(2)
+        } else {
+            batch_size.clamp(64, 1024).max(workers * 4)
+        };
+        let done_cap = batch_size.clamp(64, 1024).max(workers * 4);
+
+        let scan_pb = if quiet {
             ProgressBar::hidden()
         } else {
-            let pb = ProgressBar::with_draw_target(
-                Some(total_to_process),
-                ProgressDrawTarget::stderr(),
-            );
+            let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
             pb.set_style(
                 ProgressStyle::with_template(
-                    "[{prefix}] [{bar:30.cyan/blue}] {pos}/{len} files ({msg}) ETA {eta}",
+                    "{spinner:.cyan} [{prefix}] {pos} processed ({msg}) {elapsed_precise}",
                 )
-                .unwrap()
-                .progress_chars("=>-"),
+                .unwrap(),
             );
             pb.set_prefix(storage.id.clone());
-            pb.set_message("0 B");
+            pb.set_message("scanning...");
+            pb.enable_steady_tick(Duration::from_millis(120));
             pb
         };
+
         let bytes_counter = AtomicU64::new(0);
+        let discovered_counter = AtomicU64::new(0);
+        let truncated_by_max_files = AtomicBool::new(false);
+        let walker_done = AtomicBool::new(false);
+        let in_flight = AtomicUsize::new(0);
+        let gate = PauseGate::new();
         let proc_started = Instant::now();
         let meta_session = MetadataSession::new(cfg.exif.clone());
-        let mut processed_since_cooldown: usize = 0;
-        let mut processed_total: usize = 0;
 
-        for chunk in to_process.chunks(batch_size) {
-            let results: Vec<Result<(UpsertFileInput, u64)>> = pool.install(|| {
-                chunk
-                    .par_iter()
-                    .map(|f| {
-                        let hash = hash_file(
-                            &f.abs_path,
-                            cfg.hash.algorithm,
-                            cfg.hash.partial_hash_enabled,
-                        )?;
-                        let meta = meta_session.extract(&f.abs_path, &f.ext);
-                        let done_bytes =
-                            bytes_counter.fetch_add(hash.bytes_read, Ordering::Relaxed)
-                                + hash.bytes_read;
-                        scan_pb.inc(1);
-                        let secs = proc_started.elapsed().as_secs_f64().max(0.001);
-                        let mb_s = (done_bytes as f64 / 1_000_000.0) / secs;
-                        scan_pb.set_message(format!(
-                            "{}, {:.1} MB/s",
-                            human_bytes(done_bytes),
-                            mb_s
-                        ));
-                        let input = UpsertFileInput {
-                            storage_id: storage.id.clone(),
-                            rel_path: f.rel_path.clone(),
-                            file_name: f.file_name.clone(),
-                            file_stem: f.file_stem.clone(),
-                            ext: f.ext.clone(),
-                            byte_size: f.byte_size,
-                            mtime_ns: f.mtime_ns,
-                            ctime_ns: f.ctime_ns,
-                            media_kind: f.media_kind,
-                            format: f.format.clone(),
-                            role,
-                            hash_algo: hash.algorithm,
-                            hash_hex: hash.hash_hex,
-                            partial_hash: hash.partial_hash,
-                            metadata: meta,
-                        };
-                        Ok((input, hash.bytes_read))
-                    })
-                    .collect()
+        let pipeline_result: Result<()> = thread::scope(|scope| {
+            let (work_tx, work_rx) = mpsc::sync_channel::<DiscoveredFile>(work_cap);
+            let (done_tx, done_rx) = mpsc::sync_channel::<PipelineMsg>(done_cap);
+            let work_rx = Arc::new(Mutex::new(work_rx));
+
+            // Stage 1: Streaming directory walker (never buffers whole catalog in a Vec)
+            let done_tx_walker = done_tx.clone();
+            let existing_ref = &existing;
+            let allowed_exts_ref = &allowed_exts;
+            let gate_ref = &gate;
+            let discovered_ref = &discovered_counter;
+            let truncated_ref = &truncated_by_max_files;
+            let walker_done_ref = &walker_done;
+            let in_flight_ref = &in_flight;
+
+            scope.spawn(move || {
+                let mut queued_for_processing: usize = 0;
+                walk_storage_files(storage, allowed_exts_ref, cfg.scan.follow_symlinks, |ev| {
+                    if !gate_ref.wait_if_paused() {
+                        return ControlFlow::Break(());
+                    }
+                    match ev {
+                        Err(err) => {
+                            if done_tx_walker.send(PipelineMsg::DiscoveryError(err)).is_err() {
+                                return ControlFlow::Break(());
+                            }
+                        }
+                        Ok(f) => {
+                            if mode == "incremental" {
+                                if let Some(prev) = existing_ref.get(&f.rel_path) {
+                                    if prev.byte_size == f.byte_size
+                                        && prev.mtime_ns == f.mtime_ns
+                                        && prev.content_id.is_some()
+                                    {
+                                        discovered_ref.fetch_add(1, Ordering::Relaxed);
+                                        if done_tx_walker
+                                            .send(PipelineMsg::Unchanged(prev.file_id))
+                                            .is_err()
+                                        {
+                                            return ControlFlow::Break(());
+                                        }
+                                        return ControlFlow::Continue(());
+                                    }
+                                }
+                            }
+
+                            if let Some(limit) = max_files {
+                                if queued_for_processing >= limit {
+                                    truncated_ref.store(true, Ordering::Release);
+                                    return ControlFlow::Break(());
+                                }
+                            }
+
+                            queued_for_processing += 1;
+                            discovered_ref.fetch_add(1, Ordering::Relaxed);
+                            in_flight_ref.fetch_add(1, Ordering::AcqRel);
+                            if work_tx.send(f).is_err() {
+                                in_flight_ref.fetch_sub(1, Ordering::AcqRel);
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
+                    ControlFlow::Continue(())
+                });
+                walker_done_ref.store(true, Ordering::Release);
+                drop(work_tx);
+                drop(done_tx_walker);
             });
 
-            let mut batch_inputs = Vec::with_capacity(results.len());
-            for r in results {
-                match r {
-                    Ok((input, bytes)) => {
-                        summary.bytes_hashed += bytes;
-                        if export_jsonl {
-                            let rec = ScanManifestRecord {
-                                storage_id: input.storage_id.clone(),
-                                rel_path: input.rel_path.clone(),
-                                file_name: input.file_name.clone(),
-                                file_stem: input.file_stem.clone(),
-                                ext: input.ext.clone(),
-                                byte_size: input.byte_size,
-                                mtime_ns: input.mtime_ns,
-                                ctime_ns: input.ctime_ns,
-                                media_kind: input.media_kind,
-                                format: input.format.clone(),
-                                hash_algo: input.hash_algo,
-                                hash_hex: input.hash_hex.clone(),
-                                partial_hash: input.partial_hash.clone(),
-                                metadata: input.metadata.clone(),
-                            };
-                            println!("{}", serde_json::to_string(&rec)?);
-                        }
-                        batch_inputs.push(input);
+            // Stage 2: Device-concurrency-controlled Hash + EXIF workers
+            let meta_ref = &meta_session;
+            let bytes_ref = &bytes_counter;
+            let pb_ref = &scan_pb;
+
+            for _ in 0..workers {
+                let rx_clone = Arc::clone(&work_rx);
+                let tx_clone = done_tx.clone();
+                let hash_algo = cfg.hash.algorithm;
+                let partial_hash_enabled = cfg.hash.partial_hash_enabled;
+
+                scope.spawn(move || loop {
+                    if !gate_ref.wait_if_paused() {
+                        break;
                     }
-                    Err(err) => {
-                        summary.error_count += 1;
-                        warn!(storage_id = %storage.id, error = %err, "file processing error");
+                    let next_file = {
+                        let rx_guard = rx_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        rx_guard.recv().ok()
+                    };
+                    let Some(f) = next_file else {
+                        break;
+                    };
+                    if !gate_ref.wait_if_paused() {
+                        in_flight_ref.fetch_sub(1, Ordering::AcqRel);
+                        break;
+                    }
+
+                    let msg = match hash_file(&f.abs_path, hash_algo, partial_hash_enabled) {
+                        Ok(hash) => {
+                            let meta = meta_ref.extract(&f.abs_path, &f.ext);
+                            let done_bytes =
+                                bytes_ref.fetch_add(hash.bytes_read, Ordering::Relaxed)
+                                    + hash.bytes_read;
+                            pb_ref.inc(1);
+                            let secs = proc_started.elapsed().as_secs_f64().max(0.001);
+                            let mb_s = (done_bytes as f64 / 1_000_000.0) / secs;
+                            pb_ref.set_message(format!(
+                                "{}, {:.1} MB/s",
+                                human_bytes(done_bytes),
+                                mb_s
+                            ));
+                            let input = UpsertFileInput {
+                                storage_id: storage.id.clone(),
+                                rel_path: f.rel_path,
+                                file_name: f.file_name,
+                                file_stem: f.file_stem,
+                                ext: f.ext,
+                                byte_size: f.byte_size,
+                                mtime_ns: f.mtime_ns,
+                                ctime_ns: f.ctime_ns,
+                                media_kind: f.media_kind,
+                                format: f.format,
+                                role,
+                                hash_algo: hash.algorithm,
+                                hash_hex: hash.hash_hex,
+                                partial_hash: hash.partial_hash,
+                                metadata: meta,
+                            };
+                            PipelineMsg::Processed(Box::new(input), hash.bytes_read)
+                        }
+                        Err(err) => PipelineMsg::ProcessError(err.to_string()),
+                    };
+
+                    let send_ok = tx_clone.send(msg).is_ok();
+                    in_flight_ref.fetch_sub(1, Ordering::AcqRel);
+                    if !send_ok {
+                        break;
+                    }
+                });
+            }
+
+            // Drop parent handles so channels close cleanly if workers/consumer exit early
+            drop(work_rx);
+            drop(done_tx);
+
+            // Stage 3: Batched SQLite writer, JSONL exporter, and HDD cooldown controller
+            let mut unchanged_batch: Vec<i64> = Vec::with_capacity(batch_size);
+            let mut batch_inputs: Vec<UpsertFileInput> = Vec::with_capacity(batch_size);
+            let mut processed_since_cooldown: usize = 0;
+            let mut processed_total: u64 = 0;
+
+            let drain_res: Result<()> = (|| {
+                for msg in done_rx {
+                    match msg {
+                        PipelineMsg::DiscoveryError(err) => {
+                            summary.error_count += 1;
+                            warn!(storage_id = %storage.id, error = %err, "discovery error");
+                        }
+                        PipelineMsg::Unchanged(file_id) => {
+                            summary.files_skipped += 1;
+                            unchanged_batch.push(file_id);
+                            if unchanged_batch.len() >= batch_size {
+                                db.touch_unchanged_files(&unchanged_batch, scan_run_id)?;
+                                unchanged_batch.clear();
+                            }
+                        }
+                        PipelineMsg::ProcessError(err) => {
+                            summary.error_count += 1;
+                            processed_total += 1;
+                            processed_since_cooldown += 1;
+                            warn!(storage_id = %storage.id, error = %err, "file processing error");
+                        }
+                        PipelineMsg::Processed(input_box, bytes) => {
+                            let input = *input_box;
+                            summary.bytes_hashed += bytes;
+                            if export_jsonl {
+                                let rec = ScanManifestRecord {
+                                    storage_id: input.storage_id.clone(),
+                                    rel_path: input.rel_path.clone(),
+                                    file_name: input.file_name.clone(),
+                                    file_stem: input.file_stem.clone(),
+                                    ext: input.ext.clone(),
+                                    byte_size: input.byte_size,
+                                    mtime_ns: input.mtime_ns,
+                                    ctime_ns: input.ctime_ns,
+                                    media_kind: input.media_kind,
+                                    format: input.format.clone(),
+                                    hash_algo: input.hash_algo,
+                                    hash_hex: input.hash_hex.clone(),
+                                    partial_hash: input.partial_hash.clone(),
+                                    metadata: input.metadata.clone(),
+                                };
+                                println!("{}", serde_json::to_string(&rec)?);
+                            }
+                            batch_inputs.push(input);
+                            processed_total += 1;
+                            processed_since_cooldown += 1;
+
+                            if batch_inputs.len() >= batch_size {
+                                let (added, updated) =
+                                    db.upsert_scanned_batch(&batch_inputs, scan_run_id)?;
+                                summary.files_added += added;
+                                summary.files_updated += updated;
+                                batch_inputs.clear();
+                            }
+                        }
+                    }
+
+                    if cooldown_enabled && processed_since_cooldown >= cooldown_every {
+                        if !batch_inputs.is_empty() {
+                            let (added, updated) =
+                                db.upsert_scanned_batch(&batch_inputs, scan_run_id)?;
+                            summary.files_added += added;
+                            summary.files_updated += updated;
+                            batch_inputs.clear();
+                        }
+                        if !unchanged_batch.is_empty() {
+                            db.touch_unchanged_files(&unchanged_batch, scan_run_id)?;
+                            unchanged_batch.clear();
+                        }
+                        processed_since_cooldown = 0;
+
+                        let more_pending = !walker_done_ref.load(Ordering::Acquire)
+                            || in_flight_ref.load(Ordering::Acquire) > 0;
+                        if more_pending {
+                            gate_ref.pause();
+                            pb_ref.set_message(format!(
+                                "cooling down {}s ({} done)",
+                                cooldown_secs,
+                                human_bytes(summary.bytes_hashed)
+                            ));
+                            info!(
+                                storage_id = %storage.id,
+                                processed = processed_total,
+                                cooldown_secs,
+                                "batch committed; pausing pipeline for cooldown"
+                            );
+                            thread::sleep(Duration::from_secs(cooldown_secs));
+                            gate_ref.resume();
+                        }
                     }
                 }
-            }
 
-            let (added, updated) = db.upsert_scanned_batch(&batch_inputs, scan_run_id)?;
-            summary.files_added += added;
-            summary.files_updated += updated;
-            processed_total += chunk.len();
-            processed_since_cooldown += chunk.len();
+                if !unchanged_batch.is_empty() {
+                    db.touch_unchanged_files(&unchanged_batch, scan_run_id)?;
+                }
+                if !batch_inputs.is_empty() {
+                    let (added, updated) = db.upsert_scanned_batch(&batch_inputs, scan_run_id)?;
+                    summary.files_added += added;
+                    summary.files_updated += updated;
+                }
+                Ok(())
+            })();
 
-            if cooldown_enabled
-                && processed_since_cooldown >= cooldown_every
-                && processed_total < to_process.len()
-            {
-                processed_since_cooldown = 0;
-                scan_pb.set_message(format!(
-                    "cooling down {}s ({} done)",
-                    cooldown_secs,
-                    human_bytes(summary.bytes_hashed)
-                ));
-                info!(
-                    storage_id = %storage.id,
-                    processed = processed_total,
-                    total = to_process.len(),
-                    cooldown_secs,
-                    "batch committed; pausing for cooldown"
-                );
-                thread::sleep(Duration::from_secs(cooldown_secs));
+            if drain_res.is_err() {
+                gate_ref.stop();
             }
-        }
+            drain_res
+        });
 
         scan_pb.finish_and_clear();
+        pipeline_result?;
+        summary.files_scanned = discovered_counter.load(Ordering::Relaxed);
 
-        if !truncated_by_max_files {
+        if !truncated_by_max_files.load(Ordering::Acquire) {
             summary.files_missing = db.mark_unseen_as_missing(&storage.id, scan_run_id)?;
         }
         let pair_report = db.pair_raw_jpeg_assets(&storage.id)?;

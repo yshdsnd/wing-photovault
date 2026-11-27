@@ -74,7 +74,27 @@ failure_domain = "nas-eagle"
         .unwrap();
     assert!(out.status.success(), "init failed: {:?}", out);
 
-    // 2. initial scan
+    // 2. initial scan (test --max-files early-stop first: adds 1 file, skips missing marking)
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "scan",
+            "--storage",
+            "ssd_hot",
+            "--max-files",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "partial scan failed: {:?}", out);
+    let partial: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(partial[0]["files_added"], 1);
+    assert_eq!(partial[0]["files_missing"], 0);
+
+    // 2b. full completion scan picks up remaining files (incremental skips the 1 already indexed)
     let out = Command::new(wingpv_bin())
         .args([
             "--config",
@@ -88,6 +108,9 @@ failure_domain = "nas-eagle"
     assert!(out.status.success(), "scan failed: {:?}", out);
     let summaries: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(summaries.as_array().unwrap().len(), 2);
+    assert_eq!(summaries[0]["files_skipped"], 1);
+    assert_eq!(summaries[0]["files_added"], 1);
+    assert_eq!(summaries[1]["files_added"], 1);
 
     // 3. incremental scan should skip all unchanged files
     let out = Command::new(wingpv_bin())

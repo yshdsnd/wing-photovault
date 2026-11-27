@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -27,14 +28,18 @@ pub struct DiscoveryReport {
     pub errors: Vec<String>,
 }
 
-/// Non-destructively walk a storage root, skipping excluded paths and non-matching extensions.
-pub fn discover_storage_files(
+/// Stream matching files from a storage root one by one without buffering the whole catalog
+/// in memory (32-bit and million-file safe).
+///
+/// Returning `ControlFlow::Break(())` stops directory traversal immediately.
+pub fn walk_storage_files<F>(
     storage: &StorageConfig,
     allowed_exts: &HashSet<String>,
     follow_symlinks: bool,
-) -> DiscoveryReport {
-    let mut report = DiscoveryReport::default();
-
+    mut on_event: F,
+) where
+    F: FnMut(Result<DiscoveredFile, String>) -> ControlFlow<()>,
+{
     let normalized_excludes: Vec<String> = storage
         .exclude_paths
         .iter()
@@ -58,7 +63,9 @@ pub fn discover_storage_files(
         let entry = match entry_res {
             Ok(e) => e,
             Err(err) => {
-                report.errors.push(err.to_string());
+                if on_event(Err(err.to_string())).is_break() {
+                    break;
+                }
                 continue;
             }
         };
@@ -91,9 +98,9 @@ pub fn discover_storage_files(
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(err) => {
-                report
-                    .errors
-                    .push(format!("{}: {err}", abs_path.display()));
+                if on_event(Err(format!("{}: {err}", abs_path.display()))).is_break() {
+                    break;
+                }
                 continue;
             }
         };
@@ -101,9 +108,9 @@ pub fn discover_storage_files(
         let rel_path = match abs_path.strip_prefix(&storage.root) {
             Ok(rel) => to_forward_slash_path(rel),
             Err(err) => {
-                report
-                    .errors
-                    .push(format!("{}: {err}", abs_path.display()));
+                if on_event(Err(format!("{}: {err}", abs_path.display()))).is_break() {
+                    break;
+                }
                 continue;
             }
         };
@@ -128,7 +135,7 @@ pub fn discover_storage_files(
 
         let (media_kind, format) = classify_extension(&ext);
 
-        report.files.push(DiscoveredFile {
+        let discovered = DiscoveredFile {
             abs_path,
             rel_path,
             file_name,
@@ -139,9 +146,28 @@ pub fn discover_storage_files(
             ctime_ns,
             media_kind,
             format: format.to_string(),
-        });
-    }
+        };
 
+        if on_event(Ok(discovered)).is_break() {
+            break;
+        }
+    }
+}
+
+/// Non-destructively walk a storage root, skipping excluded paths and non-matching extensions.
+pub fn discover_storage_files(
+    storage: &StorageConfig,
+    allowed_exts: &HashSet<String>,
+    follow_symlinks: bool,
+) -> DiscoveryReport {
+    let mut report = DiscoveryReport::default();
+    walk_storage_files(storage, allowed_exts, follow_symlinks, |ev| {
+        match ev {
+            Ok(f) => report.files.push(f),
+            Err(e) => report.errors.push(e),
+        }
+        ControlFlow::Continue(())
+    });
     report
 }
 
@@ -203,5 +229,16 @@ mod tests {
             .files
             .iter()
             .any(|f| f.rel_path == "2026/2026_11_24/100EOSR5/IMG_0001.CR3"));
+
+        // Verify streaming early-stop via ControlFlow::Break
+        let mut streamed = 0usize;
+        walk_storage_files(&storage, &exts, false, |ev| {
+            if ev.is_ok() {
+                streamed += 1;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        assert_eq!(streamed, 1);
     }
 }

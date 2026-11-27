@@ -30,7 +30,7 @@
 - マニフェストのストリーミング書き出し（`stream_storage_manifest`）
 
 ### CLI (`crates/wing-photovault-cli` / バイナリ名 `wingpv`)
-- `init` / `scan`（`--storage`, `--full`, `--export-jsonl`, `--cooldown-every`, `--cooldown-secs`, `--max-files`）
+- `init` / `scan`（3 ステージ有界キュー・ストリーミングパイプライン、`PauseGate` 付きクールダウン制御、`--storage`, `--full`, `--export-jsonl`, `--cooldown-every`, `--cooldown-secs`, `--max-files`）
 - `export-manifest` / `import-manifest`（FreeBSD NAS ローカルスキャン → Windows DB 取り込み、`[exif.lens_aliases]` 自動適用）
 - `normalize-lenses`（再スキャン不要で既存 DB の `lens_model_raw` から `[exif.lens_aliases]` を再適用、`--dry-run` 読み取り専用プレビュー対応）
 - `status` / `stats`（`--percent`, `--by-year`, `--gear-history` 使用機材年表対応）/ `find`（キーセットページング `--cursor`, `--page-info` 対応）/ `benchmark`（ディレクトリ実測＋`--db-scale <N>` 大規模ダミー DB ベンチマーク、`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
@@ -58,7 +58,6 @@
 1. **FreeBSD NAS ローカルスキャン実証**（手順: [docs/nas-local-scan-freebsd.md](nas-local-scan-freebsd.md)）
    - FreeBSD 側でのビルド・インターバル付きスキャン完走 → `export-manifest` → Windows 側 `import-manifest` で `Backed-up Contents` 確認
 2. **Phase 1 残タスク（大規模・品質仕上げ）**
-   - 走査〜ハッシュ/EXIF〜DB 書込の有界キューによるストリーミングパイプライン化（全件 `Vec` 保持の解消）
    - 動画（MP4/MOV）のメタデータ取得確認、`.xmp` / `.thm` サイドカー認識の土台
 3. **Phase 2 準備**
    - `duplicates` コマンド（サイズ→部分ハッシュ→全体ハッシュ、Backup / ReadOnly 除外）
