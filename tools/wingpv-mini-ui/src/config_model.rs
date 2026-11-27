@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use wing_photovault_core::config::{
     Config, ExifBackend, ExifConfig, GeneralConfig, HashConfig, HostConfig, PerformanceConfig,
-    ScanConfig, StorageConfig,
+    ScanConfig, StatsConfig, StorageConfig,
 };
 use wing_photovault_core::model::{AccessMode, BackupMode, HashAlgorithm, MediaType, StorageTier};
 
@@ -141,6 +141,7 @@ pub struct ConfigDraft {
     pub exiftool_path: String,
     pub persistent_exiftool: bool,
     pub lens_aliases: Vec<LensAliasRow>,
+    pub stats: StatsConfig,
     pub storages: Vec<StorageDraft>,
 }
 
@@ -153,6 +154,7 @@ impl Default for ConfigDraft {
             hash: HashConfig::default(),
             performance: PerformanceConfig::default(),
             exif: ExifConfig::default(),
+            stats: StatsConfig::default(),
             storages: vec![],
         };
         Self::from_config(&cfg)
@@ -193,6 +195,7 @@ impl ConfigDraft {
                 .into_iter()
                 .map(|(raw, normalized)| LensAliasRow { raw, normalized })
                 .collect(),
+            stats: cfg.stats.clone(),
             storages: cfg.storages.iter().map(StorageDraft::from_config).collect(),
         }
     }
@@ -255,6 +258,7 @@ impl ConfigDraft {
                 persistent_exiftool: self.persistent_exiftool,
                 lens_aliases,
             },
+            stats: self.stats.clone(),
             storages: self.storages.iter().map(StorageDraft::to_config).collect(),
         }
     }

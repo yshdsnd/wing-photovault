@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
-use wing_photovault_core::config::{Config, ExifBackend, StorageConfig};
+use wing_photovault_core::config::{Config, ExifBackend, StatsConfig, StorageConfig};
 use wing_photovault_core::hashing::hash_file;
 use wing_photovault_core::metadata::{apply_lens_aliases, extract_native, MetadataSession};
 use wing_photovault_core::model::{
@@ -140,6 +140,10 @@ enum Commands {
         /// Include chronological camera and lens usage timeline (first..last capture dates)
         #[arg(long)]
         gear_history: bool,
+
+        /// Show cost per shot for cameras/lenses configured in [stats.camera_prices] / [stats.lens_prices]
+        #[arg(long)]
+        cost_per_shot: bool,
     },
 
     /// Search indexed files
@@ -226,7 +230,17 @@ fn main() -> Result<()> {
             percent,
             by_year,
             gear_history,
-        } => cmd_stats(&cli.config, percent, by_year, gear_history, cli.format),
+            cost_per_shot,
+        } => cmd_stats(
+            &cli.config,
+            StatsOpts {
+                show_percent: percent,
+                show_by_year: by_year,
+                show_gear_history: gear_history,
+                show_cost_per_shot: cost_per_shot,
+            },
+            cli.format,
+        ),
         Commands::Find {
             storage,
             ext_format,
@@ -306,6 +320,7 @@ fn load_config_or_default(path: &Path) -> Result<Config> {
             hash: Default::default(),
             performance: Default::default(),
             exif: Default::default(),
+            stats: Default::default(),
             storages: Vec::new(),
         })
     }
@@ -1180,6 +1195,14 @@ fn cmd_status(config_path: &Path, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct StatsOpts {
+    show_percent: bool,
+    show_by_year: bool,
+    show_gear_history: bool,
+    show_cost_per_shot: bool,
+}
+
 fn calc_percent(part: i64, total: i64) -> f64 {
     if total <= 0 || part <= 0 {
         0.0
@@ -1192,13 +1215,39 @@ fn round_pct2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
+fn calc_cost_per_shot(price: Option<f64>, count: i64) -> Option<f64> {
+    let p = price?;
+    if count > 0 {
+        Some(p / count as f64)
+    } else {
+        None
+    }
+}
+
+fn format_cost_per_shot(cost: f64, currency: &str) -> String {
+    if cost >= 100.0 {
+        format!("{cost:.0} {currency}/shot")
+    } else {
+        format!("{cost:.1} {currency}/shot")
+    }
+}
+
 fn format_stats_text(
     report: &wing_photovault_db::StatsReport,
     by_year: Option<&[wing_photovault_db::YearStatsRow]>,
     gear_history: Option<&wing_photovault_db::GearHistoryReport>,
-    show_percent: bool,
+    stats_cfg: &StatsConfig,
+    opts: StatsOpts,
 ) -> String {
     use std::fmt::Write as _;
+
+    let show_percent = opts.show_percent;
+    let show_cost = opts.show_cost_per_shot;
+    let currency = if stats_cfg.currency.trim().is_empty() {
+        "JPY"
+    } else {
+        stats_cfg.currency.trim()
+    };
 
     let mut out = String::new();
     let _ = writeln!(out, "Logical Assets    : {}", report.total_assets);
@@ -1251,22 +1300,36 @@ fn format_stats_text(
 
     let _ = writeln!(out, "\nBy Camera (Assets):");
     for b in &report.by_camera {
-        if show_percent {
-            let p = calc_percent(b.count, report.total_assets);
-            let _ = writeln!(out, "  - {:<32} {:>8}  ({:>6.2}%)", b.label, b.count, p);
+        let pct_col = if show_percent {
+            format!("  ({:>6.2}%)", calc_percent(b.count, report.total_assets))
         } else {
-            let _ = writeln!(out, "  - {:<32} {:>8}", b.label, b.count);
-        }
+            String::new()
+        };
+        let cost_col = if show_cost {
+            calc_cost_per_shot(stats_cfg.camera_prices.get(&b.label).copied(), b.count)
+                .map(|c| format!("  [{}]", format_cost_per_shot(c, currency)))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let _ = writeln!(out, "  - {:<32} {:>8}{}{}", b.label, b.count, pct_col, cost_col);
     }
 
     let _ = writeln!(out, "\nBy Lens (Assets):");
     for b in &report.by_lens {
-        if show_percent {
-            let p = calc_percent(b.count, report.total_assets);
-            let _ = writeln!(out, "  - {:<32} {:>8}  ({:>6.2}%)", b.label, b.count, p);
+        let pct_col = if show_percent {
+            format!("  ({:>6.2}%)", calc_percent(b.count, report.total_assets))
         } else {
-            let _ = writeln!(out, "  - {:<32} {:>8}", b.label, b.count);
-        }
+            String::new()
+        };
+        let cost_col = if show_cost {
+            calc_cost_per_shot(stats_cfg.lens_prices.get(&b.label).copied(), b.count)
+                .map(|c| format!("  [{}]", format_cost_per_shot(c, currency)))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let _ = writeln!(out, "  - {:<32} {:>8}{}{}", b.label, b.count, pct_col, cost_col);
     }
 
     if let Some(years) = by_year {
@@ -1300,11 +1363,18 @@ fn format_stats_text(
             } else {
                 String::new()
             };
+            let cost_col = if show_cost {
+                calc_cost_per_shot(stats_cfg.camera_prices.get(&c.name).copied(), c.assets)
+                    .map(|cost| format!("  [{}]", format_cost_per_shot(cost, currency)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let partner = c.top_partner.as_deref().unwrap_or("-");
             let _ = writeln!(
                 out,
-                "  - {:<26}  {}  {:>8}{}  ({:>4} days)  top_lens={}",
-                c.name, span, c.assets, pct_col, c.active_days, partner
+                "  - {:<26}  {}  {:>8}{}  ({:>4} days)  top_lens={}{}",
+                c.name, span, c.assets, pct_col, c.active_days, partner, cost_col
             );
         }
 
@@ -1320,11 +1390,70 @@ fn format_stats_text(
             } else {
                 String::new()
             };
+            let cost_col = if show_cost {
+                calc_cost_per_shot(stats_cfg.lens_prices.get(&l.name).copied(), l.assets)
+                    .map(|cost| format!("  [{}]", format_cost_per_shot(cost, currency)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let partner = l.top_partner.as_deref().unwrap_or("-");
             let _ = writeln!(
                 out,
-                "  - {:<44}  {}  {:>8}{}  ({:>4} days)  top_camera={}",
-                l.name, span, l.assets, pct_col, l.active_days, partner
+                "  - {:<44}  {}  {:>8}{}  ({:>4} days)  top_camera={}{}",
+                l.name, span, l.assets, pct_col, l.active_days, partner, cost_col
+            );
+        }
+    }
+
+    if show_cost {
+        let mut priced_items: Vec<(&str, &str, f64, i64, f64)> = Vec::new();
+        for b in &report.by_camera {
+            if let Some(&price) = stats_cfg.camera_prices.get(&b.label) {
+                if let Some(cps) = calc_cost_per_shot(Some(price), b.count) {
+                    priced_items.push(("camera", &b.label, price, b.count, cps));
+                }
+            }
+        }
+        for b in &report.by_lens {
+            if let Some(&price) = stats_cfg.lens_prices.get(&b.label) {
+                if let Some(cps) = calc_cost_per_shot(Some(price), b.count) {
+                    priced_items.push(("lens", &b.label, price, b.count, cps));
+                }
+            }
+        }
+        let _ = writeln!(out, "\nCost Per Shot Summary ({currency}):");
+        if priced_items.is_empty() {
+            let _ = writeln!(
+                out,
+                "  (no matching gear prices configured in [stats.camera_prices] / [stats.lens_prices])"
+            );
+        } else {
+            priced_items.sort_by(|a, b| a.4.total_cmp(&b.4));
+            let total_spend: f64 = priced_items.iter().map(|x| x.2).sum();
+            let best = priced_items.first().unwrap();
+            let priciest = priced_items.last().unwrap();
+            let _ = writeln!(
+                out,
+                "  - Matched priced gear : {} items (total {:.0} {currency})",
+                priced_items.len(),
+                total_spend
+            );
+            let _ = writeln!(
+                out,
+                "  - Best value          : [{}] {} — {} ({} assets)",
+                best.0,
+                best.1,
+                format_cost_per_shot(best.4, currency),
+                best.3
+            );
+            let _ = writeln!(
+                out,
+                "  - Priciest per shot   : [{}] {} — {} ({} assets)",
+                priciest.0,
+                priciest.1,
+                format_cost_per_shot(priciest.4, currency),
+                priciest.3
             );
         }
     }
@@ -1332,30 +1461,32 @@ fn format_stats_text(
     out
 }
 
-fn cmd_stats(
-    config_path: &Path,
-    show_percent: bool,
-    show_by_year: bool,
-    show_gear_history: bool,
-    format: OutputFormat,
-) -> Result<()> {
+fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Result<()> {
     let cfg = load_config_or_default(config_path)?;
     let db = Database::open(&cfg.general.db_path)?;
     let report = db.stats()?;
-    let by_year = if show_by_year {
+    let by_year = if opts.show_by_year {
         Some(db.stats_by_year()?)
     } else {
         None
     };
-    let gear_history = if show_gear_history {
+    let gear_history = if opts.show_gear_history {
         Some(db.gear_history()?)
     } else {
         None
     };
 
+    let show_percent = opts.show_percent;
+    let show_cost = opts.show_cost_per_shot;
+    let currency = if cfg.stats.currency.trim().is_empty() {
+        "JPY"
+    } else {
+        cfg.stats.currency.trim()
+    };
+
     match format {
         OutputFormat::Json | OutputFormat::Jsonl => {
-            if !show_percent && by_year.is_none() && gear_history.is_none() {
+            if !show_percent && !show_cost && by_year.is_none() && gear_history.is_none() {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 #[derive(Serialize)]
@@ -1374,6 +1505,10 @@ fn cmd_stats(
                     count: i64,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     percent: Option<f64>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    purchase_price: Option<f64>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    cost_per_shot: Option<f64>,
                 }
                 #[derive(Serialize)]
                 struct YearStatsJson<'a> {
@@ -1395,6 +1530,10 @@ fn cmd_stats(
                     first_captured: Option<&'a str>,
                     last_captured: Option<&'a str>,
                     top_partner: Option<&'a str>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    purchase_price: Option<f64>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    cost_per_shot: Option<f64>,
                 }
                 #[derive(Serialize)]
                 struct GearHistoryJson<'a> {
@@ -1410,6 +1549,8 @@ fn cmd_stats(
                     backed_up_contents: i64,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     backed_up_percent: Option<f64>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    currency: Option<&'a str>,
                     by_format: Vec<FormatBucketJson<'a>>,
                     by_camera: Vec<AssetBucketJson<'a>>,
                     by_lens: Vec<AssetBucketJson<'a>>,
@@ -1432,6 +1573,7 @@ fn cmd_stats(
                             report.total_contents,
                         ))
                     }),
+                    currency: show_cost.then_some(currency),
                     by_format: report
                         .by_format
                         .iter()
@@ -1450,21 +1592,37 @@ fn cmd_stats(
                     by_camera: report
                         .by_camera
                         .iter()
-                        .map(|b| AssetBucketJson {
-                            label: &b.label,
-                            count: b.count,
-                            percent: show_percent
-                                .then(|| round_pct2(calc_percent(b.count, report.total_assets))),
+                        .map(|b| {
+                            let price = show_cost
+                                .then(|| cfg.stats.camera_prices.get(&b.label).copied())
+                                .flatten();
+                            AssetBucketJson {
+                                label: &b.label,
+                                count: b.count,
+                                percent: show_percent.then(|| {
+                                    round_pct2(calc_percent(b.count, report.total_assets))
+                                }),
+                                purchase_price: price,
+                                cost_per_shot: calc_cost_per_shot(price, b.count).map(round_pct2),
+                            }
                         })
                         .collect(),
                     by_lens: report
                         .by_lens
                         .iter()
-                        .map(|b| AssetBucketJson {
-                            label: &b.label,
-                            count: b.count,
-                            percent: show_percent
-                                .then(|| round_pct2(calc_percent(b.count, report.total_assets))),
+                        .map(|b| {
+                            let price = show_cost
+                                .then(|| cfg.stats.lens_prices.get(&b.label).copied())
+                                .flatten();
+                            AssetBucketJson {
+                                label: &b.label,
+                                count: b.count,
+                                percent: show_percent.then(|| {
+                                    round_pct2(calc_percent(b.count, report.total_assets))
+                                }),
+                                purchase_price: price,
+                                cost_per_shot: calc_cost_per_shot(price, b.count).map(round_pct2),
+                            }
                         })
                         .collect(),
                     by_storage: &report.by_storage,
@@ -1486,31 +1644,47 @@ fn cmd_stats(
                         cameras: gh
                             .cameras
                             .iter()
-                            .map(|c| GearTimelineJson {
-                                name: &c.name,
-                                assets: c.assets,
-                                percent: show_percent.then(|| {
-                                    round_pct2(calc_percent(c.assets, report.total_assets))
-                                }),
-                                active_days: c.active_days,
-                                first_captured: c.first_captured.as_deref(),
-                                last_captured: c.last_captured.as_deref(),
-                                top_partner: c.top_partner.as_deref(),
+                            .map(|c| {
+                                let price = show_cost
+                                    .then(|| cfg.stats.camera_prices.get(&c.name).copied())
+                                    .flatten();
+                                GearTimelineJson {
+                                    name: &c.name,
+                                    assets: c.assets,
+                                    percent: show_percent.then(|| {
+                                        round_pct2(calc_percent(c.assets, report.total_assets))
+                                    }),
+                                    active_days: c.active_days,
+                                    first_captured: c.first_captured.as_deref(),
+                                    last_captured: c.last_captured.as_deref(),
+                                    top_partner: c.top_partner.as_deref(),
+                                    purchase_price: price,
+                                    cost_per_shot: calc_cost_per_shot(price, c.assets)
+                                        .map(round_pct2),
+                                }
                             })
                             .collect(),
                         lenses: gh
                             .lenses
                             .iter()
-                            .map(|l| GearTimelineJson {
-                                name: &l.name,
-                                assets: l.assets,
-                                percent: show_percent.then(|| {
-                                    round_pct2(calc_percent(l.assets, report.total_assets))
-                                }),
-                                active_days: l.active_days,
-                                first_captured: l.first_captured.as_deref(),
-                                last_captured: l.last_captured.as_deref(),
-                                top_partner: l.top_partner.as_deref(),
+                            .map(|l| {
+                                let price = show_cost
+                                    .then(|| cfg.stats.lens_prices.get(&l.name).copied())
+                                    .flatten();
+                                GearTimelineJson {
+                                    name: &l.name,
+                                    assets: l.assets,
+                                    percent: show_percent.then(|| {
+                                        round_pct2(calc_percent(l.assets, report.total_assets))
+                                    }),
+                                    active_days: l.active_days,
+                                    first_captured: l.first_captured.as_deref(),
+                                    last_captured: l.last_captured.as_deref(),
+                                    top_partner: l.top_partner.as_deref(),
+                                    purchase_price: price,
+                                    cost_per_shot: calc_cost_per_shot(price, l.assets)
+                                        .map(round_pct2),
+                                }
                             })
                             .collect(),
                     }),
@@ -1525,7 +1699,8 @@ fn cmd_stats(
                     &report,
                     by_year.as_deref(),
                     gear_history.as_ref(),
-                    show_percent
+                    &cfg.stats,
+                    opts
                 )
             );
         }
@@ -2139,9 +2314,18 @@ backup_mode = "external"
             by_storage: vec![],
         };
 
-        let plain = format_stats_text(&report, None, None, false);
+        let mut stats_cfg = StatsConfig::default();
+        stats_cfg
+            .camera_prices
+            .insert("Canon EOS R5m2".into(), 600_000.0);
+        stats_cfg
+            .lens_prices
+            .insert("RF100-500mm F4.5-7.1 L IS USM".into(), 360_000.0);
+
+        let plain = format_stats_text(&report, None, None, &stats_cfg, StatsOpts::default());
         assert!(plain.contains("Backed-up Contents: 150 / 200\n"));
         assert!(!plain.contains('%'));
+        assert!(!plain.contains("JPY/shot"));
 
         let yearly = vec![wing_photovault_db::YearStatsRow {
             year: "2025".into(),
@@ -2169,7 +2353,18 @@ backup_mode = "external"
             }],
         };
 
-        let with_pct = format_stats_text(&report, Some(&yearly), Some(&gh), true);
+        let with_pct = format_stats_text(
+            &report,
+            Some(&yearly),
+            Some(&gh),
+            &stats_cfg,
+            StatsOpts {
+                show_percent: true,
+                show_by_year: true,
+                show_gear_history: true,
+                show_cost_per_shot: true,
+            },
+        );
         assert!(with_pct.contains("Backed-up Contents: 150 / 200 (75.00%)"));
         assert!(with_pct.contains("50.00%"));
         assert!(with_pct.contains("80.00%"));
@@ -2179,6 +2374,9 @@ backup_mode = "external"
         assert!(with_pct.contains("Camera Timeline (by first capture):"));
         assert!(with_pct.contains("2025-01-05 .. 2025-11-20"));
         assert!(with_pct.contains("Lens Timeline (by first capture):"));
+        assert!(with_pct.contains("[8000 JPY/shot]"));
+        assert!(with_pct.contains("[7200 JPY/shot]"));
+        assert!(with_pct.contains("Cost Per Shot Summary (JPY):"));
 
         // Zero-division guard on empty DB
         let empty = StatsReport {
@@ -2192,7 +2390,17 @@ backup_mode = "external"
             by_lens: vec![],
             by_storage: vec![],
         };
-        let empty_pct = format_stats_text(&empty, None, None, true);
+        let empty_pct = format_stats_text(
+            &empty,
+            None,
+            None,
+            &stats_cfg,
+            StatsOpts {
+                show_percent: true,
+                show_cost_per_shot: true,
+                ..Default::default()
+            },
+        );
         assert!(empty_pct.contains("Backed-up Contents: 0 / 0 (0.00%)"));
     }
 }

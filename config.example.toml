@@ -43,6 +43,18 @@ persistent_exiftool = true
 # "Unknown 17-85mm" = "EF-S17-85mm f/4-5.6 IS USM"
 # "Canon RF200-800mm F6.3-9 IS USM" = "RF200-800mm F6.3-9 IS USM"
 
+[stats]
+# `wingpv stats --cost-per-shot` で1ショットあたり単価を算出するための任意設定
+currency = "JPY"
+
+[stats.camera_prices]
+# "Canon EOS R5m2" = 600000
+# "Canon EOS 7D Mark II" = 200000
+
+[stats.lens_prices]
+# "RF100-500mm F4.5-7.1 L IS USM" = 360000
+# "EF100-400mm f/4.5-5.6L IS II USM" = 250000
+
 # 複数ストレージ定義（同一階層に複数ドライブ登録可能、UNCパス対応）
 # access_mode: "managed" | "read_only"
 # backup_mode: "none" | "managed" | "external"

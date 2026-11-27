@@ -22,6 +22,8 @@ pub struct Config {
     #[serde(default)]
     pub exif: ExifConfig,
     #[serde(default)]
+    pub stats: StatsConfig,
+    #[serde(default)]
     pub storages: Vec<StorageConfig>,
 }
 
@@ -172,6 +174,27 @@ impl Default for ExifConfig {
     }
 }
 
+/// Optional fun/personal statistics settings (e.g. purchase prices for `--cost-per-shot`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsConfig {
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    #[serde(default)]
+    pub camera_prices: HashMap<String, f64>,
+    #[serde(default)]
+    pub lens_prices: HashMap<String, f64>,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            currency: default_currency(),
+            camera_prices: HashMap::new(),
+            lens_prices: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     pub id: String,
@@ -236,6 +259,20 @@ impl Config {
                 return Err(CoreError::ConfigInvalid(format!(
                     "storage '{}' has backup_mode = 'external' and must set access_mode = 'read_only'",
                     s.id
+                )));
+            }
+        }
+        for (name, &price) in &self.stats.camera_prices {
+            if !price.is_finite() || price < 0.0 {
+                return Err(CoreError::ConfigInvalid(format!(
+                    "stats.camera_prices['{name}'] must be a finite non-negative number"
+                )));
+            }
+        }
+        for (name, &price) in &self.stats.lens_prices {
+            if !price.is_finite() || price < 0.0 {
+                return Err(CoreError::ConfigInvalid(format!(
+                    "stats.lens_prices['{name}'] must be a finite non-negative number"
                 )));
             }
         }
@@ -324,6 +361,10 @@ fn default_db_batch_size() -> usize {
     1000
 }
 
+fn default_currency() -> String {
+    "JPY".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +378,7 @@ mod tests {
             hash: HashConfig::default(),
             performance: PerformanceConfig::default(),
             exif: ExifConfig::default(),
+            stats: StatsConfig::default(),
             storages: vec![StorageConfig {
                 id: "nas_ext".into(),
                 root: PathBuf::from(r"\\eagle\photos"),
@@ -378,5 +420,22 @@ mod tests {
         };
         assert!(managed_backup.allows_mutation());
         assert!(!managed_backup.allows_duplicate_quarantine());
+    }
+
+    #[test]
+    fn rejects_negative_gear_prices_in_stats_config() {
+        let mut stats = StatsConfig::default();
+        stats.lens_prices.insert("RF100-500mm".into(), -100.0);
+        let cfg = Config {
+            host: HostConfig::default(),
+            general: GeneralConfig::default(),
+            scan: ScanConfig::default(),
+            hash: HashConfig::default(),
+            performance: PerformanceConfig::default(),
+            exif: ExifConfig::default(),
+            stats,
+            storages: vec![],
+        };
+        assert!(cfg.validate().is_err());
     }
 }

@@ -96,6 +96,7 @@ struct MiniUiApp {
     stats_percent: bool,
     stats_by_year: bool,
     stats_gear_history: bool,
+    stats_cost_per_shot: bool,
     confirm_normalize_apply: bool,
     find_params: FindParams,
 
@@ -149,6 +150,7 @@ impl MiniUiApp {
             stats_percent: true,
             stats_by_year: false,
             stats_gear_history: false,
+            stats_cost_per_shot: false,
             confirm_normalize_apply: false,
             find_params: FindParams::default(),
             scan_params: ScanParams::default(),
@@ -757,6 +759,7 @@ impl MiniUiApp {
             ui.checkbox(&mut self.stats_percent, "--percent");
             ui.checkbox(&mut self.stats_by_year, "--by-year");
             ui.checkbox(&mut self.stats_gear_history, "--gear-history");
+            ui.checkbox(&mut self.stats_cost_per_shot, "--cost-per-shot");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {
@@ -775,6 +778,7 @@ impl MiniUiApp {
                         self.stats_percent,
                         self.stats_by_year,
                         self.stats_gear_history,
+                        self.stats_cost_per_shot,
                     );
                     self.run_cli(ctx, args);
                 }

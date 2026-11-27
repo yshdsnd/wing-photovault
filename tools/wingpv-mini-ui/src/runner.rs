@@ -108,6 +108,7 @@ pub fn build_stats_args(
     percent: bool,
     by_year: bool,
     gear_history: bool,
+    cost_per_shot: bool,
 ) -> Vec<String> {
     let mut args = build_simple_args(config_path, json, "stats");
     if percent {
@@ -118,6 +119,9 @@ pub fn build_stats_args(
     }
     if gear_history {
         args.push("--gear-history".to_string());
+    }
+    if cost_per_shot {
+        args.push("--cost-per-shot".to_string());
     }
     args
 }
