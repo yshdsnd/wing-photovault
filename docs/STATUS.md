@@ -2,7 +2,7 @@
 
 - Last Updated: 2026-11-27
 - Current Phase: **Phase 1（読み取り専用インデックス・検索・統計・ベンチマーク・NAS マニフェスト連携）**
-- Branch: `main`（全 20 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
+- Branch: `main`（全 21 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
 
@@ -33,7 +33,7 @@
 - `init` / `scan`（`--storage`, `--full`, `--export-jsonl`, `--cooldown-every`, `--cooldown-secs`, `--max-files`）
 - `export-manifest` / `import-manifest`（FreeBSD NAS ローカルスキャン → Windows DB 取り込み、`[exif.lens_aliases]` 自動適用）
 - `normalize-lenses`（再スキャン不要で既存 DB の `lens_model_raw` から `[exif.lens_aliases]` を再適用、`--dry-run` 読み取り専用プレビュー対応）
-- `status` / `stats`（`--percent`, `--by-year`, `--gear-history` 使用機材年表対応）/ `find` / `benchmark`（`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
+- `status` / `stats`（`--percent`, `--by-year`, `--gear-history` 使用機材年表対応）/ `find`（キーセットページング `--cursor`, `--page-info` 対応）/ `benchmark`（`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
 
 ### テスト用ミニ UI (`tools/wingpv-mini-ui` / バイナリ名 `wingpv-mini-ui`)
 - Rust (`egui` / `eframe` + `rfd`) による単体実行 `.exe` ツール（ヘッドレス FreeBSD ビルドに影響しないようワークスペース `exclude` で分離しつつ、`wing-photovault-core` の型・Fail Closed 検証を共有）
@@ -58,7 +58,6 @@
 1. **FreeBSD NAS ローカルスキャン実証**（手順: [docs/nas-local-scan-freebsd.md](nas-local-scan-freebsd.md)）
    - FreeBSD 側でのビルド・インターバル付きスキャン完走 → `export-manifest` → Windows 側 `import-manifest` で `Backed-up Contents` 確認
 2. **Phase 1 残タスク（大規模・品質仕上げ）**
-   - `find` のキーセットページング対応（数十万〜数百万件向け）
    - `wingpv benchmark --db-scale <N>`（1万〜100万件のダミー DB 検索・集計ベンチマーク）
    - 走査〜ハッシュ/EXIF〜DB 書込の有界キューによるストリーミングパイプライン化（全件 `Vec` 保持の解消）
    - 動画（MP4/MOV）のメタデータ取得確認、`.xmp` / `.thm` サイドカー認識の土台

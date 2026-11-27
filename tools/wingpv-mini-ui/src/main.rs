@@ -830,6 +830,16 @@ impl MiniUiApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.find_params.limit).desired_width(100.0),
                 );
+                ui.label("cursor (任意):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.find_params.cursor)
+                        .desired_width(220.0)
+                        .hint_text("v1:<file_id>:<captured_at>"),
+                );
+                ui.end_row();
+
+                ui.label("");
+                ui.checkbox(&mut self.find_params.page_info, "JSON ページ情報 (--page-info)");
                 ui.label("");
                 ui.add_enabled_ui(!running, |ui| {
                     if ui.button("find 実行").clicked() {

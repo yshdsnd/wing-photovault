@@ -15,6 +15,8 @@ pub struct FindParams {
     pub from: String,
     pub to: String,
     pub limit: String,
+    pub cursor: String,
+    pub page_info: bool,
     pub json_output: bool,
 }
 
@@ -28,6 +30,8 @@ impl Default for FindParams {
             from: String::new(),
             to: String::new(),
             limit: "100".to_string(),
+            cursor: String::new(),
+            page_info: false,
             json_output: false,
         }
     }
@@ -149,6 +153,13 @@ pub fn build_find_args(config_path: &Path, params: &FindParams) -> Vec<String> {
             args.push("--limit".to_string());
             args.push(n.to_string());
         }
+    }
+    if !params.cursor.trim().is_empty() {
+        args.push("--cursor".to_string());
+        args.push(params.cursor.trim().to_string());
+    }
+    if params.page_info {
+        args.push("--page-info".to_string());
     }
     args
 }

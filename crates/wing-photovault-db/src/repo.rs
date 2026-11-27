@@ -141,6 +141,43 @@ pub struct GearHistoryReport {
     pub lenses: Vec<GearTimelineRow>,
 }
 
+/// Opaque-style keyset pagination cursor for `find_page`, matching
+/// `ORDER BY COALESCE(a.captured_at, '') DESC, f.id ASC`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindCursor {
+    pub captured_at: String,
+    pub file_id: i64,
+}
+
+impl FindCursor {
+    pub fn encode(&self) -> String {
+        format!("v1:{}:{}", self.file_id, self.captured_at)
+    }
+
+    pub fn decode(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        let rest = trimmed
+            .strip_prefix("v1:")
+            .ok_or_else(|| "invalid cursor format: expected 'v1:<file_id>:<captured_at>'".to_string())?;
+        let (id_str, captured_at) = rest
+            .split_once(':')
+            .ok_or_else(|| "invalid cursor format: missing separator".to_string())?;
+        let file_id: i64 = id_str
+            .parse()
+            .map_err(|_| "invalid cursor file_id: expected positive integer".to_string())?;
+        if file_id <= 0 {
+            return Err("invalid cursor file_id: must be > 0".to_string());
+        }
+        if captured_at.len() > 64 || captured_at.chars().any(|c| c.is_control()) {
+            return Err("invalid cursor captured_at value".to_string());
+        }
+        Ok(Self {
+            captured_at: captured_at.to_string(),
+            file_id,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FindFilter {
     pub storage_id: Option<String>,
@@ -150,6 +187,14 @@ pub struct FindFilter {
     pub from_date: Option<String>,
     pub to_date: Option<String>,
     pub limit: Option<i64>,
+    pub cursor: Option<FindCursor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FindPage {
+    pub items: Vec<FindRow>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1255,6 +1300,13 @@ impl Database {
     }
 
     pub fn find(&self, filter: &FindFilter) -> DbResult<Vec<FindRow>> {
+        Ok(self.find_page(filter)?.items)
+    }
+
+    /// Keyset-paginated search over present files ordered by
+    /// `COALESCE(a.captured_at, '') DESC, f.id ASC`.
+    /// Uses `LIMIT + 1` probing to determine `has_more` and `next_cursor` without `OFFSET`.
+    pub fn find_page(&self, filter: &FindFilter) -> DbResult<FindPage> {
         let mut sql = String::from(
             "SELECT f.id, f.asset_id, a.public_id, f.storage_id, f.rel_path,
                     COALESCE(c.format, f.ext), f.byte_size,
@@ -1291,12 +1343,21 @@ impl Database {
             sql.push_str(" AND a.captured_at <= ?");
             bind_values.push(to.clone().into());
         }
+        if let Some(cursor) = &filter.cursor {
+            sql.push_str(
+                " AND (COALESCE(a.captured_at, '') < ? OR (COALESCE(a.captured_at, '') = ? AND f.id > ?))",
+            );
+            bind_values.push(cursor.captured_at.clone().into());
+            bind_values.push(cursor.captured_at.clone().into());
+            bind_values.push(cursor.file_id.into());
+        }
 
         sql.push_str(" ORDER BY COALESCE(a.captured_at, '') DESC, f.id ASC");
 
-        if let Some(limit) = filter.limit {
+        let effective_limit = filter.limit.map(|l| l.max(1));
+        if let Some(limit) = effective_limit {
             sql.push_str(" LIMIT ?");
-            bind_values.push(limit.into());
+            bind_values.push(limit.saturating_add(1).into());
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1319,11 +1380,36 @@ impl Database {
             })
         })?;
 
-        let mut out = Vec::new();
+        let mut items = Vec::new();
         for row in rows {
-            out.push(row?);
+            items.push(row?);
         }
-        Ok(out)
+
+        let has_more = match effective_limit {
+            Some(limit) if (items.len() as i64) > limit => {
+                items.truncate(limit as usize);
+                true
+            }
+            _ => false,
+        };
+
+        let next_cursor = if has_more {
+            items.last().map(|last| {
+                FindCursor {
+                    captured_at: last.captured_at.clone().unwrap_or_default(),
+                    file_id: last.file_id,
+                }
+                .encode()
+            })
+        } else {
+            None
+        };
+
+        Ok(FindPage {
+            items,
+            has_more,
+            next_cursor,
+        })
     }
 
     /// Re-apply `[exif.lens_aliases]` to existing `assets` and `content_metadata` rows
@@ -2281,5 +2367,95 @@ mod tests {
         assert_eq!(gh.lenses.len(), 3);
         assert_eq!(gh.lenses[0].name, "EF100-400mm f/4.5-5.6L IS USM");
         assert_eq!(gh.lenses[0].top_partner.as_deref(), Some("Canon EOS 10D"));
+    }
+
+    #[test]
+    fn keyset_pagination_traverses_ties_and_nulls_without_duplicates_or_gaps() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("pc", "PC", "windows").unwrap();
+        let st = StorageConfig {
+            id: "ssd_hot".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Nvme,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&st, "pc", StorageStatus::Online).unwrap();
+        let run1 = db.start_scan_run(&st.id, "incremental").unwrap();
+
+        let make = |rel: &str, hash: &str, dt: Option<&str>| UpsertFileInput {
+            storage_id: st.id.clone(),
+            rel_path: rel.into(),
+            file_name: rel.into(),
+            file_stem: rel.into(),
+            ext: ".jpg".into(),
+            byte_size: 100,
+            mtime_ns: 100,
+            ctime_ns: None,
+            media_kind: MediaKind::Image,
+            format: "jpeg".into(),
+            role: FileRole::Original,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: dt.map(|d| ExtractedMetadata {
+                extractor: "native".into(),
+                captured_at: Some(d.into()),
+                ..Default::default()
+            }),
+        };
+
+        // 5 files: 2 burst ties at 2026-11-24, 1 older at 2025-01-01, 2 NULL timestamps
+        let items = vec![
+            make("burst_a.jpg", "h1", Some("2026-11-24T10:00:00")),
+            make("burst_b.jpg", "h2", Some("2026-11-24T10:00:00")),
+            make("older.jpg", "h3", Some("2025-01-01T08:00:00")),
+            make("null_a.jpg", "h4", None),
+            make("null_b.jpg", "h5", None),
+        ];
+        db.upsert_scanned_batch(&items, run1).unwrap();
+
+        let mut collected = Vec::new();
+        let mut cursor: Option<FindCursor> = None;
+        let mut pages = 0;
+
+        loop {
+            let page = db
+                .find_page(&FindFilter {
+                    limit: Some(2),
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+            pages += 1;
+            collected.extend(page.items.into_iter().map(|r| r.rel_path));
+            if !page.has_more {
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            let raw_cursor = page.next_cursor.expect("has_more must return next_cursor");
+            cursor = Some(FindCursor::decode(&raw_cursor).unwrap());
+        }
+
+        assert_eq!(pages, 3);
+        assert_eq!(
+            collected,
+            vec![
+                "burst_a.jpg",
+                "burst_b.jpg",
+                "older.jpg",
+                "null_a.jpg",
+                "null_b.jpg"
+            ]
+        );
+
+        // Fail Closed cursor decoding validation
+        assert!(FindCursor::decode("invalid").is_err());
+        assert!(FindCursor::decode("v1:0:2026-11-24").is_err());
+        assert!(FindCursor::decode("v1:-5:2026-11-24").is_err());
+        assert!(FindCursor::decode("v1:1:bad\nctrl").is_err());
     }
 }

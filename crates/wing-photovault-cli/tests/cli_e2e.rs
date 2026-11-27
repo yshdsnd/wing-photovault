@@ -144,6 +144,52 @@ failure_domain = "nas-eagle"
     assert!(arr[0]["asset_public_id"].as_str().is_some());
     assert_eq!(arr[0]["asset_public_id"], arr[1]["asset_public_id"]);
 
+    // 5b. find keyset pagination with --limit 1 --page-info --cursor
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "find",
+            "--ext-format",
+            "cr3",
+            "--limit",
+            "1",
+            "--page-info",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find page 1 failed: {:?}", out);
+    let page1: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(page1["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page1["has_more"], true);
+    let cursor = page1["next_cursor"].as_str().unwrap();
+
+    let out = Command::new(wingpv_bin())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "find",
+            "--ext-format",
+            "cr3",
+            "--limit",
+            "1",
+            "--page-info",
+            "--cursor",
+            cursor,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find page 2 failed: {:?}", out);
+    let page2: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(page2["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page2["has_more"], false);
+    assert!(page2["next_cursor"].is_null());
+    assert_ne!(page1["items"][0]["file_id"], page2["items"][0]["file_id"]);
+
     // 6. Invariant: offline storage must NOT mark its files as missing
     let nas_hidden = tmp.path().join("nas_backup_offline");
     fs::rename(&nas_root, &nas_hidden).unwrap();

@@ -22,7 +22,7 @@ use wing_photovault_core::model::{
     StorageStatus, StorageTier,
 };
 use wing_photovault_core::scanner::{discover_storage_files, DiscoveredFile};
-use wing_photovault_db::{Database, FindFilter, ScanRunSummary, UpsertFileInput};
+use wing_photovault_db::{Database, FindCursor, FindFilter, ScanRunSummary, UpsertFileInput};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
@@ -156,6 +156,12 @@ enum Commands {
         to: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: i64,
+        /// Keyset pagination cursor returned by a previous page (`v1:<file_id>:<captured_at>`)
+        #[arg(long)]
+        cursor: Option<String>,
+        /// With `--format json`, wrap results in `{ items, has_more, next_cursor }`
+        #[arg(long)]
+        page_info: bool,
     },
 
     /// Benchmark scanning, BLAKE3 vs SHA-256 hashing, and EXIF extraction on a directory
@@ -222,19 +228,32 @@ fn main() -> Result<()> {
             from,
             to,
             limit,
-        } => cmd_find(
-            &cli.config,
-            FindFilter {
-                storage_id: storage,
-                format: ext_format,
-                camera,
-                lens,
-                from_date: from,
-                to_date: to,
-                limit: Some(limit),
-            },
-            cli.format,
-        ),
+            cursor,
+            page_info,
+        } => {
+            let decoded_cursor = match cursor {
+                Some(raw) => Some(
+                    FindCursor::decode(&raw)
+                        .map_err(|msg| anyhow::anyhow!("invalid --cursor: {msg}"))?,
+                ),
+                None => None,
+            };
+            cmd_find(
+                &cli.config,
+                FindFilter {
+                    storage_id: storage,
+                    format: ext_format,
+                    camera,
+                    lens,
+                    from_date: from,
+                    to_date: to,
+                    limit: Some(limit),
+                    cursor: decoded_cursor,
+                },
+                page_info,
+                cli.format,
+            )
+        }
         Commands::Benchmark {
             path,
             limit,
@@ -1318,20 +1337,34 @@ fn cmd_stats(
     Ok(())
 }
 
-fn cmd_find(config_path: &Path, filter: FindFilter, format: OutputFormat) -> Result<()> {
+fn cmd_find(
+    config_path: &Path,
+    filter: FindFilter,
+    page_info: bool,
+    format: OutputFormat,
+) -> Result<()> {
     let cfg = load_config_or_default(config_path)?;
     let db = Database::open(&cfg.general.db_path)?;
-    let rows = db.find(&filter)?;
+    let page = db.find_page(&filter)?;
 
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+        OutputFormat::Json => {
+            if page_info {
+                println!("{}", serde_json::to_string_pretty(&page)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&page.items)?);
+            }
+        }
         OutputFormat::Jsonl => {
-            for r in &rows {
+            for r in &page.items {
                 println!("{}", serde_json::to_string(r)?);
+            }
+            if let Some(next) = &page.next_cursor {
+                eprintln!("next_cursor={next}");
             }
         }
         OutputFormat::Text => {
-            for r in &rows {
+            for r in &page.items {
                 println!(
                     "{} | {:<16} | {:<4} | {:<19} | {:<18} | {}",
                     r.storage_id,
@@ -1342,7 +1375,11 @@ fn cmd_find(config_path: &Path, filter: FindFilter, format: OutputFormat) -> Res
                     r.rel_path
                 );
             }
-            eprintln!("Found {} file(s).", rows.len());
+            if let Some(next) = &page.next_cursor {
+                eprintln!("Found {} file(s). Next page: --cursor {next}", page.items.len());
+            } else {
+                eprintln!("Found {} file(s).", page.items.len());
+            }
         }
     }
     Ok(())

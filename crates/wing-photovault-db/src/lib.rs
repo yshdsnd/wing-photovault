@@ -6,7 +6,7 @@ pub mod repo;
 
 pub use error::{DbError, DbResult};
 pub use repo::{
-    Database, ExistingFileSig, FindFilter, FindRow, GearHistoryReport, GearTimelineRow,
-    LensAliasChange, NormalizeLensesReport, PairReport, ScanRunSummary, StatsReport, StatusReport,
-    StorageStatsRow, UpsertFileInput, YearStatsRow,
+    Database, ExistingFileSig, FindCursor, FindFilter, FindPage, FindRow, GearHistoryReport,
+    GearTimelineRow, LensAliasChange, NormalizeLensesReport, PairReport, ScanRunSummary,
+    StatsReport, StatusReport, StorageStatsRow, UpsertFileInput, YearStatsRow,
 };
