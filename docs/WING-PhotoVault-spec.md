@@ -468,15 +468,18 @@ flowchart TD
 | 5 | ブラウザー、サムネイル、EXIF検索、統合表示、統計 |
 | 6 | 取り込みGUI、連写選別、評価・タグ、重複確認、管理画面、進捗 |
 | 7 | Googleフォト、縮小JPEG、OAuth、送信状態 |
-| 8 | 類似画像、ピント・ブレ、AI支援、Linux/FreeBSD、API・バインディング |
+| 8 | 類似画像、ピント・ブレ、AI支援、Linux/FreeBSD、API・バインディング、iOS PhotoKit 連携検討 |
 
 インターフェース確定後はWING-UIの並行開発も可能。
 
 ## 16. 初期対象外
-RAW現像、レタッチ、動画編集、AI完全自動削除、クラウド上のオリジナル管理、複数ユーザー同時編集、Web化、スマホ専用アプリ、仮想ファイルシステム（WinFsp / Dokan 等）、分散DB、NAS上SQLite DBの複数ホスト直接共有。
+RAW現像、レタッチ、動画編集、AI完全自動削除、クラウド上のオリジナル管理、複数ユーザー同時編集、Web化、スマホ専用アプリ（将来検討事項は第17節参照）、仮想ファイルシステム（WinFsp / Dokan 等）、分散DB、NAS上SQLite DBの複数ホスト直接共有。
 
-## 17. 未決定事項
-WING-UI 言語・フレームワーク（Qt/QML, PySide6, Tauri, egui, Slint 等）・具体デザイン、SHA-256/BLAKE3 最終選定、CR3/MakerNote 解析方式、RAW/JPEG・サイドカー判定詳細、連写判定、保持優先順位、NASディレクトリ・検証方式、robocopyと独自コピーの使い分け、マルチホスト同期方式・認証方式（mTLS等）、Lightroom SDK 適合性、Google Photos API 適合性、実測に基づく最終性能目標。
+## 17. 未決定事項・将来検討項目
+- **設計未確定事項**: WING-UI 言語・フレームワーク（Qt/QML, PySide6, Tauri, egui, Slint 等）・具体デザイン、SHA-256/BLAKE3 最終選定、CR3/MakerNote 解析方式、RAW/JPEG・サイドカー判定詳細、連写判定、保持優先順位、NASディレクトリ・検証方式、robocopyと独自コピーの使い分け、マルチホスト同期方式・認証方式（mTLS等）、Lightroom SDK 適合性、Google Photos API 適合性、実測に基づく最終性能目標。
+- **iOS 版コンパニオンアプリ / PhotoKit 連携（Proposed / Phase 8 以降の将来検討）**:
+  - Apple 公式 `PhotoKit`（`PHPhotoLibrary` / `PHAsset` / `PHAssetResourceManager`）を用い、ユーザーの明示的なフルアクセス許可のもとで iPhone「写真」アプリ内の写真・動画を非破壊リストアップ・原本ハッシュ化し、`ScanManifestRecord`（JSONL マニフェスト）または `wing-photovault-core` FFI 経由で自宅 PC/NAS カタログと突合（未バックアップ検出・モバイル検索）する構想。
+  - 検討すべき制約: iCloud 写真「ストレージを最適化」時の不要なダウンロード抑止（`isNetworkAccessAllowed = false` 等の制御）、iOS バックグラウンド実行時間制限（フォアグラウンド差分スキャン / `BGProcessingTask`）、macOS + Xcode ビルドおよび署名運用要件。当面は iPhone から NAS/PC へ転送済みファイルを通常の `wingpv scan` で管理する運用を優先する。
 
 ## 付録 A. 設計変更の理由
 ### A.1 原点と役割分担
