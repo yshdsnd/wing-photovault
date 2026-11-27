@@ -233,6 +233,13 @@ pub struct NormalizeLensesReport {
     pub changes: Vec<LensAliasChange>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SeedBenchmarkReport {
+    pub files_created: u64,
+    pub assets_created: u64,
+    pub contents_created: u64,
+}
+
 impl Database {
     pub fn open(path: &Path) -> DbResult<Self> {
         if let Some(parent) = path.parent() {
@@ -1557,6 +1564,221 @@ impl Database {
             assets_updated,
             contents_updated,
             changes,
+        })
+    }
+
+    /// Populate a fresh temporary benchmark database with `target_files` realistic synthetic
+    /// RAW+JPEG records across two storages (Hot NVMe + External Backup NAS) using standard
+    /// durable WAL batch transactions (never mutates real photo assets).
+    pub fn seed_synthetic_benchmark(&mut self, target_files: usize) -> DbResult<SeedBenchmarkReport> {
+        use std::path::PathBuf;
+        use wing_photovault_core::model::{AccessMode, BackupMode, MediaType, StorageTier};
+
+        if target_files == 0 {
+            return Ok(SeedBenchmarkReport::default());
+        }
+
+        self.upsert_host("bench-host", "Benchmark Host", "synthetic")?;
+        let hot = StorageConfig {
+            id: "ssd_hot_bench".into(),
+            root: PathBuf::from("/bench/hot"),
+            media: MediaType::Nvme,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: Some("bench-nvme".into()),
+            exclude_paths: vec![],
+        };
+        let nas = StorageConfig {
+            id: "nas_backup_bench".into(),
+            root: PathBuf::from("/bench/nas"),
+            media: MediaType::Hdd,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: Some("bench-nas".into()),
+            exclude_paths: vec![],
+        };
+        self.upsert_storage(&hot, "bench-host", StorageStatus::Online)?;
+        self.upsert_storage(&nas, "bench-host", StorageStatus::Online)?;
+        let run_hot = self.start_scan_run(&hot.id, "benchmark-seed")?;
+        let run_nas = self.start_scan_run(&nas.id, "benchmark-seed")?;
+
+        const CAMERAS: [&str; 8] = [
+            "Canon EOS R5m2",
+            "Canon EOS 7D Mark II",
+            "Canon EOS R5",
+            "Canon EOS 90D",
+            "Canon EOS R7",
+            "Canon EOS 6D Mark II",
+            "Canon EOS 10D",
+            "Canon EOS 20D",
+        ];
+        const LENSES: [&str; 8] = [
+            "RF100-500mm F4.5-7.1 L IS USM",
+            "EF100-400mm f/4.5-5.6L IS II USM",
+            "RF200-800mm F6.3-9 IS USM",
+            "EF24-105mm f/4L IS USM",
+            "Unknown 100-400mm",
+            "60-600mm F4.5-6.3 DG OS HSM | Sports 018",
+            "Unknown 28-75mm",
+            "RF24-105mm F4 L IS USM",
+        ];
+
+        let now = Utc::now().to_rfc3339();
+        let batch_assets = 5_000usize;
+        let total_assets = target_files.div_ceil(2);
+        let mut files_created = 0u64;
+        let mut assets_created = 0u64;
+        let mut contents_created = 0u64;
+
+        let mut asset_idx = 0usize;
+        while asset_idx < total_assets {
+            let chunk_end = (asset_idx + batch_assets).min(total_assets);
+            let tx = self.conn.transaction()?;
+            {
+                let mut ins_asset = tx.prepare_cached(
+                    "INSERT INTO assets (
+                        public_id, captured_at, camera_make, camera_model,
+                        lens_model_raw, lens_model, focal_length_mm, f_number,
+                        shutter_speed_s, shutter_speed_str, iso, created_at, updated_at
+                     ) VALUES (?1, ?2, 'Canon', ?3, ?4, ?4, ?5, 5.6, 0.0005, '1/2000', ?6, ?7, ?7)",
+                )?;
+                let mut ins_content = tx.prepare_cached(
+                    "INSERT INTO contents (
+                        hash_algo, hash_hex, byte_size, media_kind, format, created_at
+                     ) VALUES ('blake3', ?1, ?2, ?3, ?4, ?5)",
+                )?;
+                let mut ins_meta = tx.prepare_cached(
+                    "INSERT INTO content_metadata (
+                        content_id, extractor, captured_at, camera_make, camera_model,
+                        lens_model_raw, lens_model, focal_length_mm, f_number,
+                        shutter_speed_s, shutter_speed_str, iso, extracted_at
+                     ) VALUES (?1, 'synthetic', ?2, 'Canon', ?3, ?4, ?4, ?5, 5.6, 0.0005, '1/2000', ?6, ?7)",
+                )?;
+                let mut ins_file = tx.prepare_cached(
+                    "INSERT INTO files (
+                        storage_id, rel_path, file_name, file_stem, ext,
+                        byte_size, mtime_ns, content_id, asset_id, role,
+                        presence, last_seen_scan_id, last_seen_at, last_verified_at,
+                        created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'present', ?11, ?12, ?12, ?12, ?12)",
+                )?;
+
+                for i in asset_idx..chunk_end {
+                    let year = 2003 + (i % 24);
+                    let month = 1 + ((i / 24) % 12);
+                    let day = 1 + ((i / 288) % 28);
+                    let sec_of_day = (i * 17) % 86_400;
+                    let hour = sec_of_day / 3600;
+                    let minute = (sec_of_day % 3600) / 60;
+                    let second = sec_of_day % 60;
+                    let captured_at = format!(
+                        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+                    );
+                    let cam = CAMERAS[i % CAMERAS.len()];
+                    let lens = LENSES[(i / 3) % LENSES.len()];
+                    let focal = 100.0 + ((i % 7) as f64) * 100.0;
+                    let iso = 100i64 * (1 << (i % 6));
+                    let public_id = Uuid::now_v7().to_string();
+
+                    ins_asset.execute(params![public_id, captured_at, cam, lens, focal, iso, now])?;
+                    let asset_id = tx.last_insert_rowid();
+                    assets_created += 1;
+
+                    let (storage_id, role, scan_id) = if i % 2 == 0 {
+                        (hot.id.as_str(), "original", run_hot)
+                    } else {
+                        (nas.id.as_str(), "backup", run_nas)
+                    };
+
+                    // File 1: RAW (cr3 / cr2)
+                    if (files_created as usize) < target_files {
+                        let (ext, fmt, size) = if year >= 2019 {
+                            (".cr3", "cr3", 45_000_000i64)
+                        } else {
+                            (".cr2", "cr2", 24_000_000i64)
+                        };
+                        let hash_hex = format!("{i:032x}00000000000000000000000000000001");
+                        ins_content.execute(params![hash_hex, size, "raw", fmt, now])?;
+                        let content_id = tx.last_insert_rowid();
+                        contents_created += 1;
+                        ins_meta.execute(params![
+                            content_id,
+                            captured_at,
+                            cam,
+                            lens,
+                            focal,
+                            iso,
+                            now
+                        ])?;
+
+                        let stem = format!("IMG_{i:06}");
+                        let file_name = format!("{stem}{ext}");
+                        let rel_path = format!("{year:04}/{year:04}_{month:02}_{day:02}/{file_name}");
+                        ins_file.execute(params![
+                            storage_id,
+                            rel_path,
+                            file_name,
+                            stem,
+                            ext,
+                            size,
+                            1_700_000_000i64 + i as i64,
+                            content_id,
+                            asset_id,
+                            role,
+                            scan_id,
+                            now
+                        ])?;
+                        files_created += 1;
+                    }
+
+                    // File 2: Companion JPEG
+                    if (files_created as usize) < target_files {
+                        let size = 8_500_000i64;
+                        let hash_hex = format!("{i:032x}00000000000000000000000000000002");
+                        ins_content.execute(params![hash_hex, size, "image", "jpeg", now])?;
+                        let content_id = tx.last_insert_rowid();
+                        contents_created += 1;
+                        ins_meta.execute(params![
+                            content_id,
+                            captured_at,
+                            cam,
+                            lens,
+                            focal,
+                            iso,
+                            now
+                        ])?;
+
+                        let stem = format!("IMG_{i:06}");
+                        let file_name = format!("{stem}.JPG");
+                        let rel_path = format!("{year:04}/{year:04}_{month:02}_{day:02}/{file_name}");
+                        ins_file.execute(params![
+                            storage_id,
+                            rel_path,
+                            file_name,
+                            stem,
+                            ".jpg",
+                            size,
+                            1_700_000_000i64 + i as i64,
+                            content_id,
+                            asset_id,
+                            role,
+                            scan_id,
+                            now
+                        ])?;
+                        files_created += 1;
+                    }
+                }
+            }
+            tx.commit()?;
+            asset_idx = chunk_end;
+        }
+
+        Ok(SeedBenchmarkReport {
+            files_created,
+            assets_created,
+            contents_created,
         })
     }
 

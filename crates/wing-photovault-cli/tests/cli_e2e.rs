@@ -247,6 +247,28 @@ failure_domain = "nas-eagle"
     assert!(out.status.success());
     let bench: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(bench["blake3_ok"], 3);
+
+    // 8. benchmark --db-scale (temporary synthetic DB; never touches real assets)
+    let out = Command::new(wingpv_bin())
+        .args(["--format", "json", "benchmark", "--db-scale", "1000"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "db-scale benchmark failed: {:?}", out);
+    let db_bench: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(db_bench["files_created"], 1000);
+    assert_eq!(db_bench["assets_created"], 500);
+    assert_eq!(db_bench["present_files_verified"], 1000);
+    assert_eq!(db_bench["find_first_page_rows"], 100);
+    assert_eq!(db_bench["find_next_page_rows"], 100);
+    assert!(db_bench["db_size_bytes"].as_u64().unwrap() > 0);
+    assert!(db_bench["normalize_lenses_applied_assets"].as_u64().unwrap() > 0);
+
+    // Fail Closed: --db-scale 0 must be rejected
+    let out = Command::new(wingpv_bin())
+        .args(["benchmark", "--db-scale", "0"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
 }
 
 #[test]

@@ -164,18 +164,23 @@ enum Commands {
         page_info: bool,
     },
 
-    /// Benchmark scanning, BLAKE3 vs SHA-256 hashing, and EXIF extraction on a directory
+    /// Benchmark scanning/hashing/EXIF on a directory, or SQLite query/aggregation scale via `--db-scale <N>`
     Benchmark {
         /// Target directory to benchmark (read-only)
-        path: PathBuf,
+        #[arg(conflicts_with = "db_scale")]
+        path: Option<PathBuf>,
 
-        /// Maximum number of files to process
+        /// Maximum number of files to process (directory benchmark mode)
         #[arg(long, default_value_t = 500)]
         limit: usize,
 
-        /// Also benchmark ExifTool CLI for comparison
+        /// Also benchmark ExifTool CLI for comparison (directory benchmark mode)
         #[arg(long)]
         with_exiftool: bool,
+
+        /// Benchmark DB query/aggregation performance on a temporary synthetic DB with N files (e.g. 100000)
+        #[arg(long)]
+        db_scale: Option<usize>,
     },
 }
 
@@ -258,7 +263,18 @@ fn main() -> Result<()> {
             path,
             limit,
             with_exiftool,
-        } => cmd_benchmark(&cli.config, &path, limit, with_exiftool, cli.format),
+            db_scale,
+        } => {
+            if let Some(n) = db_scale {
+                cmd_benchmark_db_scale(n, cli.format)
+            } else if let Some(target) = path {
+                cmd_benchmark(&cli.config, &target, limit, with_exiftool, cli.format)
+            } else {
+                anyhow::bail!(
+                    "benchmark requires either a target directory <PATH> or --db-scale <N>"
+                );
+            }
+        }
     }
 }
 
@@ -1528,6 +1544,206 @@ fn cmd_benchmark(
                     report.files_tested
                 );
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_benchmark_db_scale(target_files: usize, format: OutputFormat) -> Result<()> {
+    if target_files == 0 {
+        anyhow::bail!("--db-scale must be at least 1");
+    }
+
+    struct TempBenchDir(PathBuf);
+    impl Drop for TempBenchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_dir = TempBenchDir(
+        std::env::temp_dir().join(format!("wingpv-db-bench-{}-{stamp}", std::process::id())),
+    );
+    std::fs::create_dir_all(&tmp_dir.0)?;
+    let db_path = tmp_dir.0.join("synthetic-bench.db");
+
+    let mut db = Database::open(&db_path)?;
+
+    let t_seed = Instant::now();
+    let seeded = db.seed_synthetic_benchmark(target_files)?;
+    let seed_secs = t_seed.elapsed().as_secs_f64().max(1e-9);
+
+    let db_size_bytes = ["", "-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let p = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+        })
+        .sum::<u64>();
+
+    let t_status = Instant::now();
+    let st = db.status()?;
+    let status_ms = t_status.elapsed().as_secs_f64() * 1000.0;
+
+    let t_stats = Instant::now();
+    let _stats = db.stats()?;
+    let stats_ms = t_stats.elapsed().as_secs_f64() * 1000.0;
+
+    let t_year = Instant::now();
+    let _yearly = db.stats_by_year()?;
+    let stats_by_year_ms = t_year.elapsed().as_secs_f64() * 1000.0;
+
+    let t_gh = Instant::now();
+    let _gh = db.gear_history()?;
+    let gear_history_ms = t_gh.elapsed().as_secs_f64() * 1000.0;
+
+    let t_p1 = Instant::now();
+    let page1 = db.find_page(&FindFilter {
+        limit: Some(100),
+        ..Default::default()
+    })?;
+    let find_first_page_ms = t_p1.elapsed().as_secs_f64() * 1000.0;
+
+    let (find_next_page_ms, find_next_page_rows) = if let Some(raw_cur) = &page1.next_cursor {
+        let cur = FindCursor::decode(raw_cur).map_err(|e| anyhow::anyhow!(e))?;
+        let t_p2 = Instant::now();
+        let page2 = db.find_page(&FindFilter {
+            limit: Some(100),
+            cursor: Some(cur),
+            ..Default::default()
+        })?;
+        (t_p2.elapsed().as_secs_f64() * 1000.0, page2.items.len())
+    } else {
+        (0.0, 0)
+    };
+
+    let t_filt = Instant::now();
+    let filtered = db.find_page(&FindFilter {
+        camera: Some("R5m2".to_string()),
+        lens: Some("RF100-500".to_string()),
+        limit: Some(100),
+        ..Default::default()
+    })?;
+    let find_filtered_ms = t_filt.elapsed().as_secs_f64() * 1000.0;
+
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert(
+        "Unknown 100-400mm".to_string(),
+        "EF100-400mm f/4.5-5.6L IS USM".to_string(),
+    );
+    aliases.insert(
+        "Unknown 28-75mm".to_string(),
+        "TAMRON SP AF 28-75mm F/2.8 XR Di".to_string(),
+    );
+
+    let t_nd = Instant::now();
+    let _norm_dry = db.reapply_lens_aliases(&aliases, true)?;
+    let normalize_lenses_dry_run_ms = t_nd.elapsed().as_secs_f64() * 1000.0;
+
+    let t_na = Instant::now();
+    let norm_apply = db.reapply_lens_aliases(&aliases, false)?;
+    let normalize_lenses_apply_ms = t_na.elapsed().as_secs_f64() * 1000.0;
+
+    // Close DB before dropping TempBenchDir (important on Windows file locks)
+    drop(db);
+
+    #[derive(Serialize)]
+    struct DbScaleBenchReport {
+        files_created: u64,
+        assets_created: u64,
+        contents_created: u64,
+        present_files_verified: i64,
+        db_size_bytes: u64,
+        bytes_per_file: u64,
+        seed_secs: f64,
+        seed_files_per_sec: f64,
+        status_ms: f64,
+        stats_ms: f64,
+        stats_by_year_ms: f64,
+        gear_history_ms: f64,
+        find_first_page_ms: f64,
+        find_first_page_rows: usize,
+        find_next_page_ms: f64,
+        find_next_page_rows: usize,
+        find_filtered_ms: f64,
+        find_filtered_rows: usize,
+        normalize_lenses_dry_run_ms: f64,
+        normalize_lenses_apply_ms: f64,
+        normalize_lenses_applied_assets: u64,
+    }
+
+    let report = DbScaleBenchReport {
+        files_created: seeded.files_created,
+        assets_created: seeded.assets_created,
+        contents_created: seeded.contents_created,
+        present_files_verified: st.total_present_files,
+        db_size_bytes,
+        bytes_per_file: db_size_bytes / seeded.files_created.max(1),
+        seed_secs,
+        seed_files_per_sec: seeded.files_created as f64 / seed_secs,
+        status_ms,
+        stats_ms,
+        stats_by_year_ms,
+        gear_history_ms,
+        find_first_page_ms,
+        find_first_page_rows: page1.items.len(),
+        find_next_page_ms,
+        find_next_page_rows,
+        find_filtered_ms,
+        find_filtered_rows: filtered.items.len(),
+        normalize_lenses_dry_run_ms,
+        normalize_lenses_apply_ms,
+        normalize_lenses_applied_assets: norm_apply.assets_updated,
+    };
+
+    match format {
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Text => {
+            println!("DB Scale Benchmark (temporary synthetic SQLite WAL DB):");
+            println!(
+                "  Records            : {} files / {} assets / {} contents",
+                report.files_created, report.assets_created, report.contents_created
+            );
+            println!(
+                "  DB size (incl WAL) : {} ({} B/file)",
+                human_bytes(report.db_size_bytes),
+                report.bytes_per_file
+            );
+            println!(
+                "  Seed throughput    : {:.3}s ({:.0} files/s)",
+                report.seed_secs, report.seed_files_per_sec
+            );
+            println!("  status()           : {:.2} ms", report.status_ms);
+            println!("  stats()            : {:.2} ms", report.stats_ms);
+            println!("  stats_by_year()    : {:.2} ms", report.stats_by_year_ms);
+            println!("  gear_history()     : {:.2} ms", report.gear_history_ms);
+            println!(
+                "  find page 1 (100)  : {:.2} ms ({} rows)",
+                report.find_first_page_ms, report.find_first_page_rows
+            );
+            println!(
+                "  find page 2 cursor : {:.2} ms ({} rows)",
+                report.find_next_page_ms, report.find_next_page_rows
+            );
+            println!(
+                "  find filtered      : {:.2} ms ({} rows)",
+                report.find_filtered_ms, report.find_filtered_rows
+            );
+            println!(
+                "  normalize dry-run  : {:.2} ms",
+                report.normalize_lenses_dry_run_ms
+            );
+            println!(
+                "  normalize apply    : {:.2} ms ({} assets updated)",
+                report.normalize_lenses_apply_ms, report.normalize_lenses_applied_assets
+            );
         }
     }
 

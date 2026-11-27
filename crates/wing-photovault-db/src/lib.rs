@@ -8,5 +8,5 @@ pub use error::{DbError, DbResult};
 pub use repo::{
     Database, ExistingFileSig, FindCursor, FindFilter, FindPage, FindRow, GearHistoryReport,
     GearTimelineRow, LensAliasChange, NormalizeLensesReport, PairReport, ScanRunSummary,
-    StatsReport, StatusReport, StorageStatsRow, UpsertFileInput, YearStatsRow,
+    SeedBenchmarkReport, StatsReport, StatusReport, StorageStatsRow, UpsertFileInput, YearStatsRow,
 };
