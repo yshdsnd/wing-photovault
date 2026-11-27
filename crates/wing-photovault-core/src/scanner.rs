@@ -68,6 +68,17 @@ pub fn discover_storage_files(
         }
 
         let abs_path = entry.path().to_path_buf();
+        let file_name = abs_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Skip macOS AppleDouble resource-fork metadata files (e.g. `._IMG_0001.JPG`)
+        if file_name.starts_with("._") {
+            continue;
+        }
+
         let ext = match abs_path.extension().and_then(|e| e.to_str()) {
             Some(e) => format!(".{}", e.to_ascii_lowercase()),
             None => continue,
@@ -97,11 +108,6 @@ pub fn discover_storage_files(
             }
         };
 
-        let file_name = abs_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string();
         let file_stem = abs_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -173,6 +179,8 @@ mod tests {
 
         fs::write(keep_dir.join("IMG_0001.CR3"), b"raw").unwrap();
         fs::write(keep_dir.join("IMG_0001.JPG"), b"jpg").unwrap();
+        fs::write(keep_dir.join("._IMG_0001.JPG"), b"appledouble").unwrap();
+        fs::write(keep_dir.join(".__MG_1371.JPG"), b"appledouble").unwrap();
         fs::write(keep_dir.join("notes.txt"), b"ignore").unwrap();
         fs::write(skip_dir.join("best.jpg"), b"excluded").unwrap();
 

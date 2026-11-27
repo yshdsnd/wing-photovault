@@ -87,9 +87,18 @@ fn needs_exiftool_fallback(ext: &str, native: Option<&ExtractedMetadata>) -> boo
     if m.captured_at.is_none() || m.camera_model.is_none() {
         return true;
     }
-    // Legacy Canon CR2 (e.g. EOS 20D) and CRW store lens info only in Canon MakerNote,
-    // not in standard Exif 2.3 LensModel (0xA434).
-    if matches!(ext, ".cr2" | ".crw") && m.lens_model_raw.is_none() {
+    // Legacy Canon CR2/CRW (e.g. EOS 10D/20D) and Canon EOS CR3/JPEG with 3rd-party or
+    // legacy EF lenses (e.g. EOS 90D + Sigma 17-50mm, EOS 40D JPEG-only) often leave
+    // standard Exif 2.3 LensModel (0xA434) empty while storing LensID in Canon MakerNote.
+    // Restricting CR3/JPEG fallback to interchangeable-lens Canon EOS avoids needless
+    // ExifTool overhead on fixed-lens compact cameras and smartphones.
+    if m.lens_model_raw.is_none()
+        && (matches!(ext, ".cr2" | ".crw")
+            || (matches!(ext, ".cr3" | ".jpg" | ".jpeg")
+                && m.camera_model
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("Canon EOS"))))
+    {
         return true;
     }
     false
@@ -952,6 +961,44 @@ mod tests {
         };
         assert!(needs_exiftool_fallback(".cr2", Some(&legacy_20d_cr2)));
         assert!(needs_exiftool_fallback(".crw", None));
+
+        // EOS 90D + 3rd-party lens (empty LensModel in CR3/JPG) and legacy EOS 40D JPEG-only
+        let eos_90d_sigma = ExtractedMetadata {
+            captured_at: Some("2019-10-13T10:00:00".into()),
+            camera_model: Some("Canon EOS 90D".into()),
+            lens_model_raw: None,
+            ..Default::default()
+        };
+        assert!(needs_exiftool_fallback(".cr3", Some(&eos_90d_sigma)));
+        assert!(needs_exiftool_fallback(".jpg", Some(&eos_90d_sigma)));
+
+        // Fixed-lens compact camera / smartphone JPEG must NOT fall back to ExifTool
+        let compact_jpg = ExtractedMetadata {
+            captured_at: Some("2015-05-01T12:00:00".into()),
+            camera_model: Some("Canon PowerShot G7 X".into()),
+            lens_model_raw: None,
+            ..Default::default()
+        };
+        assert!(!needs_exiftool_fallback(".jpg", Some(&compact_jpg)));
+    }
+
+    #[test]
+    fn exiftool_json_falls_back_to_lens_id_when_lens_model_is_empty() {
+        let json = br#"[{
+            "Model": "Canon EOS 90D",
+            "DateTimeOriginal": "2019:10:13 11:20:00",
+            "LensModel": "",
+            "LensID": "Sigma 17-50mm f/2.8 EX DC OS HSM",
+            "FocalLength": "33.0 mm",
+            "FNumber": 5.6,
+            "ExposureTime": "1/80",
+            "ISO": 200
+        }]"#;
+        let meta = parse_exiftool_json(json, "exiftool-stay-open").unwrap();
+        assert_eq!(
+            meta.lens_model_raw.as_deref(),
+            Some("Sigma 17-50mm f/2.8 EX DC OS HSM")
+        );
     }
 
     #[test]

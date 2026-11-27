@@ -2,7 +2,7 @@
 
 - Last Updated: 2026-11-27
 - Current Phase: **Phase 1（読み取り専用インデックス・検索・統計・ベンチマーク・NAS マニフェスト連携）**
-- Branch: `main`（全 17 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
+- Branch: `main`（全 18 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
 
@@ -16,7 +16,8 @@
 - ストリーミング BLAKE3 / SHA-256 ハッシュ＋部分ハッシュ（32-bit 安全 `u64`）
 - ハイブリッド EXIF 解析（`MetadataSession`）:
   - **高速 Rust ネイティブ**: JPEG / CR2 / Canon CR3（ISOBMFF `moov -> uuid -> CMT1/CMT2` 直接走査、画像本体スキップ）＋ CRW 同伴 `.THM` ネイティブ読み取り
-  - **常駐 ExifTool（`-stay_open True`）**: `backend = "auto"` 時、CRW・動画（MP4/MOV）・HEIF および旧型 CR2（EOS 20D 等の `LensModel` 欠落ファイル）のみ自動フォールバック。`[exif.lens_aliases]` による表記正規化対応
+  - **常駐 ExifTool（`-stay_open True`）**: `backend = "auto"` 時、CRW・動画（MP4/MOV）・HEIF、旧型 CR2、および `LensModel` 欠落の Canon EOS CR3/JPEG（旧機種 JPEG 単体・Sigma 17-50mm 等のサードパーティ EF レンズ）のみ自動フォールバック（コンデジ・スマホ JPEG は除外）。`[exif.lens_aliases]` による表記正規化対応
+- スキャナで macOS AppleDouble リソースフォーク（`._*`）を自動除外
 - マニフェスト入力検証（`ScanManifestRecord::validate`: `..` パストラバーサル・不正ハッシュ拒否）
 
 ### DB (`crates/wing-photovault-db`)
