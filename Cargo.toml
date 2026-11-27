@@ -5,6 +5,9 @@ members = [
     "crates/wing-photovault-db",
     "crates/wing-photovault-cli",
 ]
+exclude = [
+    "tools/wingpv-mini-ui",
+]
 
 [workspace.package]
 version = "0.1.0"

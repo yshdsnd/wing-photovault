@@ -35,6 +35,10 @@
 - `normalize-lenses`（再スキャン不要で既存 DB の `lens_model_raw` から `[exif.lens_aliases]` を再適用、`--dry-run` 読み取り専用プレビュー対応）
 - `status` / `stats` / `find` / `benchmark`（`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
 
+### テスト用ミニ UI (`tools/wingpv-mini-ui` / バイナリ名 `wingpv-mini-ui`)
+- Rust (`egui` / `eframe` + `rfd`) による単体実行 `.exe` ツール（ヘッドレス FreeBSD ビルドに影響しないようワークスペース `exclude` で分離しつつ、`wing-photovault-core` の型・Fail Closed 検証を共有）
+- フォルダ選択付き `.toml` 設定エディタ（`external` → `read_only` 自動強制、`[exif.lens_aliases]` 編集、TOML プレビュー＆ラウンドトリップ検証）＋ `wingpv` CLI テスト実行（`init`/`status`/`stats`/`find`/`normalize-lenses`/`scan`/`export-manifest`/`import-manifest`、非同期リアルタイム出力・中断対応）
+
 ---
 
 ## 2. 実データでの確認済みベンチマーク・解析結果
