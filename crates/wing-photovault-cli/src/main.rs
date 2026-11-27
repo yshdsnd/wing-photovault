@@ -126,7 +126,11 @@ enum Commands {
     Status,
 
     /// Show asset, content, format, camera, lens, and backup statistics
-    Stats,
+    Stats {
+        /// Also show percentage share for backup coverage, formats, cameras, and lenses
+        #[arg(long)]
+        percent: bool,
+    },
 
     /// Search indexed files
     Find {
@@ -197,7 +201,7 @@ fn main() -> Result<()> {
             cmd_normalize_lenses(&cli.config, dry_run, cli.format)
         }
         Commands::Status => cmd_status(&cli.config, cli.format),
-        Commands::Stats => cmd_stats(&cli.config, cli.format),
+        Commands::Stats { percent } => cmd_stats(&cli.config, percent, cli.format),
         Commands::Find {
             storage,
             ext_format,
@@ -949,47 +953,182 @@ fn cmd_status(config_path: &Path, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(config_path: &Path, format: OutputFormat) -> Result<()> {
+fn calc_percent(part: i64, total: i64) -> f64 {
+    if total <= 0 || part <= 0 {
+        0.0
+    } else {
+        (part as f64 / total as f64) * 100.0
+    }
+}
+
+fn round_pct2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+fn format_stats_text(report: &wing_photovault_db::StatsReport, show_percent: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Logical Assets    : {}", report.total_assets);
+    let _ = writeln!(out, "Unique Contents   : {}", report.total_contents);
+    if show_percent {
+        let bp = calc_percent(report.backed_up_contents, report.total_contents);
+        let _ = writeln!(
+            out,
+            "Backed-up Contents: {} / {} ({:.2}%)",
+            report.backed_up_contents, report.total_contents, bp
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "Backed-up Contents: {} / {}",
+            report.backed_up_contents, report.total_contents
+        );
+    }
+    let _ = writeln!(
+        out,
+        "Physical Files    : {} ({})",
+        report.total_present_files,
+        human_bytes(report.total_present_bytes.max(0) as u64)
+    );
+
+    let _ = writeln!(out, "\nBy Format:");
+    for b in &report.by_format {
+        if show_percent {
+            let cnt_p = calc_percent(b.count, report.total_present_files);
+            let bytes_p = calc_percent(b.total_bytes, report.total_present_bytes);
+            let _ = writeln!(
+                out,
+                "  - {:<10} {:>8} files ({:>6.2}%)  ({}, {:>6.2}%)",
+                b.label,
+                b.count,
+                cnt_p,
+                human_bytes(b.total_bytes.max(0) as u64),
+                bytes_p
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  - {:<10} {:>8} files  ({})",
+                b.label,
+                b.count,
+                human_bytes(b.total_bytes.max(0) as u64)
+            );
+        }
+    }
+
+    let _ = writeln!(out, "\nBy Camera (Assets):");
+    for b in &report.by_camera {
+        if show_percent {
+            let p = calc_percent(b.count, report.total_assets);
+            let _ = writeln!(out, "  - {:<32} {:>8}  ({:>6.2}%)", b.label, b.count, p);
+        } else {
+            let _ = writeln!(out, "  - {:<32} {:>8}", b.label, b.count);
+        }
+    }
+
+    let _ = writeln!(out, "\nBy Lens (Assets):");
+    for b in &report.by_lens {
+        if show_percent {
+            let p = calc_percent(b.count, report.total_assets);
+            let _ = writeln!(out, "  - {:<32} {:>8}  ({:>6.2}%)", b.label, b.count, p);
+        } else {
+            let _ = writeln!(out, "  - {:<32} {:>8}", b.label, b.count);
+        }
+    }
+
+    out
+}
+
+fn cmd_stats(config_path: &Path, show_percent: bool, format: OutputFormat) -> Result<()> {
     let cfg = load_config_or_default(config_path)?;
     let db = Database::open(&cfg.general.db_path)?;
     let report = db.stats()?;
 
     match format {
         OutputFormat::Json | OutputFormat::Jsonl => {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            if show_percent {
+                #[derive(Serialize)]
+                struct FormatBucketPct<'a> {
+                    label: &'a str,
+                    count: i64,
+                    count_percent: f64,
+                    total_bytes: i64,
+                    bytes_percent: f64,
+                }
+                #[derive(Serialize)]
+                struct AssetBucketPct<'a> {
+                    label: &'a str,
+                    count: i64,
+                    percent: f64,
+                }
+                #[derive(Serialize)]
+                struct StatsReportWithPercent<'a> {
+                    total_assets: i64,
+                    total_contents: i64,
+                    total_present_files: i64,
+                    total_present_bytes: i64,
+                    backed_up_contents: i64,
+                    backed_up_percent: f64,
+                    by_format: Vec<FormatBucketPct<'a>>,
+                    by_camera: Vec<AssetBucketPct<'a>>,
+                    by_lens: Vec<AssetBucketPct<'a>>,
+                    by_storage: &'a [wing_photovault_db::StorageStatsRow],
+                }
+                let enriched = StatsReportWithPercent {
+                    total_assets: report.total_assets,
+                    total_contents: report.total_contents,
+                    total_present_files: report.total_present_files,
+                    total_present_bytes: report.total_present_bytes,
+                    backed_up_contents: report.backed_up_contents,
+                    backed_up_percent: round_pct2(calc_percent(
+                        report.backed_up_contents,
+                        report.total_contents,
+                    )),
+                    by_format: report
+                        .by_format
+                        .iter()
+                        .map(|b| FormatBucketPct {
+                            label: &b.label,
+                            count: b.count,
+                            count_percent: round_pct2(calc_percent(
+                                b.count,
+                                report.total_present_files,
+                            )),
+                            total_bytes: b.total_bytes,
+                            bytes_percent: round_pct2(calc_percent(
+                                b.total_bytes,
+                                report.total_present_bytes,
+                            )),
+                        })
+                        .collect(),
+                    by_camera: report
+                        .by_camera
+                        .iter()
+                        .map(|b| AssetBucketPct {
+                            label: &b.label,
+                            count: b.count,
+                            percent: round_pct2(calc_percent(b.count, report.total_assets)),
+                        })
+                        .collect(),
+                    by_lens: report
+                        .by_lens
+                        .iter()
+                        .map(|b| AssetBucketPct {
+                            label: &b.label,
+                            count: b.count,
+                            percent: round_pct2(calc_percent(b.count, report.total_assets)),
+                        })
+                        .collect(),
+                    by_storage: &report.by_storage,
+                };
+                println!("{}", serde_json::to_string_pretty(&enriched)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
         }
         OutputFormat::Text => {
-            println!("Logical Assets    : {}", report.total_assets);
-            println!("Unique Contents   : {}", report.total_contents);
-            println!(
-                "Backed-up Contents: {} / {}",
-                report.backed_up_contents, report.total_contents
-            );
-            println!(
-                "Physical Files    : {} ({})",
-                report.total_present_files,
-                human_bytes(report.total_present_bytes.max(0) as u64)
-            );
-
-            println!("\nBy Format:");
-            for b in &report.by_format {
-                println!(
-                    "  - {:<10} {:>8} files  ({})",
-                    b.label,
-                    b.count,
-                    human_bytes(b.total_bytes.max(0) as u64)
-                );
-            }
-
-            println!("\nBy Camera (Assets):");
-            for b in &report.by_camera {
-                println!("  - {:<32} {:>8}", b.label, b.count);
-            }
-
-            println!("\nBy Lens (Assets):");
-            for b in &report.by_lens {
-                println!("  - {:<32} {:>8}", b.label, b.count);
-            }
+            print!("{}", format_stats_text(&report, show_percent));
         }
     }
     Ok(())
@@ -1338,5 +1477,67 @@ backup_mode = "external"
                 Some("SIGMA 15-30mm F3.5-4.5 EX DG ASPHERICAL")
             );
         }
+    }
+
+    #[test]
+    fn stats_text_formatting_toggles_percentages_cleanly_and_handles_zero_totals() {
+        use wing_photovault_db::repo::BucketCount;
+        use wing_photovault_db::StatsReport;
+
+        let report = StatsReport {
+            total_assets: 100,
+            total_contents: 200,
+            total_present_files: 200,
+            total_present_bytes: 1_000_000,
+            backed_up_contents: 150,
+            by_format: vec![
+                BucketCount {
+                    label: "cr3".into(),
+                    count: 100,
+                    total_bytes: 800_000,
+                },
+                BucketCount {
+                    label: "jpeg".into(),
+                    count: 100,
+                    total_bytes: 200_000,
+                },
+            ],
+            by_camera: vec![BucketCount {
+                label: "Canon EOS R5m2".into(),
+                count: 75,
+                total_bytes: 0,
+            }],
+            by_lens: vec![BucketCount {
+                label: "RF100-500mm F4.5-7.1 L IS USM".into(),
+                count: 50,
+                total_bytes: 0,
+            }],
+            by_storage: vec![],
+        };
+
+        let plain = format_stats_text(&report, false);
+        assert!(plain.contains("Backed-up Contents: 150 / 200\n"));
+        assert!(!plain.contains('%'));
+
+        let with_pct = format_stats_text(&report, true);
+        assert!(with_pct.contains("Backed-up Contents: 150 / 200 (75.00%)"));
+        assert!(with_pct.contains("50.00%"));
+        assert!(with_pct.contains("80.00%"));
+        assert!(with_pct.contains("75.00%)"));
+
+        // Zero-division guard on empty DB
+        let empty = StatsReport {
+            total_assets: 0,
+            total_contents: 0,
+            total_present_files: 0,
+            total_present_bytes: 0,
+            backed_up_contents: 0,
+            by_format: vec![],
+            by_camera: vec![],
+            by_lens: vec![],
+            by_storage: vec![],
+        };
+        let empty_pct = format_stats_text(&empty, true);
+        assert!(empty_pct.contains("Backed-up Contents: 0 / 0 (0.00%)"));
     }
 }

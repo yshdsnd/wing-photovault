@@ -14,8 +14,8 @@ use wing_photovault_core::model::{AccessMode, BackupMode, HashAlgorithm, MediaTy
 use crate::config_model::{ConfigDraft, LensAliasRow, StorageDraft};
 use crate::runner::{
     build_export_manifest_args, build_find_args, build_import_manifest_args,
-    build_normalize_lenses_args, build_scan_args, build_simple_args, detect_wingpv_binary,
-    CommandRunner, FindParams, ScanParams,
+    build_normalize_lenses_args, build_scan_args, build_simple_args, build_stats_args,
+    detect_wingpv_binary, CommandRunner, FindParams, ScanParams,
 };
 
 fn main() -> eframe::Result<()> {
@@ -93,6 +93,7 @@ struct MiniUiApp {
 
     // Inspect / Query tab state
     query_json: bool,
+    stats_percent: bool,
     confirm_normalize_apply: bool,
     find_params: FindParams,
 
@@ -143,6 +144,7 @@ impl MiniUiApp {
             status_banner: banner,
             show_toml_preview: false,
             query_json: false,
+            stats_percent: true,
             confirm_normalize_apply: false,
             find_params: FindParams::default(),
             scan_params: ScanParams::default(),
@@ -742,6 +744,7 @@ impl MiniUiApp {
 
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.query_json, "JSON 出力 (--format json)");
+            ui.checkbox(&mut self.stats_percent, "stats 割合表示 (--percent)");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {
@@ -754,7 +757,8 @@ impl MiniUiApp {
                     self.run_cli(ctx, args);
                 }
                 if ui.button("stats").clicked() {
-                    let args = build_simple_args(&self.config_path, self.query_json, "stats");
+                    let args =
+                        build_stats_args(&self.config_path, self.query_json, self.stats_percent);
                     self.run_cli(ctx, args);
                 }
                 if ui.button("normalize-lenses --dry-run").clicked() {

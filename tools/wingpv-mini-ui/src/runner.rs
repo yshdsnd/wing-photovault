@@ -98,6 +98,14 @@ pub fn build_normalize_lenses_args(config_path: &Path, json: bool, dry_run: bool
     args
 }
 
+pub fn build_stats_args(config_path: &Path, json: bool, percent: bool) -> Vec<String> {
+    let mut args = build_simple_args(config_path, json, "stats");
+    if percent {
+        args.push("--percent".to_string());
+    }
+    args
+}
+
 pub fn build_find_args(config_path: &Path, params: &FindParams) -> Vec<String> {
     let mut args = build_simple_args(config_path, params.json_output, "find");
     if !params.storage.trim().is_empty() {
