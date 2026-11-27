@@ -56,7 +56,7 @@ impl MetadataSession {
         };
 
         if let Some(m) = meta.as_mut() {
-            normalize_lens(m, &self.cfg.lens_aliases);
+            apply_lens_aliases(m, &self.cfg.lens_aliases);
         }
         meta
     }
@@ -156,12 +156,30 @@ pub fn extract_metadata(path: &Path, ext: &str, cfg: &ExifConfig) -> Option<Extr
     };
 
     if let Some(m) = meta.as_mut() {
-        normalize_lens(m, &cfg.lens_aliases);
+        apply_lens_aliases(m, &cfg.lens_aliases);
     }
     meta
 }
 
-fn normalize_lens(meta: &mut ExtractedMetadata, aliases: &HashMap<String, String>) {
+/// Resolve a raw lens string through `[exif.lens_aliases]`.
+/// Returns `None` if `raw` is empty/whitespace-only; otherwise returns the trimmed alias target
+/// (if configured and non-empty) or the trimmed raw string itself.
+pub fn resolve_lens_alias(raw: &str, aliases: &HashMap<String, String>) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(mapped) = aliases.get(trimmed) {
+        let mapped_trimmed = mapped.trim();
+        if !mapped_trimmed.is_empty() {
+            return Some(mapped_trimmed.to_string());
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+/// Apply `[exif.lens_aliases]` to extracted metadata without mutating non-empty `lens_model_raw`.
+pub fn apply_lens_aliases(meta: &mut ExtractedMetadata, aliases: &HashMap<String, String>) {
     if let Some(raw) = meta.lens_model_raw.as_ref() {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -169,11 +187,9 @@ fn normalize_lens(meta: &mut ExtractedMetadata, aliases: &HashMap<String, String
             meta.lens_model = None;
             return;
         }
-        if let Some(mapped) = aliases.get(trimmed) {
-            meta.lens_model = Some(mapped.clone());
-        } else {
-            meta.lens_model = Some(trimmed.to_string());
-        }
+        meta.lens_model = resolve_lens_alias(trimmed, aliases);
+    } else if let Some(existing) = meta.lens_model.as_ref() {
+        meta.lens_model = resolve_lens_alias(existing, aliases);
     }
 }
 
@@ -936,5 +952,49 @@ mod tests {
         };
         assert!(needs_exiftool_fallback(".cr2", Some(&legacy_20d_cr2)));
         assert!(needs_exiftool_fallback(".crw", None));
+    }
+
+    #[test]
+    fn resolves_and_applies_lens_aliases_preserving_raw() {
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "Unknown 100-400mm".to_string(),
+            "EF100-400mm f/4.5-5.6L IS USM".to_string(),
+        );
+        aliases.insert(
+            "15-30mm".to_string(),
+            "  SIGMA 15-30mm F3.5-4.5 EX DG ASPHERICAL  ".to_string(),
+        );
+
+        assert_eq!(
+            resolve_lens_alias("  Unknown 100-400mm ", &aliases).as_deref(),
+            Some("EF100-400mm f/4.5-5.6L IS USM")
+        );
+        assert_eq!(
+            resolve_lens_alias("15-30mm", &aliases).as_deref(),
+            Some("SIGMA 15-30mm F3.5-4.5 EX DG ASPHERICAL")
+        );
+        assert_eq!(
+            resolve_lens_alias("RF200-800mm F6.3-9 IS USM", &aliases).as_deref(),
+            Some("RF200-800mm F6.3-9 IS USM")
+        );
+        assert_eq!(resolve_lens_alias("   ", &aliases), None);
+
+        let mut meta = ExtractedMetadata {
+            lens_model_raw: Some("Unknown 100-400mm".into()),
+            lens_model: Some("Unknown 100-400mm".into()),
+            ..Default::default()
+        };
+        apply_lens_aliases(&mut meta, &aliases);
+        assert_eq!(meta.lens_model_raw.as_deref(), Some("Unknown 100-400mm"));
+        assert_eq!(
+            meta.lens_model.as_deref(),
+            Some("EF100-400mm f/4.5-5.6L IS USM")
+        );
+
+        // Removing the alias reverts lens_model back to lens_model_raw
+        apply_lens_aliases(&mut meta, &HashMap::new());
+        assert_eq!(meta.lens_model_raw.as_deref(), Some("Unknown 100-400mm"));
+        assert_eq!(meta.lens_model.as_deref(), Some("Unknown 100-400mm"));
     }
 }

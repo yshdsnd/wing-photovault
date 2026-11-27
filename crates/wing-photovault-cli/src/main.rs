@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use wing_photovault_core::config::{Config, ExifBackend, StorageConfig};
 use wing_photovault_core::hashing::hash_file;
-use wing_photovault_core::metadata::{extract_native, MetadataSession};
+use wing_photovault_core::metadata::{apply_lens_aliases, extract_native, MetadataSession};
 use wing_photovault_core::model::{
     current_host_os, AccessMode, BackupMode, HashAlgorithm, MediaType, ScanManifestRecord,
     StorageStatus, StorageTier,
@@ -115,6 +115,13 @@ enum Commands {
         storage: Option<String>,
     },
 
+    /// Re-apply [exif.lens_aliases] to existing DB records from lens_model_raw (no rescan required)
+    NormalizeLenses {
+        /// Preview changes without modifying the database
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Show database and storage status
     Status,
 
@@ -185,6 +192,9 @@ fn main() -> Result<()> {
         }
         Commands::ImportManifest { input, storage } => {
             cmd_import_manifest(&cli.config, &input, storage.as_deref(), cli.format)
+        }
+        Commands::NormalizeLenses { dry_run } => {
+            cmd_normalize_lenses(&cli.config, dry_run, cli.format)
         }
         Commands::Status => cmd_status(&cli.config, cli.format),
         Commands::Stats => cmd_stats(&cli.config, cli.format),
@@ -734,6 +744,9 @@ fn cmd_import_manifest(
             total_rejected += 1;
             continue;
         }
+        if let Some(meta) = rec.metadata.as_mut() {
+            apply_lens_aliases(meta, &cfg.exif.lens_aliases);
+        }
 
         let Some(storage_cfg) = cfg.storages.iter().find(|s| s.id == rec.storage_id) else {
             anyhow::bail!(
@@ -845,6 +858,52 @@ fn cmd_import_manifest(
                 summary.raw_jpeg_merged,
                 summary.records_rejected
             );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_normalize_lenses(config_path: &Path, dry_run: bool, format: OutputFormat) -> Result<()> {
+    let cfg = load_config_or_default(config_path)?;
+    let mut db = if dry_run {
+        if !cfg.general.db_path.exists() {
+            anyhow::bail!(
+                "database does not exist (dry-run will not create it): {}",
+                cfg.general.db_path.display()
+            );
+        }
+        Database::open_read_only(&cfg.general.db_path)?
+    } else {
+        Database::open(&cfg.general.db_path)?
+    };
+
+    let report = db.reapply_lens_aliases(&cfg.exif.lens_aliases, dry_run)?;
+
+    match format {
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Text => {
+            let prefix = if report.dry_run { "[dry-run] " } else { "" };
+            let verb = if report.dry_run {
+                "would update"
+            } else {
+                "updated"
+            };
+            println!(
+                "{prefix}Normalized lenses (aliases={}): {verb} assets={} contents={}",
+                report.aliases_configured, report.assets_updated, report.contents_updated
+            );
+            for ch in &report.changes {
+                println!(
+                    "  - {:?} ({} -> {}): assets={} contents={}",
+                    ch.raw_lens,
+                    ch.previous_lens.as_deref().unwrap_or("(null)"),
+                    ch.normalized_lens.as_deref().unwrap_or("(null)"),
+                    ch.assets_affected,
+                    ch.contents_affected
+                );
+            }
         }
     }
     Ok(())
@@ -1127,5 +1186,157 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{val:.2} {}", UNITS[idx])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use wing_photovault_core::model::{ExtractedMetadata, MediaKind};
+
+    #[test]
+    fn import_manifest_applies_lens_aliases_and_normalize_lenses_respects_dry_run() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let cfg_path = dir.path().join("wing-photovault.toml");
+        let manifest_path = dir.path().join("nas.jsonl");
+
+        let db_path_toml = db_path.to_string_lossy().replace('\\', "\\\\");
+        let root_toml = dir.path().to_string_lossy().replace('\\', "\\\\");
+
+        let write_cfg = |extra_aliases: &str| {
+            let content = format!(
+                r#"
+[host]
+id = "test-pc"
+name = "Test PC"
+
+[general]
+db_path = "{db_path_toml}"
+
+[exif.lens_aliases]
+"Unknown 90mm" = "TAMRON SP AF90mm F/2.8 Di MACRO 1:1"
+{extra_aliases}
+
+[[storages]]
+id = "nas_backup_eagle"
+root = "{root_toml}"
+media = "nas"
+tier = "backup"
+access_mode = "read_only"
+backup_mode = "external"
+"#
+            );
+            std::fs::write(&cfg_path, content).unwrap();
+        };
+
+        write_cfg("");
+
+        // 1. Dry-run before DB exists must fail closed and NOT create a DB file
+        assert!(cmd_normalize_lenses(&cfg_path, true, OutputFormat::Json).is_err());
+        assert!(!db_path.exists());
+
+        // 2. Write manifest with two raw lens names (one aliased now, one aliased later)
+        let rec1 = ScanManifestRecord {
+            storage_id: "nas_backup_eagle".into(),
+            rel_path: "2007/IMG_0001.CR2".into(),
+            file_name: "IMG_0001.CR2".into(),
+            file_stem: "IMG_0001".into(),
+            ext: ".cr2".into(),
+            byte_size: 1024,
+            mtime_ns: 1000,
+            ctime_ns: None,
+            media_kind: MediaKind::Raw,
+            format: "cr2".into(),
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: "0123456789abcdef0123456789abcdef".into(),
+            partial_hash: None,
+            metadata: Some(ExtractedMetadata {
+                extractor: "exiftool-stay-open".into(),
+                captured_at: Some("2007-05-01T10:00:00".into()),
+                camera_model: Some("Canon EOS 20D".into()),
+                lens_model_raw: Some("Unknown 90mm".into()),
+                lens_model: Some("Unknown 90mm".into()),
+                ..Default::default()
+            }),
+        };
+        let rec2 = ScanManifestRecord {
+            storage_id: "nas_backup_eagle".into(),
+            rel_path: "2014/IMG_0002.CR2".into(),
+            file_name: "IMG_0002.CR2".into(),
+            file_stem: "IMG_0002".into(),
+            ext: ".cr2".into(),
+            byte_size: 2048,
+            mtime_ns: 2000,
+            ctime_ns: None,
+            media_kind: MediaKind::Raw,
+            format: "cr2".into(),
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: "fedcba9876543210fedcba9876543210".into(),
+            partial_hash: None,
+            metadata: Some(ExtractedMetadata {
+                extractor: "native".into(),
+                captured_at: Some("2014-06-01T10:00:00".into()),
+                camera_model: Some("Canon EOS 6D".into()),
+                lens_model_raw: Some("15-30mm".into()),
+                lens_model: Some("15-30mm".into()),
+                ..Default::default()
+            }),
+        };
+        let manifest_body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&rec1).unwrap(),
+            serde_json::to_string(&rec2).unwrap()
+        );
+        std::fs::write(&manifest_path, manifest_body).unwrap();
+
+        cmd_import_manifest(&cfg_path, &manifest_path, None, OutputFormat::Json).unwrap();
+
+        {
+            let db = Database::open_read_only(&db_path).unwrap();
+            let rows = db
+                .find(&FindFilter {
+                    lens: Some("TAMRON SP AF90mm".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].lens_model.as_deref(),
+                Some("TAMRON SP AF90mm F/2.8 Di MACRO 1:1")
+            );
+        }
+
+        // 3. Add a new alias to config, run dry-run first (must not mutate DB), then real apply
+        write_cfg(r#""15-30mm" = "SIGMA 15-30mm F3.5-4.5 EX DG ASPHERICAL""#);
+
+        cmd_normalize_lenses(&cfg_path, true, OutputFormat::Json).unwrap();
+        {
+            let db = Database::open_read_only(&db_path).unwrap();
+            let rows = db
+                .find(&FindFilter {
+                    lens: Some("SIGMA 15-30mm".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 0);
+        }
+
+        cmd_normalize_lenses(&cfg_path, false, OutputFormat::Json).unwrap();
+        {
+            let db = Database::open_read_only(&db_path).unwrap();
+            let rows = db
+                .find(&FindFilter {
+                    lens: Some("SIGMA 15-30mm".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].lens_model.as_deref(),
+                Some("SIGMA 15-30mm F3.5-4.5 EX DG ASPHERICAL")
+            );
+        }
     }
 }

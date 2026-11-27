@@ -196,6 +196,9 @@ flowchart TD
 |---|---|
 | init | 初期化 |
 | scan | スキャン・DB更新 |
+| export-manifest | ストレージのインデックス情報をJSONLマニフェスト出力 |
+| import-manifest | リモート/NASスキャン由来のJSONLマニフェスト取り込み（`lens_aliases` 適用） |
+| normalize-lenses | 既存DBの `lens_model_raw` へ `[exif.lens_aliases]` を再適用（`--dry-run` 対応） |
 | import | 取り込み |
 | duplicates | 重複検出 |
 | quarantine | 隔離 |

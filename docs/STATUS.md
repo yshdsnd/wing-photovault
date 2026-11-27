@@ -1,8 +1,8 @@
 # WING PhotoVault — 開発ステータス・引き継ぎメモ
 
-- Last Updated: 2026-11-26
+- Last Updated: 2026-11-27
 - Current Phase: **Phase 1（読み取り専用インデックス・検索・統計・ベンチマーク・NAS マニフェスト連携）**
-- Branch: `main`（全 14 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
+- Branch: `main`（全 17 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
 
@@ -30,7 +30,8 @@
 
 ### CLI (`crates/wing-photovault-cli` / バイナリ名 `wingpv`)
 - `init` / `scan`（`--storage`, `--full`, `--export-jsonl`, `--cooldown-every`, `--cooldown-secs`, `--max-files`）
-- `export-manifest` / `import-manifest`（FreeBSD NAS ローカルスキャン → Windows DB 取り込み）
+- `export-manifest` / `import-manifest`（FreeBSD NAS ローカルスキャン → Windows DB 取り込み、`[exif.lens_aliases]` 自動適用）
+- `normalize-lenses`（再スキャン不要で既存 DB の `lens_model_raw` から `[exif.lens_aliases]` を再適用、`--dry-run` 読み取り専用プレビュー対応）
 - `status` / `stats` / `find` / `benchmark`（`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
 
 ---

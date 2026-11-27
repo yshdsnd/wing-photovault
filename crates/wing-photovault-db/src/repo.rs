@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
 use wing_photovault_core::config::StorageConfig;
+use wing_photovault_core::metadata::resolve_lens_alias;
 use wing_photovault_core::model::{
     ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, ScanManifestRecord, StorageStatus,
 };
@@ -144,6 +145,24 @@ pub struct FindRow {
     pub iso: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LensAliasChange {
+    pub raw_lens: String,
+    pub previous_lens: Option<String>,
+    pub normalized_lens: Option<String>,
+    pub assets_affected: u64,
+    pub contents_affected: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct NormalizeLensesReport {
+    pub dry_run: bool,
+    pub aliases_configured: usize,
+    pub assets_updated: u64,
+    pub contents_updated: u64,
+    pub changes: Vec<LensAliasChange>,
+}
+
 impl Database {
     pub fn open(path: &Path) -> DbResult<Self> {
         if let Some(parent) = path.parent() {
@@ -154,6 +173,18 @@ impl Database {
         let mut conn = Connection::open(path)?;
         configure_connection(&conn)?;
         run_migrations(&mut conn)?;
+        Ok(Self { conn })
+    }
+
+    /// Open an existing database strictly in read-only mode (guarantees zero writes for `--dry-run`).
+    pub fn open_read_only(path: &Path) -> DbResult<Self> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        conn.execute_batch(
+            "PRAGMA query_only = ON;
+             PRAGMA busy_timeout = 5000;",
+        )?;
         Ok(Self { conn })
     }
 
@@ -1061,6 +1092,154 @@ impl Database {
         Ok(out)
     }
 
+    /// Re-apply `[exif.lens_aliases]` to existing `assets` and `content_metadata` rows
+    /// using each row's original `lens_model_raw`, without rescanning files.
+    ///
+    /// - Idempotent and reversible: removing an alias reverts `lens_model` back to trimmed `lens_model_raw`.
+    /// - Preserves `lens_model_raw`, Asset IDs, ratings, tags, and physical files.
+    /// - When `dry_run` is `true`, performs read-only aggregation and never mutates the DB.
+    pub fn reapply_lens_aliases(
+        &mut self,
+        aliases: &HashMap<String, String>,
+        dry_run: bool,
+    ) -> DbResult<NormalizeLensesReport> {
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        struct ChangeKey {
+            raw: String,
+            previous: Option<String>,
+            normalized: Option<String>,
+        }
+
+        let mut change_buckets: BTreeMap<ChangeKey, (u64, u64)> = BTreeMap::new();
+        let mut asset_updates: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut content_updates: BTreeMap<String, Option<String>> = BTreeMap::new();
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT lens_model_raw, lens_model, COUNT(*)
+                 FROM assets
+                 WHERE lens_model_raw IS NOT NULL
+                 GROUP BY lens_model_raw, lens_model",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (raw, current, cnt) = row?;
+                let expected = resolve_lens_alias(&raw, aliases);
+                if current != expected {
+                    asset_updates.insert(raw.clone(), expected.clone());
+                    let key = ChangeKey {
+                        raw,
+                        previous: current,
+                        normalized: expected,
+                    };
+                    let entry = change_buckets.entry(key).or_insert((0, 0));
+                    entry.0 += cnt.max(0) as u64;
+                }
+            }
+        }
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT lens_model_raw, lens_model, COUNT(*)
+                 FROM content_metadata
+                 WHERE lens_model_raw IS NOT NULL
+                 GROUP BY lens_model_raw, lens_model",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (raw, current, cnt) = row?;
+                let expected = resolve_lens_alias(&raw, aliases);
+                if current != expected {
+                    content_updates.insert(raw.clone(), expected.clone());
+                    let key = ChangeKey {
+                        raw,
+                        previous: current,
+                        normalized: expected,
+                    };
+                    let entry = change_buckets.entry(key).or_insert((0, 0));
+                    entry.1 += cnt.max(0) as u64;
+                }
+            }
+        }
+
+        let mut changes: Vec<LensAliasChange> = change_buckets
+            .into_iter()
+            .map(|(key, (assets_affected, contents_affected))| LensAliasChange {
+                raw_lens: key.raw,
+                previous_lens: key.previous,
+                normalized_lens: key.normalized,
+                assets_affected,
+                contents_affected,
+            })
+            .collect();
+        changes.sort_by(|a, b| {
+            b.assets_affected
+                .cmp(&a.assets_affected)
+                .then_with(|| b.contents_affected.cmp(&a.contents_affected))
+                .then_with(|| a.raw_lens.cmp(&b.raw_lens))
+        });
+
+        let (assets_updated, contents_updated) = if dry_run {
+            let a_total = changes.iter().map(|c| c.assets_affected).sum();
+            let c_total = changes.iter().map(|c| c.contents_affected).sum();
+            (a_total, c_total)
+        } else if asset_updates.is_empty() && content_updates.is_empty() {
+            (0, 0)
+        } else {
+            let now = Utc::now().to_rfc3339();
+            let tx = self.conn.transaction()?;
+            let mut a_total = 0u64;
+            let mut c_total = 0u64;
+
+            if !asset_updates.is_empty() {
+                let mut stmt = tx.prepare_cached(
+                    "UPDATE assets
+                     SET lens_model = ?1, updated_at = ?2
+                     WHERE lens_model_raw = ?3 AND lens_model IS NOT ?1",
+                )?;
+                for (raw, expected) in &asset_updates {
+                    let n = stmt.execute(params![expected.as_deref(), now, raw])?;
+                    a_total += n as u64;
+                }
+            }
+
+            if !content_updates.is_empty() {
+                let mut stmt = tx.prepare_cached(
+                    "UPDATE content_metadata
+                     SET lens_model = ?1
+                     WHERE lens_model_raw = ?2 AND lens_model IS NOT ?1",
+                )?;
+                for (raw, expected) in &content_updates {
+                    let n = stmt.execute(params![expected.as_deref(), raw])?;
+                    c_total += n as u64;
+                }
+            }
+
+            tx.commit()?;
+            (a_total, c_total)
+        };
+
+        Ok(NormalizeLensesReport {
+            dry_run,
+            aliases_configured: aliases.len(),
+            assets_updated,
+            contents_updated,
+            changes,
+        })
+    }
+
     fn storage_stats(&self) -> DbResult<Vec<StorageStatsRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.root_path, s.media_type, s.tier,
@@ -1570,5 +1749,164 @@ mod tests {
         // Idempotent second run
         let rep2 = db.pair_raw_jpeg_assets(&hot.id).unwrap();
         assert_eq!(rep2.pairs_merged, 0);
+    }
+
+    #[test]
+    fn reapply_lens_aliases_supports_dry_run_apply_idempotency_and_revert() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("eagle", "Eagle NAS", "freebsd").unwrap();
+        let nas = StorageConfig {
+            id: "nas_backup_eagle".into(),
+            root: PathBuf::from("/home/yoshi/Pictures"),
+            media: MediaType::Hdd,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: Some("nas-eagle".into()),
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&nas, "eagle", StorageStatus::Online)
+            .unwrap();
+        let run1 = db.start_scan_run(&nas.id, "incremental").unwrap();
+
+        let items = vec![
+            UpsertFileInput {
+                storage_id: nas.id.clone(),
+                rel_path: "2007/IMG_0001.CR2".into(),
+                file_name: "IMG_0001.CR2".into(),
+                file_stem: "IMG_0001".into(),
+                ext: ".cr2".into(),
+                byte_size: 10_000,
+                mtime_ns: 100,
+                ctime_ns: None,
+                media_kind: MediaKind::Raw,
+                format: "cr2".into(),
+                role: FileRole::Backup,
+                hash_algo: HashAlgorithm::Blake3,
+                hash_hex: "aaa111".into(),
+                partial_hash: None,
+                metadata: Some(ExtractedMetadata {
+                    extractor: "exiftool-stay-open".into(),
+                    captured_at: Some("2007-05-01T10:00:00".into()),
+                    camera_model: Some("Canon EOS 20D".into()),
+                    lens_model_raw: Some("Unknown 100-400mm".into()),
+                    lens_model: Some("Unknown 100-400mm".into()),
+                    ..Default::default()
+                }),
+            },
+            UpsertFileInput {
+                storage_id: nas.id.clone(),
+                rel_path: "2014/IMG_0002.CR2".into(),
+                file_name: "IMG_0002.CR2".into(),
+                file_stem: "IMG_0002".into(),
+                ext: ".cr2".into(),
+                byte_size: 20_000,
+                mtime_ns: 200,
+                ctime_ns: None,
+                media_kind: MediaKind::Raw,
+                format: "cr2".into(),
+                role: FileRole::Backup,
+                hash_algo: HashAlgorithm::Blake3,
+                hash_hex: "bbb222".into(),
+                partial_hash: None,
+                metadata: Some(ExtractedMetadata {
+                    extractor: "native".into(),
+                    captured_at: Some("2014-06-01T10:00:00".into()),
+                    camera_model: Some("Canon EOS 6D".into()),
+                    lens_model_raw: Some("15-30mm".into()),
+                    lens_model: Some("15-30mm".into()),
+                    ..Default::default()
+                }),
+            },
+        ];
+        db.upsert_scanned_batch(&items, run1).unwrap();
+
+        let public_ids_before: Vec<Option<String>> = db
+            .find(&FindFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.asset_public_id)
+            .collect();
+
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "Unknown 100-400mm".to_string(),
+            "EF100-400mm f/4.5-5.6L IS USM".to_string(),
+        );
+        aliases.insert(
+            "15-30mm".to_string(),
+            "SIGMA 15-30mm F3.5-4.5 EX DG ASPHERICAL".to_string(),
+        );
+
+        // 1. Dry-run reports planned changes without mutating DB
+        let dry = db.reapply_lens_aliases(&aliases, true).unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.assets_updated, 2);
+        assert_eq!(dry.contents_updated, 2);
+        assert_eq!(dry.changes.len(), 2);
+        assert_eq!(
+            db.find(&FindFilter {
+                lens: Some("SIGMA 15-30mm".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            0
+        );
+
+        // 2. Real apply updates both assets and content_metadata while preserving raw & public_id
+        let applied = db.reapply_lens_aliases(&aliases, false).unwrap();
+        assert!(!applied.dry_run);
+        assert_eq!(applied.assets_updated, 2);
+        assert_eq!(applied.contents_updated, 2);
+
+        let public_ids_after: Vec<Option<String>> = db
+            .find(&FindFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.asset_public_id)
+            .collect();
+        assert_eq!(public_ids_before, public_ids_after);
+
+        let sigma_rows = db
+            .find(&FindFilter {
+                lens: Some("SIGMA 15-30mm".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(sigma_rows.len(), 1);
+        assert_eq!(
+            sigma_rows[0].lens_model.as_deref(),
+            Some("SIGMA 15-30mm F3.5-4.5 EX DG ASPHERICAL")
+        );
+
+        // Verify content_metadata preserves lens_model_raw and updates lens_model
+        let (cm_raw, cm_norm): (String, String) = db
+            .conn
+            .query_row(
+                "SELECT lens_model_raw, lens_model FROM content_metadata WHERE lens_model_raw = '15-30mm'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cm_raw, "15-30mm");
+        assert_eq!(cm_norm, "SIGMA 15-30mm F3.5-4.5 EX DG ASPHERICAL");
+
+        // 3. Second run with same aliases is a no-op (idempotent)
+        let again = db.reapply_lens_aliases(&aliases, false).unwrap();
+        assert_eq!(again.assets_updated, 0);
+        assert_eq!(again.contents_updated, 0);
+        assert!(again.changes.is_empty());
+
+        // 4. Removing an alias reverts lens_model back to lens_model_raw
+        aliases.remove("15-30mm");
+        let reverted = db.reapply_lens_aliases(&aliases, false).unwrap();
+        assert_eq!(reverted.assets_updated, 1);
+        assert_eq!(reverted.contents_updated, 1);
+        assert_eq!(reverted.changes[0].raw_lens, "15-30mm");
+        assert_eq!(
+            reverted.changes[0].normalized_lens.as_deref(),
+            Some("15-30mm")
+        );
     }
 }
