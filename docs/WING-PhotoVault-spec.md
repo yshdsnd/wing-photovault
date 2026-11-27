@@ -483,6 +483,9 @@ RAW現像、レタッチ、動画編集、AI完全自動削除、クラウド上
 - **姉妹ツール構想: WING MusicVault（Proposed / 別プロジェクトでの将来検討）**:
   - 本プロジェクトのコア基盤（論理 Asset・ハッシュ・複数ストレージ・オフライン耐性・NAS マニフェスト連携・ジャーナル付き安全コピー＆検証）を横展開し、`FLAC` / `WAV` / `M4A (ALAC, AAC)` 等の音楽ライブラリ管理と **DAP（microSD 等）への差分転送・検証管理** を行う姉妹ツール構想。
   - 写真管理のスコープ肥大化を防ぐため本リポジトリ（WING PhotoVault）には音楽専用機能を混在させず、PhotoVault のコア確立後に共通基盤の切り出しまたは別リポジトリとして検討する。
+- **外部現像・AI処理ツール連携: Photoshop (ACR) / Canon NNIP・Upscaling Tool（Proposed / Phase 5〜6 以降の将来検討・要実機確認）**:
+  - WING-UI で検索・選別した対象カットのみを Hot SSD 作業フォルダへ展開（原本・`read_only` NAS には非破壊）し、Photoshop（Adobe Camera Raw）や Canon Digital Photo Professional（DPP）／Neural network Image Processing Tool（NNIP）／Neural network Upscaling Tool へ安全に渡す連携構想（引数配列渡し、直接 CLI 起動可否は実機確認が必要）。
+  - NNIP 処理済み RAW/DNG や現像・アップスケーリング出力を元の撮影 `Asset ID` に派生物（`role = 'exported'`、将来的に派生元参照）として紐付け、原本と多段階生成物の対応関係を維持する。
 
 ## 付録 A. 設計変更の理由
 ### A.1 原点と役割分担
