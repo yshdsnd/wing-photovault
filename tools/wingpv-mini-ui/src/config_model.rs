@@ -127,6 +127,7 @@ pub struct ConfigDraft {
     pub log_dir: String,
     pub image_exts_csv: String,
     pub video_exts_csv: String,
+    pub sidecar_exts_csv: String,
     pub incremental: bool,
     pub follow_symlinks: bool,
     pub hash_algorithm: HashAlgorithm,
@@ -175,6 +176,7 @@ impl ConfigDraft {
             log_dir: cfg.general.log_dir.to_string_lossy().into_owned(),
             image_exts_csv: cfg.general.image_exts.join(", "),
             video_exts_csv: cfg.general.video_exts.join(", "),
+            sidecar_exts_csv: cfg.general.sidecar_exts.join(", "),
             incremental: cfg.scan.incremental,
             follow_symlinks: cfg.scan.follow_symlinks,
             hash_algorithm: cfg.hash.algorithm,
@@ -230,6 +232,7 @@ impl ConfigDraft {
                 log_dir: PathBuf::from(self.log_dir.trim()),
                 image_exts: parse_csv(&self.image_exts_csv),
                 video_exts: parse_csv(&self.video_exts_csv),
+                sidecar_exts: parse_csv(&self.sidecar_exts_csv),
             },
             scan: ScanConfig {
                 incremental: self.incremental,

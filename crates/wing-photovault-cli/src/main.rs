@@ -20,8 +20,8 @@ use wing_photovault_core::config::{Config, ExifBackend, StorageConfig};
 use wing_photovault_core::hashing::hash_file;
 use wing_photovault_core::metadata::{apply_lens_aliases, extract_native, MetadataSession};
 use wing_photovault_core::model::{
-    current_host_os, AccessMode, BackupMode, HashAlgorithm, MediaType, ScanManifestRecord,
-    StorageStatus, StorageTier,
+    current_host_os, is_sidecar_extension, AccessMode, BackupMode, FileRole, HashAlgorithm,
+    MediaType, ScanManifestRecord, StorageStatus, StorageTier,
 };
 use wing_photovault_core::scanner::{discover_storage_files, walk_storage_files, DiscoveredFile};
 use wing_photovault_db::{Database, FindCursor, FindFilter, ScanRunSummary, UpsertFileInput};
@@ -621,7 +621,13 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
 
                     let msg = match hash_file(&f.abs_path, hash_algo, partial_hash_enabled) {
                         Ok(hash) => {
-                            let meta = meta_ref.extract(&f.abs_path, &f.ext);
+                            let is_sidecar = is_sidecar_extension(&f.ext);
+                            let meta = if is_sidecar {
+                                None
+                            } else {
+                                meta_ref.extract(&f.abs_path, &f.ext)
+                            };
+                            let file_role = if is_sidecar { FileRole::Sidecar } else { role };
                             let done_bytes =
                                 bytes_ref.fetch_add(hash.bytes_read, Ordering::Relaxed)
                                     + hash.bytes_read;
@@ -644,7 +650,7 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
                                 ctime_ns: f.ctime_ns,
                                 media_kind: f.media_kind,
                                 format: f.format,
-                                role,
+                                role: file_role,
                                 hash_algo: hash.algorithm,
                                 hash_hex: hash.hash_hex,
                                 partial_hash: hash.partial_hash,
@@ -791,6 +797,7 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
         }
         let pair_report = db.pair_raw_jpeg_assets(&storage.id)?;
         summary.raw_jpeg_merged = pair_report.pairs_merged;
+        let sidecar_report = db.link_sidecar_files(&storage.id)?;
         db.finish_scan_run(&summary, None)?;
 
         info!(
@@ -802,6 +809,7 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
             skipped = summary.files_skipped,
             missing = summary.files_missing,
             raw_jpeg_merged = summary.raw_jpeg_merged,
+            sidecars_linked = sidecar_report.linked,
             "scan completed"
         );
         summaries.push(summary);
@@ -987,6 +995,11 @@ fn cmd_import_manifest(
             rid
         };
 
+        let file_role = if is_sidecar_extension(&rec.ext) {
+            FileRole::Sidecar
+        } else {
+            storage_cfg.tier.default_file_role()
+        };
         let input = UpsertFileInput {
             storage_id: storage_cfg.id.clone(),
             rel_path: rec.rel_path,
@@ -998,7 +1011,7 @@ fn cmd_import_manifest(
             ctime_ns: rec.ctime_ns,
             media_kind: rec.media_kind,
             format: rec.format,
-            role: storage_cfg.tier.default_file_role(),
+            role: file_role,
             hash_algo: rec.hash_algo,
             hash_hex: rec.hash_hex,
             partial_hash: rec.partial_hash,
@@ -1025,6 +1038,7 @@ fn cmd_import_manifest(
             total_updated += updated;
         }
         let pair_rep = db.pair_raw_jpeg_assets(&storage_id)?;
+        let _ = db.link_sidecar_files(&storage_id)?;
         total_paired += pair_rep.pairs_merged;
 
         let summary = ScanRunSummary {
@@ -1547,11 +1561,18 @@ fn cmd_find(
         }
         OutputFormat::Text => {
             for r in &page.items {
+                let metric = if let Some(ms) = r.duration_ms {
+                    format!("{:.1}s", ms as f64 / 1000.0)
+                } else if let Some(iso) = r.iso {
+                    format!("ISO{iso}")
+                } else {
+                    "-".to_string()
+                };
                 println!(
-                    "{} | {:<16} | {:<4} | {:<19} | {:<18} | {}",
+                    "{} | {:<16} | {:<6} | {:<19} | {:<18} | {}",
                     r.storage_id,
                     r.format,
-                    r.iso.map(|i| format!("ISO{i}")).unwrap_or_else(|| "-".into()),
+                    metric,
                     r.captured_at.as_deref().unwrap_or("-"),
                     r.camera_model.as_deref().unwrap_or("-"),
                     r.rel_path

@@ -251,8 +251,41 @@ pub fn classify_extension(ext: &str) -> (MediaKind, &'static str) {
         ".nef" => (MediaKind::Raw, "nef"),
         ".mp4" | ".m4v" => (MediaKind::Video, "mp4"),
         ".mov" => (MediaKind::Video, "mov"),
+        ".xmp" => (MediaKind::Other, "xmp"),
+        ".thm" => (MediaKind::Other, "thm"),
         _ => (MediaKind::Other, "unknown"),
     }
+}
+
+/// Returns `true` if the lowercase extension (with leading dot) is a recognized sidecar format.
+pub fn is_sidecar_extension(ext: &str) -> bool {
+    matches!(ext, ".xmp" | ".thm")
+}
+
+/// Extract the logical parent media stem from a sidecar filename.
+/// Supports both `IMG_0001.xmp` / `CRW_0001.THM` (`IMG_0001`) and
+/// double-extension sidecars like `IMG_0001.CR3.xmp` (`IMG_0001`).
+pub fn sidecar_parent_stem(file_name: &str) -> Option<String> {
+    let dot = file_name.rfind('.')?;
+    let ext = file_name[dot..].to_ascii_lowercase();
+    if !is_sidecar_extension(&ext) {
+        return None;
+    }
+    let without_sidecar = &file_name[..dot];
+    if without_sidecar.is_empty() {
+        return None;
+    }
+    if let Some(inner_dot) = without_sidecar.rfind('.') {
+        let inner_ext = without_sidecar[inner_dot..].to_ascii_lowercase();
+        let (kind, _) = classify_extension(&inner_ext);
+        if matches!(kind, MediaKind::Image | MediaKind::Raw | MediaKind::Video) {
+            let stem = &without_sidecar[..inner_dot];
+            if !stem.is_empty() {
+                return Some(stem.to_string());
+            }
+        }
+    }
+    Some(without_sidecar.to_string())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -328,5 +361,38 @@ impl ScanManifestRecord {
             return Err("invalid hash_hex".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_sidecars_and_extracts_parent_stems() {
+        assert_eq!(classify_extension(".xmp"), (MediaKind::Other, "xmp"));
+        assert_eq!(classify_extension(".thm"), (MediaKind::Other, "thm"));
+        assert!(is_sidecar_extension(".xmp"));
+        assert!(is_sidecar_extension(".thm"));
+        assert!(!is_sidecar_extension(".cr3"));
+
+        assert_eq!(
+            sidecar_parent_stem("IMG_0001.xmp").as_deref(),
+            Some("IMG_0001")
+        );
+        assert_eq!(
+            sidecar_parent_stem("CRW_0123.THM").as_deref(),
+            Some("CRW_0123")
+        );
+        assert_eq!(
+            sidecar_parent_stem("IMG_0001.CR3.xmp").as_deref(),
+            Some("IMG_0001")
+        );
+        assert_eq!(
+            sidecar_parent_stem("MVI_0042.MOV.XMP").as_deref(),
+            Some("MVI_0042")
+        );
+        assert_eq!(sidecar_parent_stem("IMG_0001.CR3"), None);
+        assert_eq!(sidecar_parent_stem(".xmp"), None);
     }
 }

@@ -410,6 +410,12 @@ impl MiniUiApp {
                             .changed();
                         ui.end_row();
 
+                        ui.label("sidecar_exts（カンマ区切り）:");
+                        changed |= ui
+                            .add(egui::TextEdit::singleline(&mut self.draft.sidecar_exts_csv).desired_width(420.0))
+                            .changed();
+                        ui.end_row();
+
                         ui.label("スキャン設定:");
                         ui.horizontal(|ui| {
                             changed |= ui

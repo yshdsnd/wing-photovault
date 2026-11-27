@@ -52,6 +52,8 @@ pub struct GeneralConfig {
     pub image_exts: Vec<String>,
     #[serde(default = "default_video_exts")]
     pub video_exts: Vec<String>,
+    #[serde(default = "default_sidecar_exts")]
+    pub sidecar_exts: Vec<String>,
 }
 
 impl Default for GeneralConfig {
@@ -61,6 +63,7 @@ impl Default for GeneralConfig {
             log_dir: default_log_dir(),
             image_exts: default_image_exts(),
             video_exts: default_video_exts(),
+            sidecar_exts: default_sidecar_exts(),
         }
     }
 }
@@ -244,6 +247,7 @@ impl Config {
             .image_exts
             .iter()
             .chain(self.general.video_exts.iter())
+            .chain(self.general.sidecar_exts.iter())
             .map(|e| {
                 let lower = e.trim().to_ascii_lowercase();
                 if lower.starts_with('.') {
@@ -288,6 +292,13 @@ fn default_image_exts() -> Vec<String> {
 
 fn default_video_exts() -> Vec<String> {
     vec![".mp4", ".mov", ".m4v"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+fn default_sidecar_exts() -> Vec<String> {
+    vec![".xmp", ".thm"]
         .into_iter()
         .map(String::from)
         .collect()

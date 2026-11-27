@@ -2,7 +2,7 @@
 
 - Last Updated: 2026-11-27
 - Current Phase: **Phase 1（読み取り専用インデックス・検索・統計・ベンチマーク・NAS マニフェスト連携）**
-- Branch: `main`（全 21 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
+- Branch: `main`（全 23 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
 
@@ -27,6 +27,7 @@
 - 差分スキャン（未変更ファイルは `last_seen_at` のみ更新し `last_verified_at` を保持）
 - RAW + JPEG 論理 Asset 統合（同一フォルダ＋兄弟 `RAW/`・`JPEG/` フォルダ対応、曖昧時は非統合）
   - O(1) バッチ内ペアリング（途中中断してもコミット済み分は統合済み）＋スキャン末尾の冪等スイープ
+- サイドカー認識・親 Asset 自動紐付け（`.xmp`, `.thm`, 二重拡張子 `.CR3.xmp` 対応、`FileRole::Sidecar`、偽 Asset 非生成・曖昧時 Fail Closed）＋動画（MP4/MOV）メタデータ（`duration_ms`, `fps`）検索出力対応
 - マニフェストのストリーミング書き出し（`stream_storage_manifest`）
 
 ### CLI (`crates/wing-photovault-cli` / バイナリ名 `wingpv`)
@@ -55,11 +56,9 @@
 
 ## 3. 進行中・次のタスク候補
 
-1. **FreeBSD NAS ローカルスキャン実証**（手順: [docs/nas-local-scan-freebsd.md](nas-local-scan-freebsd.md)）
-   - FreeBSD 側でのビルド・インターバル付きスキャン完走 → `export-manifest` → Windows 側 `import-manifest` で `Backed-up Contents` 確認
-2. **Phase 1 残タスク（大規模・品質仕上げ）**
-   - 動画（MP4/MOV）のメタデータ取得確認、`.xmp` / `.thm` サイドカー認識の土台
-3. **Phase 2 準備**
+1. **FreeBSD NAS ローカルスキャン実証（進行中）**（手順: [docs/nas-local-scan-freebsd.md](nas-local-scan-freebsd.md)）
+   - FreeBSD 側での 39.5 万ファイルスキャン完走 → `export-manifest` → Windows 側 `import-manifest` で `Backed-up Contents`・24 年分使用機材年表（`stats --percent --by-year --gear-history`）確認
+2. **Phase 2 準備**（Phase 1 実装系タスクは完了済み）
    - `duplicates` コマンド（サイズ→部分ハッシュ→全体ハッシュ、Backup / ReadOnly 除外）
    - 操作ジャーナル（`operation_journal`）・隔離（`quarantine`）・復元（`restore`）・`--dry-run`
 

@@ -9,7 +9,8 @@ use uuid::Uuid;
 use wing_photovault_core::config::StorageConfig;
 use wing_photovault_core::metadata::resolve_lens_alias;
 use wing_photovault_core::model::{
-    ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, ScanManifestRecord, StorageStatus,
+    sidecar_parent_stem, ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, ScanManifestRecord,
+    StorageStatus,
 };
 
 use crate::error::DbResult;
@@ -51,6 +52,12 @@ pub struct UpsertFileInput {
 pub struct PairReport {
     pub pairs_merged: u64,
     pub ambiguous_skipped: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SidecarLinkReport {
+    pub linked: u64,
+    pub unmatched_or_ambiguous: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -213,6 +220,10 @@ pub struct FindRow {
     pub f_number: Option<f64>,
     pub shutter_speed_str: Option<String>,
     pub iso: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -542,117 +553,124 @@ impl Database {
             }
 
             // 3. Resolve asset_id:
-            //    (a) reuse existing asset linked to this exact content (e.g. backup copy on NAS)
-            //    (b) otherwise, perform O(1) indexed in-batch RAW+JPEG pairing so even an
-            //        interrupted scan commits already-paired logical assets.
-            let mut existing_asset_id: Option<i64> = tx
-                .query_row(
-                    "SELECT asset_id FROM files WHERE content_id = ?1 AND asset_id IS NOT NULL LIMIT 1",
-                    params![content_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
+            //    - Sidecars (`.xmp`, `.thm`) NEVER create standalone logical assets; they link
+            //      to an unambiguous parent asset in the same directory if already present (or stay
+            //      NULL until `link_sidecar_files` runs at the end of the scan).
+            //    - Media files reuse an existing asset for the same content (e.g. NAS backup) or
+            //      perform O(1) indexed in-batch RAW+JPEG pairing.
+            let asset_id: Option<i64> = if item.role == FileRole::Sidecar {
+                find_in_batch_sidecar_parent_asset(&tx, item)?
+            } else {
+                let mut existing_asset_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT asset_id FROM files WHERE content_id = ?1 AND asset_id IS NOT NULL LIMIT 1",
+                        params![content_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
 
-            if existing_asset_id.is_none() {
-                existing_asset_id = find_in_batch_raw_jpeg_asset(&tx, item)?;
-            }
+                if existing_asset_id.is_none() {
+                    existing_asset_id = find_in_batch_raw_jpeg_asset(&tx, item)?;
+                }
 
-            let asset_id = if let Some(aid) = existing_asset_id {
-                if let Some(meta) = item.metadata.as_ref() {
+                let resolved = if let Some(aid) = existing_asset_id {
+                    if let Some(meta) = item.metadata.as_ref() {
+                        tx.execute(
+                            "UPDATE assets SET
+                                captured_at = COALESCE(?1, captured_at),
+                                captured_subsec = COALESCE(?2, captured_subsec),
+                                camera_make = COALESCE(?3, camera_make),
+                                camera_model = COALESCE(?4, camera_model),
+                                camera_serial = COALESCE(?5, camera_serial),
+                                lens_model_raw = COALESCE(?6, lens_model_raw),
+                                lens_model = COALESCE(?7, lens_model),
+                                focal_length_mm = COALESCE(?8, focal_length_mm),
+                                focal_length_35mm = COALESCE(?9, focal_length_35mm),
+                                f_number = COALESCE(?10, f_number),
+                                shutter_speed_s = COALESCE(?11, shutter_speed_s),
+                                shutter_speed_str = COALESCE(?12, shutter_speed_str),
+                                iso = COALESCE(?13, iso),
+                                exposure_bias = COALESCE(?14, exposure_bias),
+                                width = COALESCE(?15, width),
+                                height = COALESCE(?16, height),
+                                orientation = COALESCE(?17, orientation),
+                                gps_lat = COALESCE(?18, gps_lat),
+                                gps_lon = COALESCE(?19, gps_lon),
+                                duration_ms = COALESCE(?20, duration_ms),
+                                fps = COALESCE(?21, fps),
+                                updated_at = ?22
+                             WHERE id = ?23",
+                            params![
+                                meta.captured_at.as_deref(),
+                                meta.captured_subsec.as_deref(),
+                                meta.camera_make.as_deref(),
+                                meta.camera_model.as_deref(),
+                                meta.camera_serial.as_deref(),
+                                meta.lens_model_raw.as_deref(),
+                                meta.lens_model.as_deref(),
+                                meta.focal_length_mm,
+                                meta.focal_length_35mm,
+                                meta.f_number,
+                                meta.shutter_speed_s,
+                                meta.shutter_speed_str.as_deref(),
+                                meta.iso,
+                                meta.exposure_bias,
+                                meta.width,
+                                meta.height,
+                                meta.orientation,
+                                meta.gps_lat,
+                                meta.gps_lon,
+                                meta.duration_ms,
+                                meta.fps,
+                                now,
+                                aid,
+                            ],
+                        )?;
+                    }
+                    aid
+                } else {
+                    let public_id = Uuid::now_v7().to_string();
+                    let meta = item.metadata.as_ref();
                     tx.execute(
-                        "UPDATE assets SET
-                            captured_at = COALESCE(?1, captured_at),
-                            captured_subsec = COALESCE(?2, captured_subsec),
-                            camera_make = COALESCE(?3, camera_make),
-                            camera_model = COALESCE(?4, camera_model),
-                            camera_serial = COALESCE(?5, camera_serial),
-                            lens_model_raw = COALESCE(?6, lens_model_raw),
-                            lens_model = COALESCE(?7, lens_model),
-                            focal_length_mm = COALESCE(?8, focal_length_mm),
-                            focal_length_35mm = COALESCE(?9, focal_length_35mm),
-                            f_number = COALESCE(?10, f_number),
-                            shutter_speed_s = COALESCE(?11, shutter_speed_s),
-                            shutter_speed_str = COALESCE(?12, shutter_speed_str),
-                            iso = COALESCE(?13, iso),
-                            exposure_bias = COALESCE(?14, exposure_bias),
-                            width = COALESCE(?15, width),
-                            height = COALESCE(?16, height),
-                            orientation = COALESCE(?17, orientation),
-                            gps_lat = COALESCE(?18, gps_lat),
-                            gps_lon = COALESCE(?19, gps_lon),
-                            duration_ms = COALESCE(?20, duration_ms),
-                            fps = COALESCE(?21, fps),
-                            updated_at = ?22
-                         WHERE id = ?23",
+                        "INSERT INTO assets (
+                            public_id, captured_at, captured_subsec, camera_make, camera_model,
+                            camera_serial, lens_model_raw, lens_model, focal_length_mm,
+                            focal_length_35mm, f_number, shutter_speed_s, shutter_speed_str,
+                            iso, exposure_bias, width, height, orientation, gps_lat, gps_lon,
+                            duration_ms, fps, created_at, updated_at
+                         ) VALUES (
+                            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23
+                         )",
                         params![
-                            meta.captured_at.as_deref(),
-                            meta.captured_subsec.as_deref(),
-                            meta.camera_make.as_deref(),
-                            meta.camera_model.as_deref(),
-                            meta.camera_serial.as_deref(),
-                            meta.lens_model_raw.as_deref(),
-                            meta.lens_model.as_deref(),
-                            meta.focal_length_mm,
-                            meta.focal_length_35mm,
-                            meta.f_number,
-                            meta.shutter_speed_s,
-                            meta.shutter_speed_str.as_deref(),
-                            meta.iso,
-                            meta.exposure_bias,
-                            meta.width,
-                            meta.height,
-                            meta.orientation,
-                            meta.gps_lat,
-                            meta.gps_lon,
-                            meta.duration_ms,
-                            meta.fps,
+                            public_id,
+                            meta.and_then(|m| m.captured_at.as_deref()),
+                            meta.and_then(|m| m.captured_subsec.as_deref()),
+                            meta.and_then(|m| m.camera_make.as_deref()),
+                            meta.and_then(|m| m.camera_model.as_deref()),
+                            meta.and_then(|m| m.camera_serial.as_deref()),
+                            meta.and_then(|m| m.lens_model_raw.as_deref()),
+                            meta.and_then(|m| m.lens_model.as_deref()),
+                            meta.and_then(|m| m.focal_length_mm),
+                            meta.and_then(|m| m.focal_length_35mm),
+                            meta.and_then(|m| m.f_number),
+                            meta.and_then(|m| m.shutter_speed_s),
+                            meta.and_then(|m| m.shutter_speed_str.as_deref()),
+                            meta.and_then(|m| m.iso),
+                            meta.and_then(|m| m.exposure_bias),
+                            meta.and_then(|m| m.width),
+                            meta.and_then(|m| m.height),
+                            meta.and_then(|m| m.orientation),
+                            meta.and_then(|m| m.gps_lat),
+                            meta.and_then(|m| m.gps_lon),
+                            meta.and_then(|m| m.duration_ms),
+                            meta.and_then(|m| m.fps),
                             now,
-                            aid,
                         ],
                     )?;
-                }
-                aid
-            } else {
-                let public_id = Uuid::now_v7().to_string();
-                let meta = item.metadata.as_ref();
-                tx.execute(
-                    "INSERT INTO assets (
-                        public_id, captured_at, captured_subsec, camera_make, camera_model,
-                        camera_serial, lens_model_raw, lens_model, focal_length_mm,
-                        focal_length_35mm, f_number, shutter_speed_s, shutter_speed_str,
-                        iso, exposure_bias, width, height, orientation, gps_lat, gps_lon,
-                        duration_ms, fps, created_at, updated_at
-                     ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                        ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23
-                     )",
-                    params![
-                        public_id,
-                        meta.and_then(|m| m.captured_at.as_deref()),
-                        meta.and_then(|m| m.captured_subsec.as_deref()),
-                        meta.and_then(|m| m.camera_make.as_deref()),
-                        meta.and_then(|m| m.camera_model.as_deref()),
-                        meta.and_then(|m| m.camera_serial.as_deref()),
-                        meta.and_then(|m| m.lens_model_raw.as_deref()),
-                        meta.and_then(|m| m.lens_model.as_deref()),
-                        meta.and_then(|m| m.focal_length_mm),
-                        meta.and_then(|m| m.focal_length_35mm),
-                        meta.and_then(|m| m.f_number),
-                        meta.and_then(|m| m.shutter_speed_s),
-                        meta.and_then(|m| m.shutter_speed_str.as_deref()),
-                        meta.and_then(|m| m.iso),
-                        meta.and_then(|m| m.exposure_bias),
-                        meta.and_then(|m| m.width),
-                        meta.and_then(|m| m.height),
-                        meta.and_then(|m| m.orientation),
-                        meta.and_then(|m| m.gps_lat),
-                        meta.and_then(|m| m.gps_lon),
-                        meta.and_then(|m| m.duration_ms),
-                        meta.and_then(|m| m.fps),
-                        now,
-                    ],
-                )?;
-                tx.last_insert_rowid()
+                    tx.last_insert_rowid()
+                };
+                Some(resolved)
             };
 
             // 4. Upsert physical file record (sets both last_seen_at and last_verified_at since content was hashed)
@@ -906,6 +924,106 @@ impl Database {
             )?;
 
             report.pairs_merged += 1;
+        }
+        tx.commit()?;
+
+        Ok(report)
+    }
+
+    /// Link unattached sidecar files (`.xmp`, `.thm`) within a storage to their parent logical Asset
+    /// in the same directory.
+    ///
+    /// Rules (Fail Closed):
+    /// - Same directory (case-insensitive on Windows).
+    /// - Case-insensitive match between `sidecar_parent_stem(sidecar.file_name)` and parent `file_stem`.
+    /// - Only links when all matching parent files resolve to exactly ONE distinct `asset_id`
+    ///   (e.g. a single RAW/Video or a paired RAW+JPEG sharing the same `asset_id`).
+    /// - Orphaned or ambiguous sidecars remain `asset_id = NULL` (never creating bogus Assets).
+    pub fn link_sidecar_files(&mut self, storage_id: &str) -> DbResult<SidecarLinkReport> {
+        let unlinked: Vec<(i64, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, rel_path, file_name
+                 FROM files
+                 WHERE storage_id = ?1
+                   AND presence = 'present'
+                   AND role = 'sidecar'
+                   AND asset_id IS NULL",
+            )?;
+            let rows = stmt.query_map(params![storage_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+
+        if unlinked.is_empty() {
+            return Ok(SidecarLinkReport::default());
+        }
+
+        // Index parent assets by (dir_key, lowercase_stem) -> Option<i64> (None = ambiguous)
+        let mut parent_map: HashMap<(String, String), Option<i64>> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT rel_path, file_stem, asset_id
+                 FROM files
+                 WHERE storage_id = ?1
+                   AND presence = 'present'
+                   AND role != 'sidecar'
+                   AND asset_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![storage_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (rel_path, stem, aid) = row?;
+                let key = (dir_key(&rel_path), stem.to_ascii_lowercase());
+                parent_map
+                    .entry(key)
+                    .and_modify(|existing| {
+                        if *existing != Some(aid) {
+                            *existing = None; // Ambiguous: multiple distinct parent assets
+                        }
+                    })
+                    .or_insert(Some(aid));
+            }
+        }
+
+        let mut updates: Vec<(i64, i64)> = Vec::new(); // (file_id, parent_asset_id)
+        let mut report = SidecarLinkReport::default();
+
+        for (file_id, rel_path, file_name) in unlinked {
+            let Some(parent_stem) = sidecar_parent_stem(&file_name) else {
+                report.unmatched_or_ambiguous += 1;
+                continue;
+            };
+            let key = (dir_key(&rel_path), parent_stem.to_ascii_lowercase());
+            match parent_map.get(&key) {
+                Some(Some(parent_aid)) => updates.push((file_id, *parent_aid)),
+                _ => report.unmatched_or_ambiguous += 1,
+            }
+        }
+
+        if updates.is_empty() {
+            return Ok(report);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE files SET asset_id = ?1, updated_at = ?2 WHERE id = ?3 AND asset_id IS NULL",
+            )?;
+            for (file_id, parent_aid) in updates {
+                let n = stmt.execute(params![parent_aid, now, file_id])?;
+                report.linked += n as u64;
+            }
         }
         tx.commit()?;
 
@@ -1318,7 +1436,8 @@ impl Database {
             "SELECT f.id, f.asset_id, a.public_id, f.storage_id, f.rel_path,
                     COALESCE(c.format, f.ext), f.byte_size,
                     a.captured_at, a.camera_model, a.lens_model,
-                    a.focal_length_mm, a.f_number, a.shutter_speed_str, a.iso
+                    a.focal_length_mm, a.f_number, a.shutter_speed_str, a.iso,
+                    a.duration_ms, a.fps
              FROM files f
              LEFT JOIN contents c ON c.id = f.content_id
              LEFT JOIN assets a ON a.id = f.asset_id
@@ -1384,6 +1503,8 @@ impl Database {
                 f_number: r.get(11)?,
                 shutter_speed_str: r.get(12)?,
                 iso: r.get(13)?,
+                duration_ms: r.get(14)?,
+                fps: r.get(15)?,
             })
         })?;
 
@@ -1918,6 +2039,60 @@ fn find_in_batch_raw_jpeg_asset(
     }
 
     Ok(matched_asset_id)
+}
+
+/// Fast O(1) indexed lookup for a parent asset in the same directory when ingesting a sidecar.
+/// Returns `Some(asset_id)` only if exactly one distinct parent asset matches (Fail Closed).
+fn find_in_batch_sidecar_parent_asset(
+    tx: &rusqlite::Transaction<'_>,
+    item: &UpsertFileInput,
+) -> DbResult<Option<i64>> {
+    let Some(parent_stem) = sidecar_parent_stem(&item.file_name) else {
+        return Ok(None);
+    };
+    let stem_upper = parent_stem.to_ascii_uppercase();
+    let stem_lower = parent_stem.to_ascii_lowercase();
+    let target_dir = dir_key(&item.rel_path);
+
+    let mut stmt = tx.prepare_cached(
+        "SELECT asset_id, rel_path
+         FROM files
+         WHERE file_stem IN (?1, ?2, ?3)
+           AND storage_id = ?4
+           AND presence = 'present'
+           AND role != 'sidecar'
+           AND asset_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(
+        params![parent_stem, stem_upper, stem_lower, item.storage_id],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+    )?;
+
+    let mut matched: Option<i64> = None;
+    for row in rows {
+        let (aid, rel_path) = row?;
+        if dir_key(&rel_path) != target_dir {
+            continue;
+        }
+        match matched {
+            None => matched = Some(aid),
+            Some(prev) if prev == aid => {}
+            Some(_) => return Ok(None), // Ambiguous
+        }
+    }
+    Ok(matched)
+}
+
+fn dir_key(rel_path: &str) -> String {
+    let dir = match rel_path.rfind('/') {
+        Some(idx) => &rel_path[..idx],
+        None => "",
+    };
+    if cfg!(windows) {
+        dir.to_ascii_lowercase()
+    } else {
+        dir.to_string()
+    }
 }
 
 /// Normalize parent directory for RAW+JPEG pairing.
@@ -2679,5 +2854,201 @@ mod tests {
         assert!(FindCursor::decode("v1:0:2026-11-24").is_err());
         assert!(FindCursor::decode("v1:-5:2026-11-24").is_err());
         assert!(FindCursor::decode("v1:1:bad\nctrl").is_err());
+    }
+
+    #[test]
+    fn links_sidecars_to_parent_assets_without_inflating_asset_count() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("pc", "PC", "windows").unwrap();
+        let st = StorageConfig {
+            id: "ssd_hot".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Nvme,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&st, "pc", StorageStatus::Online).unwrap();
+        let run1 = db.start_scan_run(&st.id, "incremental").unwrap();
+
+        let make = |rel: &str,
+                    name: &str,
+                    stem: &str,
+                    ext: &str,
+                    kind: MediaKind,
+                    fmt: &str,
+                    role: FileRole,
+                    hash: &str| UpsertFileInput {
+            storage_id: st.id.clone(),
+            rel_path: rel.into(),
+            file_name: name.into(),
+            file_stem: stem.into(),
+            ext: ext.into(),
+            byte_size: 100,
+            mtime_ns: 100,
+            ctime_ns: None,
+            media_kind: kind,
+            format: fmt.into(),
+            role,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: if role == FileRole::Sidecar {
+                None
+            } else {
+                Some(ExtractedMetadata {
+                    extractor: "native".into(),
+                    captured_at: Some("2026-11-24T10:00:00".into()),
+                    camera_model: Some("Canon EOS R5m2".into()),
+                    duration_ms: if kind == MediaKind::Video {
+                        Some(12_340)
+                    } else {
+                        None
+                    },
+                    fps: if kind == MediaKind::Video {
+                        Some(59.94)
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                })
+            },
+        };
+
+        // Sidecar ingested BEFORE its parent CR3 (tests post-scan link_sidecar_files)
+        // plus double-extension `.CR3.xmp`, CRW `.THM`, a video, and an orphan `.xmp`.
+        let items = vec![
+            make(
+                "2026/IMG_0001.xmp",
+                "IMG_0001.xmp",
+                "IMG_0001",
+                ".xmp",
+                MediaKind::Other,
+                "xmp",
+                FileRole::Sidecar,
+                "s1",
+            ),
+            make(
+                "2026/IMG_0001.CR3",
+                "IMG_0001.CR3",
+                "IMG_0001",
+                ".cr3",
+                MediaKind::Raw,
+                "cr3",
+                FileRole::Original,
+                "r1",
+            ),
+            make(
+                "2026/IMG_0001.CR3.xmp",
+                "IMG_0001.CR3.xmp",
+                "IMG_0001.CR3",
+                ".xmp",
+                MediaKind::Other,
+                "xmp",
+                FileRole::Sidecar,
+                "s2",
+            ),
+            make(
+                "2004/CRW_0010.CRW",
+                "CRW_0010.CRW",
+                "CRW_0010",
+                ".crw",
+                MediaKind::Raw,
+                "crw",
+                FileRole::Original,
+                "r2",
+            ),
+            make(
+                "2004/CRW_0010.THM",
+                "CRW_0010.THM",
+                "CRW_0010",
+                ".thm",
+                MediaKind::Other,
+                "thm",
+                FileRole::Sidecar,
+                "s3",
+            ),
+            make(
+                "2026/MVI_0001.MP4",
+                "MVI_0001.MP4",
+                "MVI_0001",
+                ".mp4",
+                MediaKind::Video,
+                "mp4",
+                FileRole::Original,
+                "v1",
+            ),
+            make(
+                "2026/ORPHAN.xmp",
+                "ORPHAN.xmp",
+                "ORPHAN",
+                ".xmp",
+                MediaKind::Other,
+                "xmp",
+                FileRole::Sidecar,
+                "s4",
+            ),
+        ];
+        db.upsert_scanned_batch(&items, run1).unwrap();
+
+        // Sidecars must NEVER create standalone Assets: only CR3, CRW, MP4 = 3 logical assets
+        let st_before = db.stats().unwrap();
+        assert_eq!(st_before.total_assets, 3);
+        assert_eq!(st_before.total_present_files, 7);
+
+        // Post-scan link links IMG_0001.xmp (which arrived before CR3);
+        // IMG_0001.CR3.xmp and CRW_0010.THM were already linked in-batch; ORPHAN.xmp stays NULL.
+        let link_rep = db.link_sidecar_files(&st.id).unwrap();
+        assert_eq!(link_rep.linked, 1);
+        assert_eq!(link_rep.unmatched_or_ambiguous, 1);
+
+        let cr3_aid: i64 = db
+            .conn
+            .query_row(
+                "SELECT asset_id FROM files WHERE rel_path = '2026/IMG_0001.CR3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let xmp1_aid: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT asset_id FROM files WHERE rel_path = '2026/IMG_0001.xmp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let xmp2_aid: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT asset_id FROM files WHERE rel_path = '2026/IMG_0001.CR3.xmp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let orphan_aid: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT asset_id FROM files WHERE rel_path = '2026/ORPHAN.xmp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(xmp1_aid, Some(cr3_aid));
+        assert_eq!(xmp2_aid, Some(cr3_aid));
+        assert_eq!(orphan_aid, None);
+
+        // Video find row carries duration_ms & fps
+        let videos = db
+            .find(&FindFilter {
+                format: Some("mp4".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].duration_ms, Some(12_340));
+        assert_eq!(videos[0].fps, Some(59.94));
     }
 }
