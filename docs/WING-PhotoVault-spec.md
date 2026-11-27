@@ -480,6 +480,9 @@ RAW現像、レタッチ、動画編集、AI完全自動削除、クラウド上
 - **iOS 版コンパニオンアプリ / PhotoKit 連携（Proposed / Phase 8 以降の将来検討）**:
   - Apple 公式 `PhotoKit`（`PHPhotoLibrary` / `PHAsset` / `PHAssetResourceManager`）を用い、ユーザーの明示的なフルアクセス許可のもとで iPhone「写真」アプリ内の写真・動画を非破壊リストアップ・原本ハッシュ化し、`ScanManifestRecord`（JSONL マニフェスト）または `wing-photovault-core` FFI 経由で自宅 PC/NAS カタログと突合（未バックアップ検出・モバイル検索）する構想。
   - 検討すべき制約: iCloud 写真「ストレージを最適化」時の不要なダウンロード抑止（`isNetworkAccessAllowed = false` 等の制御）、iOS バックグラウンド実行時間制限（フォアグラウンド差分スキャン / `BGProcessingTask`）、macOS + Xcode ビルドおよび署名運用要件。当面は iPhone から NAS/PC へ転送済みファイルを通常の `wingpv scan` で管理する運用を優先する。
+- **姉妹ツール構想: WING MusicVault（Proposed / 別プロジェクトでの将来検討）**:
+  - 本プロジェクトのコア基盤（論理 Asset・ハッシュ・複数ストレージ・オフライン耐性・NAS マニフェスト連携・ジャーナル付き安全コピー＆検証）を横展開し、`FLAC` / `WAV` / `M4A (ALAC, AAC)` 等の音楽ライブラリ管理と **DAP（microSD 等）への差分転送・検証管理** を行う姉妹ツール構想。
+  - 写真管理のスコープ肥大化を防ぐため本リポジトリ（WING PhotoVault）には音楽専用機能を混在させず、PhotoVault のコア確立後に共通基盤の切り出しまたは別リポジトリとして検討する。
 
 ## 付録 A. 設計変更の理由
 ### A.1 原点と役割分担
