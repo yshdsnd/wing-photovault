@@ -116,6 +116,31 @@ pub struct StatsReport {
     pub by_storage: Vec<StorageStatsRow>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct YearStatsRow {
+    pub year: String,
+    pub assets: i64,
+    pub active_days: i64,
+    pub top_camera: Option<String>,
+    pub top_lens: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GearTimelineRow {
+    pub name: String,
+    pub assets: i64,
+    pub active_days: i64,
+    pub first_captured: Option<String>,
+    pub last_captured: Option<String>,
+    pub top_partner: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GearHistoryReport {
+    pub cameras: Vec<GearTimelineRow>,
+    pub lenses: Vec<GearTimelineRow>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FindFilter {
     pub storage_id: Option<String>,
@@ -1020,6 +1045,215 @@ impl Database {
         })
     }
 
+    /// Yearly asset counts, active shooting days, and top camera/lens per year.
+    /// Malformed EXIF timestamps (e.g. `0000-...`) or NULL are grouped into `(unknown)`.
+    pub fn stats_by_year(&self) -> DbResult<Vec<YearStatsRow>> {
+        const YEAR_EXPR: &str = "CASE WHEN captured_at IS NOT NULL AND length(captured_at) >= 10 \
+             AND substr(captured_at, 1, 4) >= '1970' AND substr(captured_at, 1, 4) <= '2999' \
+             THEN substr(captured_at, 1, 4) ELSE '(unknown)' END";
+        const DAY_EXPR: &str = "CASE WHEN captured_at IS NOT NULL AND length(captured_at) >= 10 \
+             AND substr(captured_at, 1, 4) >= '1970' AND substr(captured_at, 1, 4) <= '2999' \
+             THEN substr(captured_at, 1, 10) ELSE NULL END";
+
+        let mut base_rows: Vec<(String, i64, i64)> = Vec::new();
+        {
+            let sql = format!(
+                "SELECT {YEAR_EXPR} AS yr, COUNT(*), COUNT(DISTINCT {DAY_EXPR})
+                 FROM assets
+                 GROUP BY yr
+                 ORDER BY CASE WHEN yr = '(unknown)' THEN 1 ELSE 0 END, yr ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            for row in rows {
+                base_rows.push(row?);
+            }
+        }
+
+        let mut top_cam_by_year: HashMap<String, (String, i64)> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT {YEAR_EXPR} AS yr, camera_model, COUNT(*)
+                 FROM assets
+                 WHERE camera_model IS NOT NULL
+                 GROUP BY yr, camera_model"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            for row in rows {
+                let (yr, cam, cnt) = row?;
+                let replace = match top_cam_by_year.get(&yr) {
+                    None => true,
+                    Some((prev_name, prev_cnt)) => {
+                        cnt > *prev_cnt || (cnt == *prev_cnt && cam < *prev_name)
+                    }
+                };
+                if replace {
+                    top_cam_by_year.insert(yr, (cam, cnt));
+                }
+            }
+        }
+
+        let mut top_lens_by_year: HashMap<String, (String, i64)> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT {YEAR_EXPR} AS yr, lens_model, COUNT(*)
+                 FROM assets
+                 WHERE lens_model IS NOT NULL
+                 GROUP BY yr, lens_model"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            for row in rows {
+                let (yr, lens, cnt) = row?;
+                let replace = match top_lens_by_year.get(&yr) {
+                    None => true,
+                    Some((prev_name, prev_cnt)) => {
+                        cnt > *prev_cnt || (cnt == *prev_cnt && lens < *prev_name)
+                    }
+                };
+                if replace {
+                    top_lens_by_year.insert(yr, (lens, cnt));
+                }
+            }
+        }
+
+        Ok(base_rows
+            .into_iter()
+            .map(|(year, assets, active_days)| {
+                let top_camera = top_cam_by_year.remove(&year).map(|(name, _)| name);
+                let top_lens = top_lens_by_year.remove(&year).map(|(name, _)| name);
+                YearStatsRow {
+                    year,
+                    assets,
+                    active_days,
+                    top_camera,
+                    top_lens,
+                }
+            })
+            .collect())
+    }
+
+    /// Chronological camera and lens usage timeline (`first_captured`..`last_captured`,
+    /// total assets, active shooting days, and most frequent partner lens/camera).
+    pub fn gear_history(&self) -> DbResult<GearHistoryReport> {
+        const VALID_DAY: &str = "CASE WHEN captured_at IS NOT NULL AND length(captured_at) >= 10 \
+             AND substr(captured_at, 1, 4) >= '1970' AND substr(captured_at, 1, 4) <= '2999' \
+             THEN substr(captured_at, 1, 10) ELSE NULL END";
+
+        // Compute top partner lens per camera and top partner camera per lens in one pass.
+        let mut top_lens_for_cam: HashMap<String, (String, i64)> = HashMap::new();
+        let mut top_cam_for_lens: HashMap<String, (String, i64)> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT camera_model, lens_model, COUNT(*)
+                 FROM assets
+                 WHERE camera_model IS NOT NULL AND lens_model IS NOT NULL
+                 GROUP BY camera_model, lens_model",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            for row in rows {
+                let (cam, lens, cnt) = row?;
+                let update_cam = match top_lens_for_cam.get(&cam) {
+                    None => true,
+                    Some((prev_name, prev_cnt)) => {
+                        cnt > *prev_cnt || (cnt == *prev_cnt && lens < *prev_name)
+                    }
+                };
+                if update_cam {
+                    top_lens_for_cam.insert(cam.clone(), (lens.clone(), cnt));
+                }
+                let update_lens = match top_cam_for_lens.get(&lens) {
+                    None => true,
+                    Some((prev_name, prev_cnt)) => {
+                        cnt > *prev_cnt || (cnt == *prev_cnt && cam < *prev_name)
+                    }
+                };
+                if update_lens {
+                    top_cam_for_lens.insert(lens, (cam, cnt));
+                }
+            }
+        }
+
+        let mut cameras = Vec::new();
+        {
+            let sql = format!(
+                "SELECT camera_model, COUNT(*), COUNT(DISTINCT {VALID_DAY}),
+                        MIN({VALID_DAY}), MAX({VALID_DAY})
+                 FROM assets
+                 WHERE camera_model IS NOT NULL
+                 GROUP BY camera_model
+                 ORDER BY CASE WHEN MIN({VALID_DAY}) IS NULL THEN 1 ELSE 0 END,
+                          MIN({VALID_DAY}) ASC, COUNT(*) DESC, camera_model ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (name, assets, active_days, first_captured, last_captured) = row?;
+                let top_partner = top_lens_for_cam.remove(&name).map(|(p, _)| p);
+                cameras.push(GearTimelineRow {
+                    name,
+                    assets,
+                    active_days,
+                    first_captured,
+                    last_captured,
+                    top_partner,
+                });
+            }
+        }
+
+        let mut lenses = Vec::new();
+        {
+            let sql = format!(
+                "SELECT lens_model, COUNT(*), COUNT(DISTINCT {VALID_DAY}),
+                        MIN({VALID_DAY}), MAX({VALID_DAY})
+                 FROM assets
+                 WHERE lens_model IS NOT NULL
+                 GROUP BY lens_model
+                 ORDER BY CASE WHEN MIN({VALID_DAY}) IS NULL THEN 1 ELSE 0 END,
+                          MIN({VALID_DAY}) ASC, COUNT(*) DESC, lens_model ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (name, assets, active_days, first_captured, last_captured) = row?;
+                let top_partner = top_cam_for_lens.remove(&name).map(|(p, _)| p);
+                lenses.push(GearTimelineRow {
+                    name,
+                    assets,
+                    active_days,
+                    first_captured,
+                    last_captured,
+                    top_partner,
+                });
+            }
+        }
+
+        Ok(GearHistoryReport { cameras, lenses })
+    }
+
     pub fn find(&self, filter: &FindFilter) -> DbResult<Vec<FindRow>> {
         let mut sql = String::from(
             "SELECT f.id, f.asset_id, a.public_id, f.storage_id, f.rel_path,
@@ -1908,5 +2142,144 @@ mod tests {
             reverted.changes[0].normalized_lens.as_deref(),
             Some("15-30mm")
         );
+    }
+
+    #[test]
+    fn computes_yearly_stats_and_chronological_gear_history_ignoring_malformed_dates() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("eagle", "Eagle NAS", "freebsd").unwrap();
+        let nas = StorageConfig {
+            id: "nas_backup_eagle".into(),
+            root: PathBuf::from("/home/yoshi/Pictures"),
+            media: MediaType::Hdd,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: Some("nas-eagle".into()),
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&nas, "eagle", StorageStatus::Online)
+            .unwrap();
+        let run1 = db.start_scan_run(&nas.id, "incremental").unwrap();
+
+        let make = |rel: &str, hash: &str, dt: Option<&str>, cam: Option<&str>, lens: Option<&str>| {
+            UpsertFileInput {
+                storage_id: nas.id.clone(),
+                rel_path: rel.into(),
+                file_name: rel.into(),
+                file_stem: rel.into(),
+                ext: ".cr3".into(),
+                byte_size: 1000,
+                mtime_ns: 100,
+                ctime_ns: None,
+                media_kind: MediaKind::Raw,
+                format: "cr3".into(),
+                role: FileRole::Backup,
+                hash_algo: HashAlgorithm::Blake3,
+                hash_hex: hash.into(),
+                partial_hash: None,
+                metadata: Some(ExtractedMetadata {
+                    extractor: "native".into(),
+                    captured_at: dt.map(String::from),
+                    camera_model: cam.map(String::from),
+                    lens_model_raw: lens.map(String::from),
+                    lens_model: lens.map(String::from),
+                    ..Default::default()
+                }),
+            }
+        };
+
+        let items = vec![
+            // 2004: EOS 10D (2 shots on 2 days)
+            make(
+                "2004/a.crw",
+                "h1",
+                Some("2004-05-06T09:00:00"),
+                Some("Canon EOS 10D"),
+                Some("EF100-400mm f/4.5-5.6L IS USM"),
+            ),
+            make(
+                "2004/b.crw",
+                "h2",
+                Some("2004-09-19T12:00:00"),
+                Some("Canon EOS 10D"),
+                Some("EF100-400mm f/4.5-5.6L IS USM"),
+            ),
+            // 2025: EOS R5m2 (2 shots on 1 day + 1 shot on another day)
+            make(
+                "2025/c.cr3",
+                "h3",
+                Some("2025-01-10T08:00:00"),
+                Some("Canon EOS R5m2"),
+                Some("RF200-800mm F6.3-9 IS USM"),
+            ),
+            make(
+                "2025/d.cr3",
+                "h4",
+                Some("2025-01-10T08:01:00"),
+                Some("Canon EOS R5m2"),
+                Some("RF200-800mm F6.3-9 IS USM"),
+            ),
+            make(
+                "2025/e.cr3",
+                "h5",
+                Some("2025-11-20T15:00:00"),
+                Some("Canon EOS R5m2"),
+                Some("RF100-500mm F4.5-7.1 L IS USM"),
+            ),
+            // Malformed EXIF date 0000-00-00 on R5m2 must NOT pollute first_captured!
+            make(
+                "2025/bad.cr3",
+                "h6",
+                Some("0000-00-00T00:00:00"),
+                Some("Canon EOS R5m2"),
+                Some("RF200-800mm F6.3-9 IS USM"),
+            ),
+        ];
+        db.upsert_scanned_batch(&items, run1).unwrap();
+
+        let yearly = db.stats_by_year().unwrap();
+        assert_eq!(yearly.len(), 3);
+        assert_eq!(yearly[0].year, "2004");
+        assert_eq!(yearly[0].assets, 2);
+        assert_eq!(yearly[0].active_days, 2);
+        assert_eq!(yearly[0].top_camera.as_deref(), Some("Canon EOS 10D"));
+
+        assert_eq!(yearly[1].year, "2025");
+        assert_eq!(yearly[1].assets, 3);
+        assert_eq!(yearly[1].active_days, 2);
+        assert_eq!(yearly[1].top_camera.as_deref(), Some("Canon EOS R5m2"));
+        assert_eq!(
+            yearly[1].top_lens.as_deref(),
+            Some("RF200-800mm F6.3-9 IS USM")
+        );
+
+        assert_eq!(yearly[2].year, "(unknown)");
+        assert_eq!(yearly[2].assets, 1);
+
+        let gh = db.gear_history().unwrap();
+        assert_eq!(gh.cameras.len(), 2);
+        assert_eq!(gh.cameras[0].name, "Canon EOS 10D");
+        assert_eq!(gh.cameras[0].first_captured.as_deref(), Some("2004-05-06"));
+        assert_eq!(gh.cameras[0].last_captured.as_deref(), Some("2004-09-19"));
+        assert_eq!(
+            gh.cameras[0].top_partner.as_deref(),
+            Some("EF100-400mm f/4.5-5.6L IS USM")
+        );
+
+        assert_eq!(gh.cameras[1].name, "Canon EOS R5m2");
+        // Must ignore 0000-00-00 and start at 2025-01-10
+        assert_eq!(gh.cameras[1].first_captured.as_deref(), Some("2025-01-10"));
+        assert_eq!(gh.cameras[1].last_captured.as_deref(), Some("2025-11-20"));
+        assert_eq!(gh.cameras[1].assets, 4);
+        assert_eq!(gh.cameras[1].active_days, 2);
+        assert_eq!(
+            gh.cameras[1].top_partner.as_deref(),
+            Some("RF200-800mm F6.3-9 IS USM")
+        );
+
+        assert_eq!(gh.lenses.len(), 3);
+        assert_eq!(gh.lenses[0].name, "EF100-400mm f/4.5-5.6L IS USM");
+        assert_eq!(gh.lenses[0].top_partner.as_deref(), Some("Canon EOS 10D"));
     }
 }

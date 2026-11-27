@@ -98,10 +98,22 @@ pub fn build_normalize_lenses_args(config_path: &Path, json: bool, dry_run: bool
     args
 }
 
-pub fn build_stats_args(config_path: &Path, json: bool, percent: bool) -> Vec<String> {
+pub fn build_stats_args(
+    config_path: &Path,
+    json: bool,
+    percent: bool,
+    by_year: bool,
+    gear_history: bool,
+) -> Vec<String> {
     let mut args = build_simple_args(config_path, json, "stats");
     if percent {
         args.push("--percent".to_string());
+    }
+    if by_year {
+        args.push("--by-year".to_string());
+    }
+    if gear_history {
+        args.push("--gear-history".to_string());
     }
     args
 }

@@ -94,6 +94,8 @@ struct MiniUiApp {
     // Inspect / Query tab state
     query_json: bool,
     stats_percent: bool,
+    stats_by_year: bool,
+    stats_gear_history: bool,
     confirm_normalize_apply: bool,
     find_params: FindParams,
 
@@ -145,6 +147,8 @@ impl MiniUiApp {
             show_toml_preview: false,
             query_json: false,
             stats_percent: true,
+            stats_by_year: false,
+            stats_gear_history: false,
             confirm_normalize_apply: false,
             find_params: FindParams::default(),
             scan_params: ScanParams::default(),
@@ -743,8 +747,10 @@ impl MiniUiApp {
         let running = self.runner.is_running();
 
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.query_json, "JSON 出力 (--format json)");
-            ui.checkbox(&mut self.stats_percent, "stats 割合表示 (--percent)");
+            ui.checkbox(&mut self.query_json, "JSON (--format json)");
+            ui.checkbox(&mut self.stats_percent, "--percent");
+            ui.checkbox(&mut self.stats_by_year, "--by-year");
+            ui.checkbox(&mut self.stats_gear_history, "--gear-history");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {
@@ -757,8 +763,13 @@ impl MiniUiApp {
                     self.run_cli(ctx, args);
                 }
                 if ui.button("stats").clicked() {
-                    let args =
-                        build_stats_args(&self.config_path, self.query_json, self.stats_percent);
+                    let args = build_stats_args(
+                        &self.config_path,
+                        self.query_json,
+                        self.stats_percent,
+                        self.stats_by_year,
+                        self.stats_gear_history,
+                    );
                     self.run_cli(ctx, args);
                 }
                 if ui.button("normalize-lenses --dry-run").clicked() {

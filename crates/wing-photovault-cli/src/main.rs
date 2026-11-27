@@ -130,6 +130,14 @@ enum Commands {
         /// Also show percentage share for backup coverage, formats, cameras, and lenses
         #[arg(long)]
         percent: bool,
+
+        /// Include yearly asset counts, active shooting days, and top camera/lens per year
+        #[arg(long)]
+        by_year: bool,
+
+        /// Include chronological camera and lens usage timeline (first..last capture dates)
+        #[arg(long)]
+        gear_history: bool,
     },
 
     /// Search indexed files
@@ -201,7 +209,11 @@ fn main() -> Result<()> {
             cmd_normalize_lenses(&cli.config, dry_run, cli.format)
         }
         Commands::Status => cmd_status(&cli.config, cli.format),
-        Commands::Stats { percent } => cmd_stats(&cli.config, percent, cli.format),
+        Commands::Stats {
+            percent,
+            by_year,
+            gear_history,
+        } => cmd_stats(&cli.config, percent, by_year, gear_history, cli.format),
         Commands::Find {
             storage,
             ext_format,
@@ -965,7 +977,12 @@ fn round_pct2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-fn format_stats_text(report: &wing_photovault_db::StatsReport, show_percent: bool) -> String {
+fn format_stats_text(
+    report: &wing_photovault_db::StatsReport,
+    by_year: Option<&[wing_photovault_db::YearStatsRow]>,
+    gear_history: Option<&wing_photovault_db::GearHistoryReport>,
+    show_percent: bool,
+) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -1037,98 +1054,265 @@ fn format_stats_text(report: &wing_photovault_db::StatsReport, show_percent: boo
         }
     }
 
+    if let Some(years) = by_year {
+        let _ = writeln!(out, "\nBy Year (Assets):");
+        for y in years {
+            let pct_col = if show_percent {
+                format!(" ({:>6.2}%)", calc_percent(y.assets, report.total_assets))
+            } else {
+                String::new()
+            };
+            let cam = y.top_camera.as_deref().unwrap_or("-");
+            let lens = y.top_lens.as_deref().unwrap_or("-");
+            let _ = writeln!(
+                out,
+                "  - {:<9} {:>8}{}  ({:>3} days)  top_camera={:<22}  top_lens={}",
+                y.year, y.assets, pct_col, y.active_days, cam, lens
+            );
+        }
+    }
+
+    if let Some(gh) = gear_history {
+        let _ = writeln!(out, "\nCamera Timeline (by first capture):");
+        for c in &gh.cameras {
+            let span = format!(
+                "{} .. {}",
+                c.first_captured.as_deref().unwrap_or("----------"),
+                c.last_captured.as_deref().unwrap_or("----------")
+            );
+            let pct_col = if show_percent {
+                format!(" ({:>6.2}%)", calc_percent(c.assets, report.total_assets))
+            } else {
+                String::new()
+            };
+            let partner = c.top_partner.as_deref().unwrap_or("-");
+            let _ = writeln!(
+                out,
+                "  - {:<26}  {}  {:>8}{}  ({:>4} days)  top_lens={}",
+                c.name, span, c.assets, pct_col, c.active_days, partner
+            );
+        }
+
+        let _ = writeln!(out, "\nLens Timeline (by first capture):");
+        for l in &gh.lenses {
+            let span = format!(
+                "{} .. {}",
+                l.first_captured.as_deref().unwrap_or("----------"),
+                l.last_captured.as_deref().unwrap_or("----------")
+            );
+            let pct_col = if show_percent {
+                format!(" ({:>6.2}%)", calc_percent(l.assets, report.total_assets))
+            } else {
+                String::new()
+            };
+            let partner = l.top_partner.as_deref().unwrap_or("-");
+            let _ = writeln!(
+                out,
+                "  - {:<44}  {}  {:>8}{}  ({:>4} days)  top_camera={}",
+                l.name, span, l.assets, pct_col, l.active_days, partner
+            );
+        }
+    }
+
     out
 }
 
-fn cmd_stats(config_path: &Path, show_percent: bool, format: OutputFormat) -> Result<()> {
+fn cmd_stats(
+    config_path: &Path,
+    show_percent: bool,
+    show_by_year: bool,
+    show_gear_history: bool,
+    format: OutputFormat,
+) -> Result<()> {
     let cfg = load_config_or_default(config_path)?;
     let db = Database::open(&cfg.general.db_path)?;
     let report = db.stats()?;
+    let by_year = if show_by_year {
+        Some(db.stats_by_year()?)
+    } else {
+        None
+    };
+    let gear_history = if show_gear_history {
+        Some(db.gear_history()?)
+    } else {
+        None
+    };
 
     match format {
         OutputFormat::Json | OutputFormat::Jsonl => {
-            if show_percent {
+            if !show_percent && by_year.is_none() && gear_history.is_none() {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
                 #[derive(Serialize)]
-                struct FormatBucketPct<'a> {
+                struct FormatBucketJson<'a> {
                     label: &'a str,
                     count: i64,
-                    count_percent: f64,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    count_percent: Option<f64>,
                     total_bytes: i64,
-                    bytes_percent: f64,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    bytes_percent: Option<f64>,
                 }
                 #[derive(Serialize)]
-                struct AssetBucketPct<'a> {
+                struct AssetBucketJson<'a> {
                     label: &'a str,
                     count: i64,
-                    percent: f64,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    percent: Option<f64>,
                 }
                 #[derive(Serialize)]
-                struct StatsReportWithPercent<'a> {
+                struct YearStatsJson<'a> {
+                    year: &'a str,
+                    assets: i64,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    percent: Option<f64>,
+                    active_days: i64,
+                    top_camera: Option<&'a str>,
+                    top_lens: Option<&'a str>,
+                }
+                #[derive(Serialize)]
+                struct GearTimelineJson<'a> {
+                    name: &'a str,
+                    assets: i64,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    percent: Option<f64>,
+                    active_days: i64,
+                    first_captured: Option<&'a str>,
+                    last_captured: Option<&'a str>,
+                    top_partner: Option<&'a str>,
+                }
+                #[derive(Serialize)]
+                struct GearHistoryJson<'a> {
+                    cameras: Vec<GearTimelineJson<'a>>,
+                    lenses: Vec<GearTimelineJson<'a>>,
+                }
+                #[derive(Serialize)]
+                struct StatsReportExtended<'a> {
                     total_assets: i64,
                     total_contents: i64,
                     total_present_files: i64,
                     total_present_bytes: i64,
                     backed_up_contents: i64,
-                    backed_up_percent: f64,
-                    by_format: Vec<FormatBucketPct<'a>>,
-                    by_camera: Vec<AssetBucketPct<'a>>,
-                    by_lens: Vec<AssetBucketPct<'a>>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    backed_up_percent: Option<f64>,
+                    by_format: Vec<FormatBucketJson<'a>>,
+                    by_camera: Vec<AssetBucketJson<'a>>,
+                    by_lens: Vec<AssetBucketJson<'a>>,
                     by_storage: &'a [wing_photovault_db::StorageStatsRow],
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    by_year: Option<Vec<YearStatsJson<'a>>>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    gear_history: Option<GearHistoryJson<'a>>,
                 }
-                let enriched = StatsReportWithPercent {
+
+                let enriched = StatsReportExtended {
                     total_assets: report.total_assets,
                     total_contents: report.total_contents,
                     total_present_files: report.total_present_files,
                     total_present_bytes: report.total_present_bytes,
                     backed_up_contents: report.backed_up_contents,
-                    backed_up_percent: round_pct2(calc_percent(
-                        report.backed_up_contents,
-                        report.total_contents,
-                    )),
+                    backed_up_percent: show_percent.then(|| {
+                        round_pct2(calc_percent(
+                            report.backed_up_contents,
+                            report.total_contents,
+                        ))
+                    }),
                     by_format: report
                         .by_format
                         .iter()
-                        .map(|b| FormatBucketPct {
+                        .map(|b| FormatBucketJson {
                             label: &b.label,
                             count: b.count,
-                            count_percent: round_pct2(calc_percent(
-                                b.count,
-                                report.total_present_files,
-                            )),
+                            count_percent: show_percent.then(|| {
+                                round_pct2(calc_percent(b.count, report.total_present_files))
+                            }),
                             total_bytes: b.total_bytes,
-                            bytes_percent: round_pct2(calc_percent(
-                                b.total_bytes,
-                                report.total_present_bytes,
-                            )),
+                            bytes_percent: show_percent.then(|| {
+                                round_pct2(calc_percent(b.total_bytes, report.total_present_bytes))
+                            }),
                         })
                         .collect(),
                     by_camera: report
                         .by_camera
                         .iter()
-                        .map(|b| AssetBucketPct {
+                        .map(|b| AssetBucketJson {
                             label: &b.label,
                             count: b.count,
-                            percent: round_pct2(calc_percent(b.count, report.total_assets)),
+                            percent: show_percent
+                                .then(|| round_pct2(calc_percent(b.count, report.total_assets))),
                         })
                         .collect(),
                     by_lens: report
                         .by_lens
                         .iter()
-                        .map(|b| AssetBucketPct {
+                        .map(|b| AssetBucketJson {
                             label: &b.label,
                             count: b.count,
-                            percent: round_pct2(calc_percent(b.count, report.total_assets)),
+                            percent: show_percent
+                                .then(|| round_pct2(calc_percent(b.count, report.total_assets))),
                         })
                         .collect(),
                     by_storage: &report.by_storage,
+                    by_year: by_year.as_deref().map(|list| {
+                        list.iter()
+                            .map(|y| YearStatsJson {
+                                year: &y.year,
+                                assets: y.assets,
+                                percent: show_percent.then(|| {
+                                    round_pct2(calc_percent(y.assets, report.total_assets))
+                                }),
+                                active_days: y.active_days,
+                                top_camera: y.top_camera.as_deref(),
+                                top_lens: y.top_lens.as_deref(),
+                            })
+                            .collect()
+                    }),
+                    gear_history: gear_history.as_ref().map(|gh| GearHistoryJson {
+                        cameras: gh
+                            .cameras
+                            .iter()
+                            .map(|c| GearTimelineJson {
+                                name: &c.name,
+                                assets: c.assets,
+                                percent: show_percent.then(|| {
+                                    round_pct2(calc_percent(c.assets, report.total_assets))
+                                }),
+                                active_days: c.active_days,
+                                first_captured: c.first_captured.as_deref(),
+                                last_captured: c.last_captured.as_deref(),
+                                top_partner: c.top_partner.as_deref(),
+                            })
+                            .collect(),
+                        lenses: gh
+                            .lenses
+                            .iter()
+                            .map(|l| GearTimelineJson {
+                                name: &l.name,
+                                assets: l.assets,
+                                percent: show_percent.then(|| {
+                                    round_pct2(calc_percent(l.assets, report.total_assets))
+                                }),
+                                active_days: l.active_days,
+                                first_captured: l.first_captured.as_deref(),
+                                last_captured: l.last_captured.as_deref(),
+                                top_partner: l.top_partner.as_deref(),
+                            })
+                            .collect(),
+                    }),
                 };
                 println!("{}", serde_json::to_string_pretty(&enriched)?);
-            } else {
-                println!("{}", serde_json::to_string_pretty(&report)?);
             }
         }
         OutputFormat::Text => {
-            print!("{}", format_stats_text(&report, show_percent));
+            print!(
+                "{}",
+                format_stats_text(
+                    &report,
+                    by_year.as_deref(),
+                    gear_history.as_ref(),
+                    show_percent
+                )
+            );
         }
     }
     Ok(())
@@ -1515,15 +1699,46 @@ backup_mode = "external"
             by_storage: vec![],
         };
 
-        let plain = format_stats_text(&report, false);
+        let plain = format_stats_text(&report, None, None, false);
         assert!(plain.contains("Backed-up Contents: 150 / 200\n"));
         assert!(!plain.contains('%'));
 
-        let with_pct = format_stats_text(&report, true);
+        let yearly = vec![wing_photovault_db::YearStatsRow {
+            year: "2025".into(),
+            assets: 75,
+            active_days: 12,
+            top_camera: Some("Canon EOS R5m2".into()),
+            top_lens: Some("RF100-500mm F4.5-7.1 L IS USM".into()),
+        }];
+        let gh = wing_photovault_db::GearHistoryReport {
+            cameras: vec![wing_photovault_db::GearTimelineRow {
+                name: "Canon EOS R5m2".into(),
+                assets: 75,
+                active_days: 12,
+                first_captured: Some("2025-01-05".into()),
+                last_captured: Some("2025-11-20".into()),
+                top_partner: Some("RF100-500mm F4.5-7.1 L IS USM".into()),
+            }],
+            lenses: vec![wing_photovault_db::GearTimelineRow {
+                name: "RF100-500mm F4.5-7.1 L IS USM".into(),
+                assets: 50,
+                active_days: 10,
+                first_captured: Some("2025-01-05".into()),
+                last_captured: Some("2025-11-20".into()),
+                top_partner: Some("Canon EOS R5m2".into()),
+            }],
+        };
+
+        let with_pct = format_stats_text(&report, Some(&yearly), Some(&gh), true);
         assert!(with_pct.contains("Backed-up Contents: 150 / 200 (75.00%)"));
         assert!(with_pct.contains("50.00%"));
         assert!(with_pct.contains("80.00%"));
         assert!(with_pct.contains("75.00%)"));
+        assert!(with_pct.contains("By Year (Assets):"));
+        assert!(with_pct.contains("2025"));
+        assert!(with_pct.contains("Camera Timeline (by first capture):"));
+        assert!(with_pct.contains("2025-01-05 .. 2025-11-20"));
+        assert!(with_pct.contains("Lens Timeline (by first capture):"));
 
         // Zero-division guard on empty DB
         let empty = StatsReport {
@@ -1537,7 +1752,7 @@ backup_mode = "external"
             by_lens: vec![],
             by_storage: vec![],
         };
-        let empty_pct = format_stats_text(&empty, true);
+        let empty_pct = format_stats_text(&empty, None, None, true);
         assert!(empty_pct.contains("Backed-up Contents: 0 / 0 (0.00%)"));
     }
 }
