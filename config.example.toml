@@ -11,7 +11,7 @@ db_path = "./wing-photovault.db"
 log_dir = "./logs"
 # 最優先: JPEG, Canon RAW (CR3, CR2, CRW), 任意: HEIF
 image_exts = [".jpg", ".jpeg", ".cr3", ".cr2", ".crw", ".hif", ".heif", ".heic"]
-video_exts = [".mp4", ".mov", ".m4v"]
+video_exts = [".mp4", ".mov", ".m4v", ".avi"]
 sidecar_exts = [".xmp", ".thm"]
 
 [scan]

@@ -328,7 +328,7 @@ fn default_image_exts() -> Vec<String> {
 }
 
 fn default_video_exts() -> Vec<String> {
-    vec![".mp4", ".mov", ".m4v"]
+    vec![".mp4", ".mov", ".m4v", ".avi"]
         .into_iter()
         .map(String::from)
         .collect()

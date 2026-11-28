@@ -28,7 +28,7 @@
 - 差分スキャン（未変更ファイルは `last_seen_at` のみ更新し `last_verified_at` を保持）
 - RAW + JPEG 論理 Asset 統合（同一フォルダ＋兄弟 `RAW/`・`JPEG/` フォルダ対応、曖昧時は非統合）
   - O(1) バッチ内ペアリング（途中中断してもコミット済み分は統合済み）＋スキャン末尾の冪等スイープ
-- サイドカー認識・親 Asset 自動紐付け（`.xmp`, `.thm`, 二重拡張子 `.CR3.xmp` 対応、`FileRole::Sidecar`、偽 Asset 非生成・曖昧時 Fail Closed）＋動画（MP4/MOV）メタデータ（`duration_ms`, `fps`）検索出力対応
+- サイドカー認識・親 Asset 自動紐付け（`.xmp`, `.thm`, 二重拡張子 `.CR3.xmp` 対応、`FileRole::Sidecar`、偽 Asset 非生成・曖昧時 Fail Closed）＋動画（MP4/MOV/AVI）メタデータ（`duration_ms`, `fps`）検索出力対応
 - マニフェストのストリーミング書き出し（`stream_storage_manifest`）
 
 ### CLI (`crates/wing-photovault-cli` / バイナリ名 `wingpv`)

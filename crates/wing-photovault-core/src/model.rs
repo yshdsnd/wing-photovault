@@ -251,6 +251,7 @@ pub fn classify_extension(ext: &str) -> (MediaKind, &'static str) {
         ".nef" => (MediaKind::Raw, "nef"),
         ".mp4" | ".m4v" => (MediaKind::Video, "mp4"),
         ".mov" => (MediaKind::Video, "mov"),
+        ".avi" => (MediaKind::Video, "avi"),
         ".xmp" => (MediaKind::Other, "xmp"),
         ".thm" => (MediaKind::Other, "thm"),
         _ => (MediaKind::Other, "unknown"),
@@ -370,11 +371,17 @@ mod tests {
 
     #[test]
     fn classifies_sidecars_and_extracts_parent_stems() {
+        assert_eq!(classify_extension(".avi"), (MediaKind::Video, "avi"));
         assert_eq!(classify_extension(".xmp"), (MediaKind::Other, "xmp"));
         assert_eq!(classify_extension(".thm"), (MediaKind::Other, "thm"));
         assert!(is_sidecar_extension(".xmp"));
         assert!(is_sidecar_extension(".thm"));
         assert!(!is_sidecar_extension(".cr3"));
+
+        assert_eq!(
+            sidecar_parent_stem("MVI_0027.AVI.xmp").as_deref(),
+            Some("MVI_0027")
+        );
 
         assert_eq!(
             sidecar_parent_stem("IMG_0001.xmp").as_deref(),

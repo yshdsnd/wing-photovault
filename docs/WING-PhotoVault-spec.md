@@ -130,7 +130,7 @@ NAS上の大量ファイルのスキャン・ハッシュ検証は、SMB越し�
 ### 5.8 EXIF・対応ファイル形式
 対応形式の優先度:
 - **最優先**: JPEG（`.jpg`, `.jpeg`）、Canon RAW（`.cr3`, `.cr2`）、および `.crw`（優先度低め）
-- **可能なら対応**: HEIF（`.heif`, `.heic`, `.hif`）、動画（`.mp4`, `.mov`, `.m4v`）
+- **可能なら対応**: HEIF（`.heif`, `.heic`, `.hif`）、動画（`.mp4`, `.mov`, `.m4v`, `.avi`）
 - **初期対象外（拡張余地を残す）**: Canon 以外のメーカーの RAW（実機検証不可のため初期は対象外とするが、拡張子設定とパーサ抽象化により将来追加可能にする）
 
 撮影日時・サブ秒、カメラメーカー・機種・識別情報、レンズ、焦点距離・35mm換算、F値、シャッター速度、ISO、露出補正、画像サイズ、GPS、形式、動画解像度・fps・時間等を取得。表記ゆらぎを正規化する。速度を最重視しつつ、Rustネイティブ解析（JPEG / CR2 / CR3 の高速パス）と ExifTool 常駐モード（網羅性・フォールバック・比較検証用）を実験・ベンチマークしながら選定・併用する。
@@ -226,7 +226,7 @@ CLIから検索・統計・進捗・結果・エラーを構造化出力し、�
 db_path = "./wing-photovault.db"
 log_dir = "./logs"
 image_exts = [".jpg", ".jpeg", ".cr3", ".cr2", ".crw", ".hif", ".heif", ".heic"]
-video_exts = [".mp4", ".mov", ".m4v"]
+video_exts = [".mp4", ".mov", ".m4v", ".avi"]
 [paths]
 quarantine_dir = 'G:\PhotoVault\_Quarantine'
 gphotos_temp_dir = 'G:\PhotoVault\_GPhotosQueue'
