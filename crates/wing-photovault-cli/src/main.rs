@@ -24,7 +24,9 @@ use wing_photovault_core::model::{
     MediaType, ScanManifestRecord, StorageStatus, StorageTier,
 };
 use wing_photovault_core::scanner::{discover_storage_files, walk_storage_files, DiscoveredFile};
-use wing_photovault_db::{Database, FindCursor, FindFilter, ScanRunSummary, UpsertFileInput};
+use wing_photovault_db::{
+    Database, DuplicateFilter, FindCursor, FindFilter, ScanRunSummary, UpsertFileInput,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
@@ -150,6 +152,29 @@ enum Commands {
         split_extenders: bool,
     },
 
+    /// Detect exact duplicate files (read-only; never flags intentional cross-tier backups)
+    Duplicates {
+        /// Restrict duplicate search to a single storage ID
+        #[arg(long)]
+        storage: Option<String>,
+
+        /// Also include within-storage duplicates inside read-only/backup storages (marked protected)
+        #[arg(long)]
+        include_backups: bool,
+
+        /// Also include sidecar files (.xmp, .thm)
+        #[arg(long)]
+        include_sidecars: bool,
+
+        /// Minimum single-file size in bytes (e.g. 1048576 for 1 MB)
+        #[arg(long, default_value_t = 0)]
+        min_bytes: u64,
+
+        /// Maximum number of duplicate groups to show (0 = unlimited)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
     /// Search indexed files
     Find {
         #[arg(long)]
@@ -244,6 +269,23 @@ fn main() -> Result<()> {
                 show_gear_history: gear_history,
                 show_cost_per_shot: cost_per_shot,
                 split_extenders,
+            },
+            cli.format,
+        ),
+        Commands::Duplicates {
+            storage,
+            include_backups,
+            include_sidecars,
+            min_bytes,
+            limit,
+        } => cmd_duplicates(
+            &cli.config,
+            DuplicateFilter {
+                storage_id: storage,
+                include_backups,
+                include_sidecars,
+                min_bytes,
+                limit: (limit > 0).then_some(limit),
             },
             cli.format,
         ),
@@ -1226,6 +1268,16 @@ fn calc_percent(part: i64, total: i64) -> f64 {
     }
 }
 
+/// Never round partial backup coverage (e.g. 400,959 / 400,960) up to 100.00%.
+fn calc_backup_percent(backed_up: i64, total: i64) -> f64 {
+    let pct = calc_percent(backed_up, total);
+    if total > 0 && backed_up < total && pct >= 99.995 {
+        99.99
+    } else {
+        pct
+    }
+}
+
 fn round_pct2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
@@ -1267,12 +1319,27 @@ fn format_stats_text(
     let mut out = String::new();
     let _ = writeln!(out, "Logical Assets    : {}", report.total_assets);
     let _ = writeln!(out, "Unique Contents   : {}", report.total_contents);
+    let unbacked = (report.total_contents - report.backed_up_contents).max(0);
     if show_percent {
-        let bp = calc_percent(report.backed_up_contents, report.total_contents);
+        let bp = calc_backup_percent(report.backed_up_contents, report.total_contents);
+        if unbacked > 0 {
+            let _ = writeln!(
+                out,
+                "Backed-up Contents: {} / {} ({:.2}%, unbacked: {})",
+                report.backed_up_contents, report.total_contents, bp, unbacked
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "Backed-up Contents: {} / {} ({:.2}%)",
+                report.backed_up_contents, report.total_contents, bp
+            );
+        }
+    } else if unbacked > 0 {
         let _ = writeln!(
             out,
-            "Backed-up Contents: {} / {} ({:.2}%)",
-            report.backed_up_contents, report.total_contents, bp
+            "Backed-up Contents: {} / {} (unbacked: {})",
+            report.backed_up_contents, report.total_contents, unbacked
         );
     } else {
         let _ = writeln!(
@@ -1599,7 +1666,7 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                     total_present_bytes: report.total_present_bytes,
                     backed_up_contents: report.backed_up_contents,
                     backed_up_percent: show_percent.then(|| {
-                        round_pct2(calc_percent(
+                        round_pct2(calc_backup_percent(
                             report.backed_up_contents,
                             report.total_contents,
                         ))
@@ -1735,6 +1802,74 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                     opts
                 )
             );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_duplicates(
+    config_path: &Path,
+    filter: DuplicateFilter,
+    format: OutputFormat,
+) -> Result<()> {
+    let cfg = load_config_or_default(config_path)?;
+    if !cfg.general.db_path.exists() {
+        anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+    }
+    let db = Database::open_read_only(&cfg.general.db_path)?;
+    let report = db.find_duplicates(&filter)?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Jsonl => {
+            for g in &report.groups {
+                println!("{}", serde_json::to_string(g)?);
+            }
+        }
+        OutputFormat::Text => {
+            println!("Duplicate Groups     : {} (showing {})", report.total_groups, report.returned_groups);
+            println!(
+                "  - Actionable       : {} groups ({} redundant files, {} reclaimable)",
+                report.actionable_groups,
+                report.actionable_redundant_files,
+                human_bytes(report.reclaimable_bytes.max(0) as u64)
+            );
+            println!(
+                "  - Protected only   : {} groups ({} total redundant files, {} total redundant)",
+                report.protected_only_groups,
+                report.total_redundant_files,
+                human_bytes(report.total_redundant_bytes.max(0) as u64)
+            );
+            if report.groups.is_empty() {
+                if !filter.include_backups && filter.storage_id.is_none() {
+                    println!("\nNo actionable managed duplicates found. (Use --include-backups to also inspect within-storage duplicates on read-only/backup storages.)");
+                } else {
+                    println!("\nNo duplicate files found.");
+                }
+            } else {
+                for (idx, g) in report.groups.iter().enumerate() {
+                    let short_hash = &g.hash_hex[..g.hash_hex.len().min(12)];
+                    println!(
+                        "\n[{}] {} {} x{} ({}:{})  reclaimable={}  redundant={}",
+                        idx + 1,
+                        g.format,
+                        human_bytes(g.byte_size.max(0) as u64),
+                        g.total_copies,
+                        g.hash_algo,
+                        short_hash,
+                        human_bytes(g.reclaimable_bytes.max(0) as u64),
+                        human_bytes(g.redundant_bytes.max(0) as u64),
+                    );
+                    for f in &g.files {
+                        println!(
+                            "  - [{:<9}] {:<18} ({}/{}) {}",
+                            f.recommendation, f.storage_id, f.tier, f.access_mode, f.rel_path
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -2355,7 +2490,7 @@ backup_mode = "external"
             .insert("RF100-500mm F4.5-7.1 L IS USM".into(), 360_000.0);
 
         let plain = format_stats_text(&report, None, None, &stats_cfg, StatsOpts::default());
-        assert!(plain.contains("Backed-up Contents: 150 / 200\n"));
+        assert!(plain.contains("Backed-up Contents: 150 / 200 (unbacked: 50)\n"));
         assert!(!plain.contains('%'));
         assert!(!plain.contains("JPY/shot"));
 
@@ -2398,7 +2533,9 @@ backup_mode = "external"
                 split_extenders: true,
             },
         );
-        assert!(with_pct.contains("Backed-up Contents: 150 / 200 (75.00%)"));
+        assert!(with_pct.contains("Backed-up Contents: 150 / 200 (75.00%, unbacked: 50)"));
+        assert!((calc_backup_percent(400_959, 400_960) - 99.99).abs() < 1e-9);
+        assert!((calc_backup_percent(400_960, 400_960) - 100.0).abs() < 1e-9);
         assert!(with_pct.contains("50.00%"));
         assert!(with_pct.contains("80.00%"));
         assert!(with_pct.contains("75.00%)"));

@@ -2,7 +2,7 @@
 
 - Last Updated: 2026-11-28
 - Current Phase: **Phase 1（読み取り専用インデックス・検索・統計・ベンチマーク・NAS マニフェスト連携）**
-- Branch: `main`（全 27 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
+- Branch: `main`（全 28 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
 
@@ -35,7 +35,7 @@
 - `init` / `scan`（3 ステージ有界キュー・ストリーミングパイプライン、`PauseGate` 付きクールダウン制御、`--storage`, `--full`, `--export-jsonl`, `--cooldown-every`, `--cooldown-secs`, `--max-files`）
 - `export-manifest` / `import-manifest`（FreeBSD NAS ローカルスキャン → Windows DB 取り込み、`[exif.lens_aliases]` 自動適用）
 - `normalize-lenses`（再スキャン不要で既存 DB の `lens_model_raw` から `[exif.lens_aliases]` を再適用、`--dry-run` 読み取り専用プレビュー対応）
-- `status` / `stats`（`--percent`, `--by-year`, `--gear-history` 使用機材年表、`--cost-per-shot` 1ショット単価、`--split-extenders` テレコン分解集計対応）/ `find`（キーセットページング `--cursor`, `--page-info` 対応）/ `benchmark`（ディレクトリ実測＋`--db-scale <N>` 大規模ダミー DB ベンチマーク、`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
+- `status` / `stats`（`--percent`, `--by-year`, `--gear-history` 使用機材年表、`--cost-per-shot` 1ショット単価、`--split-extenders` テレコン分解集計、未バックアップ件数＆切り捨て%表示対応）/ `duplicates`（読み取り専用重複検出、`read_only`/`external` バックアップ保護、`--include-backups`/`--include-sidecars`/`--min-bytes`/`--limit` 対応）/ `find`（キーセットページング `--cursor`, `--page-info` 対応）/ `benchmark`（ディレクトリ実測＋`--db-scale <N>` 大規模ダミー DB ベンチマーク、`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
 
 ### テスト用ミニ UI (`tools/wingpv-mini-ui` / バイナリ名 `wingpv-mini-ui`)
 - Rust (`egui` / `eframe` + `rfd`) による単体実行 `.exe` ツール（ヘッドレス FreeBSD ビルドに影響しないようワークスペース `exclude` で分離しつつ、`wing-photovault-core` の型・Fail Closed 検証を共有）

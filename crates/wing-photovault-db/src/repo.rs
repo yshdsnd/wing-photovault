@@ -148,6 +148,64 @@ pub struct GearHistoryReport {
     pub lenses: Vec<GearTimelineRow>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateFilter {
+    /// Restrict detection to duplicates within a single storage ID.
+    pub storage_id: Option<String>,
+    /// Also include within-storage duplicates found inside `read_only`/`backup`/`external` storages.
+    /// Cross-tier intentional backups (e.g. 1 Hot + 1 Backup) are NEVER reported as duplicates.
+    pub include_backups: bool,
+    /// Include sidecar files (`.xmp`, `.thm`); defaults to `false`.
+    pub include_sidecars: bool,
+    /// Only report groups whose single-file size is >= `min_bytes`.
+    pub min_bytes: u64,
+    /// Maximum number of groups to return (`None` or `Some(0)` = unlimited).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateFileRow {
+    pub file_id: i64,
+    pub asset_id: Option<i64>,
+    pub storage_id: String,
+    pub rel_path: String,
+    pub tier: String,
+    pub access_mode: String,
+    pub backup_mode: String,
+    pub role: String,
+    pub protected: bool,
+    /// Advisory role: `"keep"`, `"duplicate"`, or `"protected"`.
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateGroup {
+    pub content_id: i64,
+    pub hash_algo: String,
+    pub hash_hex: String,
+    pub format: String,
+    pub byte_size: i64,
+    pub total_copies: usize,
+    pub actionable_copies: usize,
+    pub protected_copies: usize,
+    pub reclaimable_bytes: i64,
+    pub redundant_bytes: i64,
+    pub files: Vec<DuplicateFileRow>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DuplicateReport {
+    pub total_groups: usize,
+    pub returned_groups: usize,
+    pub actionable_groups: usize,
+    pub protected_only_groups: usize,
+    pub total_redundant_files: usize,
+    pub actionable_redundant_files: usize,
+    pub total_redundant_bytes: i64,
+    pub reclaimable_bytes: i64,
+    pub groups: Vec<DuplicateGroup>,
+}
+
 /// Opaque-style keyset pagination cursor for `find_page`, matching
 /// `ORDER BY COALESCE(a.captured_at, '') DESC, f.id ASC`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1591,6 +1649,273 @@ impl Database {
         }
 
         Ok(GearHistoryReport { cameras, lenses })
+    }
+
+    /// Read-only duplicate content detection respecting backup & read-only protection invariants.
+    ///
+    /// Rules (Fail Closed / never treat intentional backups as duplicates):
+    /// - A `content_id` with 1 copy on a managed storage and 1 copy on a backup storage is an
+    ///   intentional backup, NOT a duplicate.
+    /// - Actionable duplicates occur when >= 2 present copies exist on managed non-backup storages
+    ///   (`access_mode = 'managed' AND tier != 'backup' AND backup_mode != 'external'`).
+    /// - Within-storage duplicates inside `read_only`/`backup`/`external` storages are only shown
+    ///   when `filter.include_backups` is `true` or `filter.storage_id` explicitly targets that
+    ///   storage, and their files are always marked `protected = true` with `reclaimable_bytes = 0`.
+    pub fn find_duplicates(&self, filter: &DuplicateFilter) -> DbResult<DuplicateReport> {
+        let mut sql = String::from(
+            "SELECT f.content_id, c.hash_algo, c.hash_hex, c.format, c.byte_size,
+                    f.id, f.asset_id, f.storage_id, f.rel_path,
+                    s.tier, s.access_mode, s.backup_mode, f.role
+             FROM files f
+             JOIN contents c ON c.id = f.content_id
+             JOIN storages s ON s.id = f.storage_id
+             WHERE f.presence = 'present'
+               AND f.content_id IS NOT NULL
+               AND f.content_id IN (
+                   SELECT f2.content_id
+                   FROM files f2
+                   WHERE f2.presence = 'present'
+                     AND f2.content_id IS NOT NULL",
+        );
+
+        let mut bind_values: Vec<rusqlite::types::Value> = Vec::new();
+        if !filter.include_sidecars {
+            sql.push_str(" AND f2.role != 'sidecar'");
+        }
+        if let Some(sid) = &filter.storage_id {
+            sql.push_str(" AND f2.storage_id = ?");
+            bind_values.push(sid.clone().into());
+        }
+        sql.push_str(" GROUP BY f2.content_id HAVING COUNT(*) > 1)");
+
+        if !filter.include_sidecars {
+            sql.push_str(" AND f.role != 'sidecar'");
+        }
+        if let Some(sid) = &filter.storage_id {
+            sql.push_str(" AND f.storage_id = ?");
+            bind_values.push(sid.clone().into());
+        }
+        if filter.min_bytes > 0 {
+            sql.push_str(" AND c.byte_size >= ?");
+            bind_values.push((filter.min_bytes.min(i64::MAX as u64) as i64).into());
+        }
+        sql.push_str(" ORDER BY f.content_id ASC, f.storage_id ASC, f.rel_path ASC, f.id ASC");
+
+        #[derive(Clone)]
+        struct RawRow {
+            content_id: i64,
+            hash_algo: String,
+            hash_hex: String,
+            format: String,
+            byte_size: i64,
+            file_id: i64,
+            asset_id: Option<i64>,
+            storage_id: String,
+            rel_path: String,
+            tier: String,
+            access_mode: String,
+            backup_mode: String,
+            role: String,
+        }
+
+        let mut grouped: BTreeMap<i64, Vec<RawRow>> = BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(bind_values), |r| {
+                Ok(RawRow {
+                    content_id: r.get(0)?,
+                    hash_algo: r.get(1)?,
+                    hash_hex: r.get(2)?,
+                    format: r.get(3)?,
+                    byte_size: r.get(4)?,
+                    file_id: r.get(5)?,
+                    asset_id: r.get(6)?,
+                    storage_id: r.get(7)?,
+                    rel_path: r.get(8)?,
+                    tier: r.get(9)?,
+                    access_mode: r.get(10)?,
+                    backup_mode: r.get(11)?,
+                    role: r.get(12)?,
+                })
+            })?;
+            for row in rows {
+                let r = row?;
+                grouped.entry(r.content_id).or_default().push(r);
+            }
+        }
+
+        let include_protected_dups = filter.include_backups || filter.storage_id.is_some();
+        let mut groups: Vec<DuplicateGroup> = Vec::new();
+
+        for (content_id, raw_files) in grouped {
+            if raw_files.len() < 2 {
+                continue;
+            }
+            let mut managed_rows: Vec<&RawRow> = Vec::new();
+            let mut protected_by_storage: HashMap<&str, Vec<&RawRow>> = HashMap::new();
+
+            for rf in &raw_files {
+                let is_protected = rf.access_mode == "read_only"
+                    || rf.tier == "backup"
+                    || rf.backup_mode == "external";
+                if is_protected {
+                    protected_by_storage
+                        .entry(rf.storage_id.as_str())
+                        .or_default()
+                        .push(rf);
+                } else {
+                    managed_rows.push(rf);
+                }
+            }
+
+            let has_actionable = managed_rows.len() >= 2;
+            let has_protected_internal_dup =
+                protected_by_storage.values().any(|v| v.len() >= 2);
+
+            // Intentional cross-tier backups (e.g. 1 managed + 1 backup, or 1 per distinct backup)
+            // are NEVER duplicates.
+            if !has_actionable && !(include_protected_dups && has_protected_internal_dup) {
+                continue;
+            }
+
+            // Deterministic advisory keeper selection among managed copies:
+            // prefer non-hot (archive) slightly? Keep simple & predictable:
+            // shortest rel_path first, then lexicographical rel_path, then smallest file_id.
+            managed_rows.sort_by(|a, b| {
+                a.rel_path
+                    .len()
+                    .cmp(&b.rel_path.len())
+                    .then_with(|| a.rel_path.cmp(&b.rel_path))
+                    .then_with(|| a.file_id.cmp(&b.file_id))
+            });
+
+            let mut files: Vec<DuplicateFileRow> = Vec::new();
+            let mut actionable_redundant: usize = 0;
+            let mut protected_redundant: usize = 0;
+
+            if has_actionable {
+                for (idx, rf) in managed_rows.iter().enumerate() {
+                    let rec = if idx == 0 { "keep" } else { "duplicate" };
+                    if idx > 0 {
+                        actionable_redundant += 1;
+                    }
+                    files.push(DuplicateFileRow {
+                        file_id: rf.file_id,
+                        asset_id: rf.asset_id,
+                        storage_id: rf.storage_id.clone(),
+                        rel_path: rf.rel_path.clone(),
+                        tier: rf.tier.clone(),
+                        access_mode: rf.access_mode.clone(),
+                        backup_mode: rf.backup_mode.clone(),
+                        role: rf.role.clone(),
+                        protected: false,
+                        recommendation: rec.to_string(),
+                    });
+                }
+            }
+
+            if include_protected_dups && has_protected_internal_dup {
+                let mut sids: Vec<&str> = protected_by_storage.keys().copied().collect();
+                sids.sort_unstable();
+                for sid in sids {
+                    let list = &protected_by_storage[sid];
+                    if list.len() < 2 {
+                        continue;
+                    }
+                    protected_redundant += list.len() - 1;
+                    for rf in list {
+                        files.push(DuplicateFileRow {
+                            file_id: rf.file_id,
+                            asset_id: rf.asset_id,
+                            storage_id: rf.storage_id.clone(),
+                            rel_path: rf.rel_path.clone(),
+                            tier: rf.tier.clone(),
+                            access_mode: rf.access_mode.clone(),
+                            backup_mode: rf.backup_mode.clone(),
+                            role: rf.role.clone(),
+                            protected: true,
+                            recommendation: "protected".to_string(),
+                        });
+                    }
+                }
+            }
+
+            let meta = &raw_files[0];
+            let total_copies = files.len();
+            let actionable_copies = if has_actionable { managed_rows.len() } else { 0 };
+            let protected_copies = total_copies.saturating_sub(actionable_copies);
+            let reclaimable_bytes = meta.byte_size.saturating_mul(actionable_redundant as i64);
+            let redundant_bytes = meta
+                .byte_size
+                .saturating_mul((actionable_redundant + protected_redundant) as i64);
+
+            groups.push(DuplicateGroup {
+                content_id,
+                hash_algo: meta.hash_algo.clone(),
+                hash_hex: meta.hash_hex.clone(),
+                format: meta.format.clone(),
+                byte_size: meta.byte_size,
+                total_copies,
+                actionable_copies,
+                protected_copies,
+                reclaimable_bytes,
+                redundant_bytes,
+                files,
+            });
+        }
+
+        groups.sort_by(|a, b| {
+            b.reclaimable_bytes
+                .cmp(&a.reclaimable_bytes)
+                .then_with(|| b.redundant_bytes.cmp(&a.redundant_bytes))
+                .then_with(|| b.byte_size.cmp(&a.byte_size))
+                .then_with(|| a.content_id.cmp(&b.content_id))
+        });
+
+        let total_groups = groups.len();
+        let actionable_groups = groups.iter().filter(|g| g.actionable_copies >= 2).count();
+        let protected_only_groups = total_groups.saturating_sub(actionable_groups);
+        let actionable_redundant_files: usize = groups
+            .iter()
+            .map(|g| g.actionable_copies.saturating_sub(1))
+            .sum();
+        let total_redundant_files: usize = groups
+            .iter()
+            .map(|g| {
+                let mut r = g.actionable_copies.saturating_sub(1);
+                if g.protected_copies >= 2 {
+                    let mut by_s: HashMap<&str, usize> = HashMap::new();
+                    for f in &g.files {
+                        if f.protected {
+                            *by_s.entry(f.storage_id.as_str()).or_insert(0) += 1;
+                        }
+                    }
+                    r += by_s.values().map(|c| c.saturating_sub(1)).sum::<usize>();
+                }
+                r
+            })
+            .sum();
+        let reclaimable_bytes: i64 = groups.iter().map(|g| g.reclaimable_bytes).sum();
+        let total_redundant_bytes: i64 = groups.iter().map(|g| g.redundant_bytes).sum();
+
+        if let Some(limit) = filter.limit {
+            if limit > 0 && groups.len() > limit {
+                groups.truncate(limit);
+            }
+        }
+        let returned_groups = groups.len();
+
+        Ok(DuplicateReport {
+            total_groups,
+            returned_groups,
+            actionable_groups,
+            protected_only_groups,
+            total_redundant_files,
+            actionable_redundant_files,
+            total_redundant_bytes,
+            reclaimable_bytes,
+            groups,
+        })
     }
 
     pub fn find(&self, filter: &FindFilter) -> DbResult<Vec<FindRow>> {
@@ -3377,5 +3702,132 @@ mod tests {
             plan.contains("idx_files_storage_presence_stem"),
             "expected idx_files_storage_presence_stem in query plan, got:\n{plan}"
         );
+    }
+
+    #[test]
+    fn find_duplicates_protects_backups_and_detects_managed_and_internal_duplicates() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("pc", "PC", "windows").unwrap();
+        let hot = StorageConfig {
+            id: "ssd_hot".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Nvme,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: Some("pc-nvme".into()),
+            exclude_paths: vec![],
+        };
+        let nas = StorageConfig {
+            id: "nas_backup".into(),
+            root: PathBuf::from(r"\\eagle\photos"),
+            media: MediaType::Nas,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: Some("nas-eagle".into()),
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&hot, "pc", StorageStatus::Online).unwrap();
+        db.upsert_storage(&nas, "pc", StorageStatus::Online).unwrap();
+        let run_hot = db.start_scan_run(&hot.id, "incremental").unwrap();
+        let run_nas = db.start_scan_run(&nas.id, "incremental").unwrap();
+
+        let make = |sid: &str, rel: &str, hash: &str, size: u64, role: FileRole| UpsertFileInput {
+            storage_id: sid.into(),
+            rel_path: rel.into(),
+            file_name: rel.rsplit('/').next().unwrap_or(rel).into(),
+            file_stem: "IMG".into(),
+            ext: if role == FileRole::Sidecar {
+                ".xmp".into()
+            } else {
+                ".cr3".into()
+            },
+            byte_size: size,
+            mtime_ns: 100,
+            ctime_ns: None,
+            media_kind: if role == FileRole::Sidecar {
+                MediaKind::Other
+            } else {
+                MediaKind::Raw
+            },
+            format: if role == FileRole::Sidecar {
+                "xmp".into()
+            } else {
+                "cr3".into()
+            },
+            role,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: None,
+        };
+
+        // 1) Intentional Hot + Backup pair (hash_backup_ok): MUST NEVER be flagged as duplicate
+        // 2) Managed duplicate (hash_managed_dup): 2 copies on ssd_hot (50 MB each)
+        // 3) Backup-internal duplicate (hash_nas_dup): 2 copies inside read-only nas_backup (20 MB each)
+        // 4) Sidecar duplicate (hash_xmp_dup): excluded by default
+        db.upsert_scanned_batch(
+            &[
+                make("ssd_hot", "2026/IMG_OK.CR3", "hash_backup_ok", 10_000, FileRole::Original),
+                make("ssd_hot", "2026/IMG_DUP.CR3", "hash_managed_dup", 50_000, FileRole::Original),
+                make("ssd_hot", "2026/work/IMG_DUP_copy.CR3", "hash_managed_dup", 50_000, FileRole::Original),
+                make("ssd_hot", "2026/a.xmp", "hash_xmp_dup", 500, FileRole::Sidecar),
+                make("ssd_hot", "2026/b.xmp", "hash_xmp_dup", 500, FileRole::Sidecar),
+            ],
+            run_hot,
+        )
+        .unwrap();
+        db.upsert_scanned_batch(
+            &[
+                make("nas_backup", "2026/IMG_OK.CR3", "hash_backup_ok", 10_000, FileRole::Backup),
+                make("nas_backup", "2012/A.CR3", "hash_nas_dup", 20_000, FileRole::Backup),
+                make("nas_backup", "2012/A_1.CR3", "hash_nas_dup", 20_000, FileRole::Backup),
+            ],
+            run_nas,
+        )
+        .unwrap();
+
+        // Default: only actionable managed duplicate (hash_managed_dup) is returned
+        let default_rep = db.find_duplicates(&DuplicateFilter::default()).unwrap();
+        assert_eq!(default_rep.total_groups, 1);
+        assert_eq!(default_rep.actionable_groups, 1);
+        assert_eq!(default_rep.protected_only_groups, 0);
+        assert_eq!(default_rep.reclaimable_bytes, 50_000);
+        assert_eq!(default_rep.groups[0].hash_hex, "hash_managed_dup");
+        assert_eq!(default_rep.groups[0].files[0].recommendation, "keep");
+        assert_eq!(default_rep.groups[0].files[0].rel_path, "2026/IMG_DUP.CR3");
+        assert_eq!(default_rep.groups[0].files[1].recommendation, "duplicate");
+
+        // include_backups = true: ALSO shows backup-internal dup as protected (reclaimable_bytes unchanged!),
+        // and STILL never flags intentional Hot + Backup pair (hash_backup_ok).
+        let with_bak = db
+            .find_duplicates(&DuplicateFilter {
+                include_backups: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(with_bak.total_groups, 2);
+        assert_eq!(with_bak.actionable_groups, 1);
+        assert_eq!(with_bak.protected_only_groups, 1);
+        assert_eq!(with_bak.reclaimable_bytes, 50_000);
+        assert_eq!(with_bak.total_redundant_bytes, 70_000);
+        let nas_grp = with_bak
+            .groups
+            .iter()
+            .find(|g| g.hash_hex == "hash_nas_dup")
+            .unwrap();
+        assert_eq!(nas_grp.reclaimable_bytes, 0);
+        assert!(nas_grp.files.iter().all(|f| f.protected && f.recommendation == "protected"));
+        assert!(!with_bak.groups.iter().any(|g| g.hash_hex == "hash_backup_ok"));
+
+        // include_sidecars = true picks up sidecar dup as well
+        let with_sidecar = db
+            .find_duplicates(&DuplicateFilter {
+                include_sidecars: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(with_sidecar.total_groups, 2);
     }
 }

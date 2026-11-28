@@ -130,6 +130,21 @@ pub fn build_stats_args(
     args
 }
 
+pub fn build_duplicates_args(
+    config_path: &Path,
+    json: bool,
+    include_backups: bool,
+    limit: usize,
+) -> Vec<String> {
+    let mut args = build_simple_args(config_path, json, "duplicates");
+    if include_backups {
+        args.push("--include-backups".to_string());
+    }
+    args.push("--limit".to_string());
+    args.push(limit.to_string());
+    args
+}
+
 pub fn build_find_args(config_path: &Path, params: &FindParams) -> Vec<String> {
     let mut args = build_simple_args(config_path, params.json_output, "find");
     if !params.storage.trim().is_empty() {
@@ -461,6 +476,21 @@ mod tests {
                 "--gear-history",
                 "--cost-per-shot",
                 "--split-extenders",
+            ]
+        );
+
+        let dup_args = build_duplicates_args(cfg, true, true, 50);
+        assert_eq!(
+            dup_args,
+            vec![
+                "--config",
+                r"C:\test\wing-photovault.toml",
+                "--format",
+                "json",
+                "duplicates",
+                "--include-backups",
+                "--limit",
+                "50",
             ]
         );
 

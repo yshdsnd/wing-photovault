@@ -13,7 +13,7 @@ use wing_photovault_core::model::{AccessMode, BackupMode, HashAlgorithm, MediaTy
 
 use crate::config_model::{ConfigDraft, LensAliasRow, StorageDraft};
 use crate::runner::{
-    build_export_manifest_args, build_find_args, build_import_manifest_args,
+    build_duplicates_args, build_export_manifest_args, build_find_args, build_import_manifest_args,
     build_normalize_lenses_args, build_scan_args, build_simple_args, build_stats_args,
     detect_wingpv_binary, CommandRunner, FindParams, ScanParams,
 };
@@ -98,6 +98,7 @@ struct MiniUiApp {
     stats_gear_history: bool,
     stats_cost_per_shot: bool,
     stats_split_extenders: bool,
+    duplicates_include_backups: bool,
     confirm_normalize_apply: bool,
     find_params: FindParams,
 
@@ -153,6 +154,7 @@ impl MiniUiApp {
             stats_gear_history: false,
             stats_cost_per_shot: false,
             stats_split_extenders: false,
+            duplicates_include_backups: false,
             confirm_normalize_apply: false,
             find_params: FindParams::default(),
             scan_params: ScanParams::default(),
@@ -791,10 +793,24 @@ impl MiniUiApp {
                         build_normalize_lenses_args(&self.config_path, self.query_json, true);
                     self.run_cli(ctx, args);
                 }
+                if ui.button("duplicates").clicked() {
+                    let args = build_duplicates_args(
+                        &self.config_path,
+                        self.query_json,
+                        self.duplicates_include_backups,
+                        50,
+                    );
+                    self.run_cli(ctx, args);
+                }
             });
         });
 
         ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut self.duplicates_include_backups,
+                "duplicates: --include-backups（read_only/backup 内重複も表示）",
+            );
+            ui.separator();
             ui.checkbox(
                 &mut self.confirm_normalize_apply,
                 "DB 更新を許可（normalize-lenses 実適用）",
