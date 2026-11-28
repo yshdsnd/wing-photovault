@@ -14,9 +14,9 @@ use wing_photovault_core::model::{AccessMode, BackupMode, HashAlgorithm, MediaTy
 use crate::config_model::{ConfigDraft, LensAliasRow, StorageDraft};
 use crate::runner::{
     build_duplicates_args, build_export_manifest_args, build_find_args, build_import_manifest_args,
-    build_link_derivatives_args, build_normalize_lenses_args, build_scan_args, build_simple_args,
-    build_stats_args, build_verify_args, detect_wingpv_binary, CommandRunner, FindParams,
-    ScanParams,
+    build_ingest_args, build_link_derivatives_args, build_normalize_lenses_args, build_scan_args,
+    build_simple_args, build_stats_args, build_verify_args, detect_wingpv_binary, CommandRunner,
+    FindParams, IngestParams, ScanParams,
 };
 
 fn main() -> eframe::Result<()> {
@@ -81,6 +81,7 @@ enum ActiveTab {
     ConfigEditor,
     InspectQuery,
     ScanManifest,
+    CardIngest,
 }
 
 struct MiniUiApp {
@@ -111,6 +112,9 @@ struct MiniUiApp {
     export_output_path: String,
     import_manifest_path: String,
     import_storage_override: String,
+
+    // Card Ingest tab state
+    ingest_params: IngestParams,
 
     runner: CommandRunner,
 }
@@ -167,6 +171,7 @@ impl MiniUiApp {
             export_output_path: "nas-manifest.jsonl".to_string(),
             import_manifest_path: String::new(),
             import_storage_override: String::new(),
+            ingest_params: IngestParams::default(),
             runner: CommandRunner::default(),
         }
     }
@@ -262,6 +267,11 @@ impl MiniUiApp {
                     &mut self.tab,
                     ActiveTab::ScanManifest,
                     "3. スキャン・マニフェスト",
+                );
+                ui.selectable_value(
+                    &mut self.tab,
+                    ActiveTab::CardIngest,
+                    "4. カード取り込み (Ingest)",
                 );
             });
 
@@ -591,8 +601,12 @@ impl MiniUiApp {
                             .selected_text(st.tier.as_str())
                             .width(85.0)
                             .show_ui(ui, |ui| {
-                                for t in [StorageTier::Hot, StorageTier::Archive, StorageTier::Backup]
-                                {
+                                for t in [
+                                    StorageTier::Hot,
+                                    StorageTier::Archive,
+                                    StorageTier::Backup,
+                                    StorageTier::Quarantine,
+                                ] {
                                     changed |= ui
                                         .selectable_value(&mut st.tier, t, t.as_str())
                                         .changed();
@@ -641,8 +655,17 @@ impl MiniUiApp {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut st.failure_domain)
-                                    .desired_width(120.0)
+                                    .desired_width(110.0)
                                     .hint_text("例: pc-nvme-g"),
+                            )
+                            .changed();
+
+                        ui.label("volume_id:");
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut st.volume_id)
+                                    .desired_width(110.0)
+                                    .hint_text("任意(.wing-volume-id)"),
                             )
                             .changed();
                     });
@@ -1066,6 +1089,165 @@ impl MiniUiApp {
         self.render_runner_output(ui);
     }
 
+    fn render_card_ingest_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let running = self.runner.is_running();
+
+        // Collect writable non-backup storages configured in the loaded TOML draft
+        let writable_storages: Vec<(String, String)> = self
+            .draft
+            .storages
+            .iter()
+            .filter(|s| {
+                !s.id.trim().is_empty()
+                    && s.access_mode == AccessMode::Managed
+                    && s.backup_mode != BackupMode::External
+                    && s.tier != StorageTier::Backup
+                    && s.tier != StorageTier::Quarantine
+            })
+            .map(|s| (s.id.clone(), format!("{} ({})", s.id, s.root)))
+            .collect();
+
+        if self.ingest_params.dst_storage_id.trim().is_empty() {
+            if let Some((first_id, _)) = writable_storages.first() {
+                self.ingest_params.dst_storage_id = first_id.clone();
+            }
+        }
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.heading("SD / CFexpress カード取り込み (wingpv ingest)");
+            ui.colored_label(
+                egui::Color32::from_rgb(70, 140, 210),
+                "※ カードは完全読み取り専用・DB 非登録です（WING からカード内ファイルを消しません）。既出ハッシュは自動スキップされます。",
+            );
+            ui.add_space(4.0);
+
+            egui::Grid::new("ingest_grid")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("カード元フォルダ (DCIM 等):");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ingest_params.source_dir)
+                                .desired_width(360.0)
+                                .hint_text(r"例: E:\DCIM"),
+                        );
+                        if ui.button("カード選択...").clicked() {
+                            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                self.ingest_params.source_dir = dir.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("取り込み先ストレージ (--to):");
+                    ui.horizontal(|ui| {
+                        if writable_storages.is_empty() {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.ingest_params.dst_storage_id)
+                                    .desired_width(220.0)
+                                    .hint_text("例: ssd_hot_g"),
+                            );
+                            ui.small("(設定タブで managed ストレージを登録すると選択可能)");
+                        } else {
+                            let selected_label = writable_storages
+                                .iter()
+                                .find(|(id, _)| *id == self.ingest_params.dst_storage_id)
+                                .map(|(_, lbl)| lbl.as_str())
+                                .unwrap_or(self.ingest_params.dst_storage_id.as_str());
+                            egui::ComboBox::from_id_salt("ingest_dst_storage")
+                                .selected_text(selected_label)
+                                .width(340.0)
+                                .show_ui(ui, |ui| {
+                                    for (id, label) in &writable_storages {
+                                        ui.selectable_value(
+                                            &mut self.ingest_params.dst_storage_id,
+                                            id.clone(),
+                                            label,
+                                        );
+                                    }
+                                });
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("日付フォルダ形式 (--date-layout):");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("ingest_date_layout")
+                            .selected_text(&self.ingest_params.date_layout)
+                            .width(200.0)
+                            .show_ui(ui, |ui| {
+                                for opt in [
+                                    "YYYY/YYYY_MM_DD",
+                                    "YYYY/MM/YYYY_MM_DD",
+                                    "YYYY-MM-DD",
+                                    "flat",
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.ingest_params.date_layout,
+                                        opt.to_string(),
+                                        opt,
+                                    );
+                                }
+                            });
+                        ui.label("イベント名サフィックス (--subdir):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ingest_params.subdir)
+                                .desired_width(150.0)
+                                .hint_text("例: haneda"),
+                        );
+                    });
+                    ui.end_row();
+
+                    ui.label("オプション:");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.ingest_params.include_sidecars,
+                            "サイドカー (.xmp/.thm) も取り込む",
+                        );
+                    });
+                    ui.end_row();
+                });
+
+            ui.add_space(6.0);
+            let can_run = !running
+                && !self.ingest_params.source_dir.trim().is_empty()
+                && !self.ingest_params.dst_storage_id.trim().is_empty();
+
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(can_run, |ui| {
+                    if ui.button("1. ドライラン確認 (--dry-run)").clicked() {
+                        let args = build_ingest_args(&self.config_path, &self.ingest_params, true);
+                        self.run_cli(ctx, args);
+                    }
+                    if ui.button("2. 取り込み開始 (ingest 実行)").clicked() {
+                        let args = build_ingest_args(&self.config_path, &self.ingest_params, false);
+                        self.run_cli(ctx, args);
+                    }
+                });
+                ui.separator();
+                ui.add_enabled_ui(!running, |ui| {
+                    if ui.button("未バックアップ確認 (find --unbacked)").clicked() {
+                        let mut args = build_simple_args(&self.config_path, false, "find");
+                        args.push("--unbacked".to_string());
+                        args.push("--limit".to_string());
+                        args.push("50".to_string());
+                        self.run_cli(ctx, args);
+                    }
+                    if ui.button("取り込み履歴 (journal)").clicked() {
+                        let mut args = build_simple_args(&self.config_path, false, "journal");
+                        args.push("--op-type".to_string());
+                        args.push("ingest".to_string());
+                        self.run_cli(ctx, args);
+                    }
+                });
+            });
+        });
+
+        ui.separator();
+        self.render_runner_output(ui);
+    }
+
     fn render_runner_output(&self, ui: &mut egui::Ui) {
         let (running, cmd_line, mut stdout, mut stderr, exit_status) = self.runner.snapshot();
 
@@ -1139,6 +1321,7 @@ impl eframe::App for MiniUiApp {
             ActiveTab::ConfigEditor => self.render_config_editor_tab(ui),
             ActiveTab::InspectQuery => self.render_inspect_query_tab(ctx, ui),
             ActiveTab::ScanManifest => self.render_scan_manifest_tab(ctx, ui),
+            ActiveTab::CardIngest => self.render_card_ingest_tab(ctx, ui),
         });
     }
 }

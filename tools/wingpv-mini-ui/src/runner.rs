@@ -62,6 +62,27 @@ pub struct ScanParams {
     pub max_files: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct IngestParams {
+    pub source_dir: String,
+    pub dst_storage_id: String,
+    pub date_layout: String,
+    pub subdir: String,
+    pub include_sidecars: bool,
+}
+
+impl Default for IngestParams {
+    fn default() -> Self {
+        Self {
+            source_dir: String::new(),
+            dst_storage_id: String::new(),
+            date_layout: "YYYY/YYYY_MM_DD".to_string(),
+            subdir: String::new(),
+            include_sidecars: false,
+        }
+    }
+}
+
 /// Detect a usable `wingpv` binary without spawning a shell.
 pub fn detect_wingpv_binary() -> PathBuf {
     let exe_name = if cfg!(windows) { "wingpv.exe" } else { "wingpv" };
@@ -139,6 +160,28 @@ pub fn build_verify_args(
     if limit > 0 {
         args.push("--limit".to_string());
         args.push(limit.to_string());
+    }
+    args
+}
+
+pub fn build_ingest_args(config_path: &Path, params: &IngestParams, dry_run: bool) -> Vec<String> {
+    let mut args = build_simple_args(config_path, false, "ingest");
+    args.push(params.source_dir.trim().to_string());
+    args.push("--to".to_string());
+    args.push(params.dst_storage_id.trim().to_string());
+    if !params.date_layout.trim().is_empty() {
+        args.push("--date-layout".to_string());
+        args.push(params.date_layout.trim().to_string());
+    }
+    if !params.subdir.trim().is_empty() {
+        args.push("--subdir".to_string());
+        args.push(params.subdir.trim().to_string());
+    }
+    if params.include_sidecars {
+        args.push("--include-sidecars".to_string());
+    }
+    if dry_run {
+        args.push("--dry-run".to_string());
     }
     args
 }
@@ -596,6 +639,32 @@ mod tests {
                 "--dry-run",
                 "--limit",
                 "100",
+            ]
+        );
+
+        let ingest = IngestParams {
+            source_dir: r"E:\DCIM".into(),
+            dst_storage_id: "ssd_hot_g".into(),
+            date_layout: "YYYY/YYYY_MM_DD".into(),
+            subdir: "haneda".into(),
+            include_sidecars: true,
+        };
+        let ingest_args = build_ingest_args(cfg, &ingest, true);
+        assert_eq!(
+            ingest_args,
+            vec![
+                "--config",
+                r"C:\test\wing-photovault.toml",
+                "ingest",
+                r"E:\DCIM",
+                "--to",
+                "ssd_hot_g",
+                "--date-layout",
+                "YYYY/YYYY_MM_DD",
+                "--subdir",
+                "haneda",
+                "--include-sidecars",
+                "--dry-run",
             ]
         );
 

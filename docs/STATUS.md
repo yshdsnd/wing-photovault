@@ -45,7 +45,7 @@
 
 ### テスト用ミニ UI (`tools/wingpv-mini-ui` / バイナリ名 `wingpv-mini-ui`)
 - Rust (`egui` / `eframe` + `rfd`) による単体実行 `.exe` ツール（ヘッドレス FreeBSD ビルドに影響しないようワークスペース `exclude` で分離しつつ、`wing-photovault-core` の型・Fail Closed 検証を共有）
-- フォルダ選択付き `.toml` 設定エディタ（`external` → `read_only` 自動強制、`[exif.lens_aliases]` 編集、TOML プレビュー＆ラウンドトリップ検証）＋ `wingpv` CLI テスト実行（`init`/`status`/`stats`/`find`/`normalize-lenses`/`scan`/`export-manifest`/`import-manifest`、非同期リアルタイム出力・中断対応）
+- フォルダ選択付き `.toml` 設定エディタ（`external` → `read_only` 自動強制、`volume_id` / `quarantine` tier 編集、`[exif.lens_aliases]` 編集、TOML プレビュー＆ラウンドトリップ検証）＋ `wingpv` CLI テスト実行（`init`/`status`/`stats`/`find`/`normalize-lenses`/`link-derivatives`/`verify`/`journal`/`scan`/`export-manifest`/`import-manifest`、非同期リアルタイム出力・中断対応）＋ **Tab 4「カード取り込み (Ingest)」**（SD/CFexpress フォルダ選択、書込可能ストレージ自動ドロップダウン、`--date-layout`/`--subdir` 指定、`--dry-run` → `ingest` 実行、未バックアップ確認・取り込み履歴ワンクリック確認）
 
 ---
 
