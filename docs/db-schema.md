@@ -283,9 +283,34 @@ CREATE INDEX IF NOT EXISTS idx_op_journal_state ON operation_journal(state, upda
 CREATE INDEX IF NOT EXISTS idx_op_journal_type_created ON operation_journal(op_type, created_at DESC);
 ```
 
+### 3.11 `quarantine_records` (v5 / Phase 2-3)
+重複ファイルの安全な隔離元・隔離先・復元用メタデータ（`Asset ID` 完全維持）。
+
+```sql
+CREATE TABLE IF NOT EXISTS quarantine_records (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id         INTEGER NOT NULL REFERENCES files(id),
+    asset_id        INTEGER REFERENCES assets(id),
+    content_id      INTEGER NOT NULL REFERENCES contents(id),
+    orig_storage_id TEXT NOT NULL REFERENCES storages(id),
+    orig_rel_path   TEXT NOT NULL,
+    orig_role       TEXT NOT NULL,
+    quarantine_path TEXT NOT NULL,
+    hash_algo       TEXT NOT NULL,
+    hash_hex        TEXT NOT NULL,
+    byte_size       INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'quarantined', -- 'quarantined' | 'restored'
+    quarantined_at  TEXT NOT NULL,
+    restored_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_quarantine_status ON quarantine_records(status, quarantined_at DESC);
+CREATE INDEX IF NOT EXISTS idx_quarantine_file_id ON quarantine_records(file_id);
+```
+
 ## 5. 今後のフェーズで追加予定のテーブル
 - `file_move_history`（Phase 2: 物理パス移動履歴 — Lightroom 等の外部アプリ参照復旧支援）
-- `quarantine_records`（Phase 2: 隔離元パス・理由・復元用メタデータ）
 - `folder_pins`（Phase 2/4: フォルダ単位の自動移動除外 Pin）
 - `thumbnails`（Phase 5: ローカル SSD 上の永続縮小サムネイル管理）
 - `burst_groups` / `tags` / `asset_tags`（Phase 3: 連写グループ・タグ管理）

@@ -16,6 +16,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         V3_STORAGE_PRESENCE_STEM_INDEX,
     ),
     (4, "v4_operation_journal", V4_OPERATION_JOURNAL),
+    (5, "v5_quarantine_records", V5_QUARANTINE_RECORDS),
 ];
 
 const V1_INITIAL_SCHEMA: &str = r#"
@@ -218,6 +219,30 @@ CREATE TABLE IF NOT EXISTS operation_journal (
 CREATE INDEX IF NOT EXISTS idx_op_journal_group ON operation_journal(op_group_id);
 CREATE INDEX IF NOT EXISTS idx_op_journal_state ON operation_journal(state, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_op_journal_type_created ON operation_journal(op_type, created_at DESC);
+"#;
+
+const V5_QUARANTINE_RECORDS: &str = r#"
+-- Phase 2-3: Safe quarantine metadata enabling lossless restore with preserved Asset ID.
+CREATE TABLE IF NOT EXISTS quarantine_records (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id         INTEGER NOT NULL REFERENCES files(id),
+    asset_id        INTEGER REFERENCES assets(id),
+    content_id      INTEGER NOT NULL REFERENCES contents(id),
+    orig_storage_id TEXT NOT NULL REFERENCES storages(id),
+    orig_rel_path   TEXT NOT NULL,
+    orig_role       TEXT NOT NULL,
+    quarantine_path TEXT NOT NULL,
+    hash_algo       TEXT NOT NULL,
+    hash_hex        TEXT NOT NULL,
+    byte_size       INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'quarantined', -- 'quarantined' | 'restored'
+    quarantined_at  TEXT NOT NULL,
+    restored_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_quarantine_status ON quarantine_records(status, quarantined_at DESC);
+CREATE INDEX IF NOT EXISTS idx_quarantine_file_id ON quarantine_records(file_id);
 "#;
 
 pub fn run_migrations(conn: &mut Connection) -> DbResult<()> {

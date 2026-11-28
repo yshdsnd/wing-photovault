@@ -38,8 +38,8 @@ use wing_photovault_core::timeline_svg::{
 use wing_photovault_core::volume::{verify_volume_identity, VolumeCheck};
 use wing_photovault_db::{
     Database, DerivativeLinkOptions, DuplicateFilter, FindCursor, FindFilter,
-    FocalDistributionReport, JournalEntryInput, JournalFilter, ScanRunSummary, StatsFilter,
-    UpsertFileInput,
+    FocalDistributionReport, JournalEntryInput, JournalFilter, QuarantineRecordInput,
+    ScanRunSummary, StatsFilter, UpsertFileInput,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -259,6 +259,51 @@ enum Commands {
         include_sidecars: bool,
 
         /// Preview ingest plan without creating directories, copying files, or modifying DB/journal
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Safely quarantine redundant managed duplicate files (copy -> hash verify -> journal -> remove source; never touches backups or last copy)
+    Quarantine {
+        /// List currently quarantined files instead of quarantining new ones
+        #[arg(long)]
+        list: bool,
+
+        /// Target actionable duplicate files (requires at least one verified healthy 'keep' copy)
+        #[arg(long)]
+        duplicates: bool,
+
+        /// Destination quarantine directory (optional if a tier="quarantine" managed storage is configured)
+        #[arg(long)]
+        to: Option<PathBuf>,
+
+        /// Restrict duplicate search to a single managed storage ID
+        #[arg(long)]
+        storage: Option<String>,
+
+        /// Minimum single-file size in bytes
+        #[arg(long, default_value_t = 0)]
+        min_bytes: u64,
+
+        /// Maximum number of duplicate groups / records to process (0 = unlimited)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Preview quarantine plan without creating directories, moving files, or modifying DB/journal
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Restore quarantined file(s) back to their original path with hash verification and preserved Asset ID
+    Restore {
+        /// Quarantine record ID to restore (omit when using `--all`)
+        id: Option<i64>,
+
+        /// Restore all active quarantined records
+        #[arg(long)]
+        all: bool,
+
+        /// Preview restore plan without writing files or modifying DB/journal
         #[arg(long)]
         dry_run: bool,
     },
@@ -628,6 +673,30 @@ fn main() -> Result<()> {
             },
             cli.format,
         ),
+        Commands::Quarantine {
+            list,
+            duplicates,
+            to,
+            storage,
+            min_bytes,
+            limit,
+            dry_run,
+        } => cmd_quarantine(
+            &cli.config,
+            QuarantineOpts {
+                list_only: list,
+                duplicates,
+                to_dir: to.as_deref(),
+                storage_id: storage,
+                min_bytes,
+                limit: (limit > 0).then_some(limit),
+                dry_run,
+            },
+            cli.format,
+        ),
+        Commands::Restore { id, all, dry_run } => {
+            cmd_restore(&cli.config, id, all, dry_run, cli.format)
+        }
         Commands::Benchmark {
             path,
             limit,
@@ -3619,6 +3688,698 @@ fn cmd_ingest(config_path: &Path, opts: IngestOpts<'_>, format: OutputFormat) ->
             }
             if report.items.len() > 30 {
                 println!("  ... and {} more item(s)", report.items.len() - 30);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct QuarantineOpts<'a> {
+    list_only: bool,
+    duplicates: bool,
+    to_dir: Option<&'a Path>,
+    storage_id: Option<String>,
+    min_bytes: u64,
+    limit: Option<usize>,
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuarantineItemResult {
+    file_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarantine_record_id: Option<i64>,
+    storage_id: String,
+    rel_path: String,
+    quarantine_path: String,
+    byte_size: u64,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuarantineReport {
+    dry_run: bool,
+    quarantine_root: String,
+    quarantined: u64,
+    would_quarantine: u64,
+    skipped_unsafe: u64,
+    errors: u64,
+    bytes_reclaimed: u64,
+    items: Vec<QuarantineItemResult>,
+}
+
+fn parse_hash_algo_str(raw: &str) -> HashAlgorithm {
+    match raw.to_ascii_lowercase().as_str() {
+        "sha256" => HashAlgorithm::Sha256,
+        _ => HashAlgorithm::Blake3,
+    }
+}
+
+fn cmd_quarantine(
+    config_path: &Path,
+    opts: QuarantineOpts<'_>,
+    format: OutputFormat,
+) -> Result<()> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("failed to load config: {}", config_path.display()))?;
+    if !cfg.general.db_path.exists() {
+        anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+    }
+
+    if opts.list_only {
+        let db = Database::open_read_only(&cfg.general.db_path)?;
+        let rows = db.list_quarantine_records(true, opts.limit)?;
+        match format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+            OutputFormat::Jsonl => {
+                for r in &rows {
+                    println!("{}", serde_json::to_string(r)?);
+                }
+            }
+            OutputFormat::Text => {
+                if rows.is_empty() {
+                    println!("No active quarantined files.");
+                } else {
+                    println!("Active Quarantined Files ({}):", rows.len());
+                    for r in &rows {
+                        println!(
+                            "  - #{} [{}] {}:{} ({}, asset={:?}) -> {}",
+                            r.id,
+                            r.reason,
+                            r.orig_storage_id,
+                            r.orig_rel_path,
+                            human_bytes(r.byte_size.max(0) as u64),
+                            r.asset_id,
+                            r.quarantine_path
+                        );
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if !opts.duplicates {
+        anyhow::bail!("specify either `--duplicates` to quarantine redundant duplicates or `--list` to inspect quarantined files");
+    }
+
+    // Resolve quarantine destination root: explicit `--to` or configured `tier = "quarantine"` managed storage
+    let q_root: PathBuf = if let Some(dir) = opts.to_dir {
+        dir.to_path_buf()
+    } else if let Some(qs) = cfg
+        .storages
+        .iter()
+        .find(|s| s.tier == StorageTier::Quarantine && s.allows_mutation())
+    {
+        qs.root.clone()
+    } else {
+        anyhow::bail!(
+            "no quarantine destination specified: pass `--to <DIR>` or configure a writable `tier = \"quarantine\"` storage"
+        );
+    };
+
+    let mut db = if opts.dry_run {
+        Database::open_read_only(&cfg.general.db_path)?
+    } else {
+        let db = Database::open(&cfg.general.db_path)?;
+        db.upsert_host(&cfg.host.id, &cfg.host.name, current_host_os())?;
+        db
+    };
+
+    let storage_map: std::collections::HashMap<&str, &StorageConfig> = cfg
+        .storages
+        .iter()
+        .map(|s| (s.id.as_str(), s))
+        .collect();
+
+    let dup_report = db.find_duplicates(&DuplicateFilter {
+        storage_id: opts.storage_id,
+        include_backups: false,
+        include_sidecars: false,
+        min_bytes: opts.min_bytes,
+        limit: opts.limit,
+    })?;
+
+    let op_group_id = format!("quarantine-{}", chrono::Utc::now().timestamp_millis());
+    let mut report = QuarantineReport {
+        dry_run: opts.dry_run,
+        quarantine_root: q_root.to_string_lossy().into_owned(),
+        quarantined: 0,
+        would_quarantine: 0,
+        skipped_unsafe: 0,
+        errors: 0,
+        bytes_reclaimed: 0,
+        items: Vec::new(),
+    };
+
+    for group in &dup_report.groups {
+        if group.actionable_copies < 2 {
+            continue;
+        }
+        let algo = parse_hash_algo_str(&group.hash_algo);
+
+        // Fail Closed: verify that the designated "keep" copy is physically present and matches hash!
+        let Some(keep_row) = group.files.iter().find(|f| f.recommendation == "keep") else {
+            report.skipped_unsafe += 1;
+            continue;
+        };
+        let keep_verified = storage_map
+            .get(keep_row.storage_id.as_str())
+            .and_then(|st| {
+                if !st.root.is_dir() {
+                    return None;
+                }
+                let expected_vid = st
+                    .volume_id
+                    .clone()
+                    .or_else(|| db.get_storage_volume_id(&st.id).ok().flatten());
+                if !verify_volume_identity(&st.root, expected_vid.as_deref()).is_ok() {
+                    return None;
+                }
+                let abs = safe_join_rel_path(&st.root, &keep_row.rel_path, false).ok()?;
+                let h = hash_file(&abs, algo, false).ok()?;
+                Some(h.hash_hex.eq_ignore_ascii_case(&group.hash_hex))
+            })
+            .unwrap_or(false);
+
+        if !keep_verified {
+            report.skipped_unsafe += group
+                .files
+                .iter()
+                .filter(|f| f.recommendation == "duplicate")
+                .count() as u64;
+            for f in group.files.iter().filter(|f| f.recommendation == "duplicate") {
+                report.items.push(QuarantineItemResult {
+                    file_id: f.file_id,
+                    quarantine_record_id: None,
+                    storage_id: f.storage_id.clone(),
+                    rel_path: f.rel_path.clone(),
+                    quarantine_path: String::new(),
+                    byte_size: group.byte_size.max(0) as u64,
+                    status: "skipped_unsafe".into(),
+                    detail: Some(format!(
+                        "keep copy '{}:{}' could not be verified on disk (Fail Closed)",
+                        keep_row.storage_id, keep_row.rel_path
+                    )),
+                });
+            }
+            continue;
+        }
+
+        for dup in group.files.iter().filter(|f| f.recommendation == "duplicate") {
+            let Some(st) = storage_map.get(dup.storage_id.as_str()) else {
+                report.skipped_unsafe += 1;
+                continue;
+            };
+            // Double-check core invariant: NEVER quarantine read_only, backup, or external storages
+            if !st.allows_duplicate_quarantine() || !st.root.is_dir() {
+                report.skipped_unsafe += 1;
+                continue;
+            }
+            let expected_vid = st
+                .volume_id
+                .clone()
+                .or_else(|| db.get_storage_volume_id(&st.id).ok().flatten());
+            if !verify_volume_identity(&st.root, expected_vid.as_deref()).is_ok() {
+                report.skipped_unsafe += 1;
+                continue;
+            }
+
+            let src_abs = match safe_join_rel_path(&st.root, &dup.rel_path, false) {
+                Ok(p) => p,
+                Err(err) => {
+                    report.errors += 1;
+                    report.items.push(QuarantineItemResult {
+                        file_id: dup.file_id,
+                        quarantine_record_id: None,
+                        storage_id: dup.storage_id.clone(),
+                        rel_path: dup.rel_path.clone(),
+                        quarantine_path: String::new(),
+                        byte_size: group.byte_size.max(0) as u64,
+                        status: "error".into(),
+                        detail: Some(err),
+                    });
+                    continue;
+                }
+            };
+            let q_rel = format!("{}/{}", dup.storage_id, dup.rel_path);
+            let q_abs = match safe_join_rel_path(&q_root, &q_rel, false) {
+                Ok(p) => p,
+                Err(err) => {
+                    report.errors += 1;
+                    report.items.push(QuarantineItemResult {
+                        file_id: dup.file_id,
+                        quarantine_record_id: None,
+                        storage_id: dup.storage_id.clone(),
+                        rel_path: dup.rel_path.clone(),
+                        quarantine_path: String::new(),
+                        byte_size: group.byte_size.max(0) as u64,
+                        status: "error".into(),
+                        detail: Some(err),
+                    });
+                    continue;
+                }
+            };
+            let q_abs_str = q_abs.to_string_lossy().into_owned();
+
+            // TOCTOU guard: re-hash source on disk before touching anything
+            match hash_file(&src_abs, algo, false) {
+                Ok(h) if h.hash_hex.eq_ignore_ascii_case(&group.hash_hex) => {}
+                Ok(_) => {
+                    report.skipped_unsafe += 1;
+                    report.items.push(QuarantineItemResult {
+                        file_id: dup.file_id,
+                        quarantine_record_id: None,
+                        storage_id: dup.storage_id.clone(),
+                        rel_path: dup.rel_path.clone(),
+                        quarantine_path: q_abs_str,
+                        byte_size: group.byte_size.max(0) as u64,
+                        status: "skipped_unsafe".into(),
+                        detail: Some("source hash changed on disk since last scan (Fail Closed)".into()),
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    report.errors += 1;
+                    report.items.push(QuarantineItemResult {
+                        file_id: dup.file_id,
+                        quarantine_record_id: None,
+                        storage_id: dup.storage_id.clone(),
+                        rel_path: dup.rel_path.clone(),
+                        quarantine_path: q_abs_str,
+                        byte_size: group.byte_size.max(0) as u64,
+                        status: "error".into(),
+                        detail: Some(err.to_string()),
+                    });
+                    continue;
+                }
+            }
+
+            let journal_id = if !opts.dry_run {
+                Some(db.insert_journal_entry(&JournalEntryInput {
+                    op_group_id: op_group_id.clone(),
+                    op_type: "quarantine".to_string(),
+                    state: "planned".to_string(),
+                    host_id: Some(cfg.host.id.clone()),
+                    asset_id: dup.asset_id,
+                    file_id: Some(dup.file_id),
+                    src_storage_id: Some(dup.storage_id.clone()),
+                    src_rel_path: Some(dup.rel_path.clone()),
+                    dst_storage_id: None,
+                    dst_rel_path: Some(q_abs_str.clone()),
+                    expected_algo: Some(group.hash_algo.clone()),
+                    expected_hash: Some(group.hash_hex.clone()),
+                    actual_hash: None,
+                    byte_size: Some(group.byte_size),
+                    error_message: None,
+                })?)
+            } else {
+                None
+            };
+
+            let copy_res = verified_copy_file(
+                &src_abs,
+                &q_abs,
+                algo,
+                Some(&group.hash_hex),
+                opts.dry_run,
+            );
+
+            match copy_res.status {
+                CopyStatus::WouldCopy => {
+                    report.would_quarantine += 1;
+                    report.bytes_reclaimed += group.byte_size.max(0) as u64;
+                    report.items.push(QuarantineItemResult {
+                        file_id: dup.file_id,
+                        quarantine_record_id: None,
+                        storage_id: dup.storage_id.clone(),
+                        rel_path: dup.rel_path.clone(),
+                        quarantine_path: q_abs_str,
+                        byte_size: group.byte_size.max(0) as u64,
+                        status: "would_quarantine".into(),
+                        detail: None,
+                    });
+                }
+                CopyStatus::Copied | CopyStatus::SkippedIdentical => {
+                    if let Some(jid) = journal_id {
+                        db.update_journal_state(jid, "verified", Some(&group.hash_hex), None)?;
+                    }
+                    let qrec_id = db.commit_quarantine_record(&QuarantineRecordInput {
+                        file_id: dup.file_id,
+                        asset_id: dup.asset_id,
+                        content_id: group.content_id,
+                        orig_storage_id: dup.storage_id.clone(),
+                        orig_rel_path: dup.rel_path.clone(),
+                        orig_role: dup.role.clone(),
+                        quarantine_path: q_abs_str.clone(),
+                        hash_algo: group.hash_algo.clone(),
+                        hash_hex: group.hash_hex.clone(),
+                        byte_size: group.byte_size,
+                        reason: "duplicate".to_string(),
+                    })?;
+                    // Only remove source AFTER destination is written, flushed, verified, and DB-recorded!
+                    if let Err(err) = std::fs::remove_file(&src_abs) {
+                        if let Some(jid) = journal_id {
+                            db.update_journal_state(
+                                jid,
+                                "failed",
+                                Some(&group.hash_hex),
+                                Some(&format!("quarantine copy succeeded but remove_file failed: {err}")),
+                            )?;
+                        }
+                        report.errors += 1;
+                        report.items.push(QuarantineItemResult {
+                            file_id: dup.file_id,
+                            quarantine_record_id: Some(qrec_id),
+                            storage_id: dup.storage_id.clone(),
+                            rel_path: dup.rel_path.clone(),
+                            quarantine_path: q_abs_str,
+                            byte_size: group.byte_size.max(0) as u64,
+                            status: "error".into(),
+                            detail: Some(format!("remove_file failed: {err}")),
+                        });
+                        continue;
+                    }
+                    if let Some(jid) = journal_id {
+                        db.update_journal_state(jid, "committed", Some(&group.hash_hex), None)?;
+                    }
+                    report.quarantined += 1;
+                    report.bytes_reclaimed += group.byte_size.max(0) as u64;
+                    report.items.push(QuarantineItemResult {
+                        file_id: dup.file_id,
+                        quarantine_record_id: Some(qrec_id),
+                        storage_id: dup.storage_id.clone(),
+                        rel_path: dup.rel_path.clone(),
+                        quarantine_path: q_abs_str,
+                        byte_size: group.byte_size.max(0) as u64,
+                        status: "quarantined".into(),
+                        detail: None,
+                    });
+                }
+                CopyStatus::ConflictDifferentContent | CopyStatus::MissingSource | CopyStatus::Failed => {
+                    if let Some(jid) = journal_id {
+                        db.update_journal_state(jid, "failed", None, copy_res.detail.as_deref())?;
+                    }
+                    report.errors += 1;
+                    report.items.push(QuarantineItemResult {
+                        file_id: dup.file_id,
+                        quarantine_record_id: None,
+                        storage_id: dup.storage_id.clone(),
+                        rel_path: dup.rel_path.clone(),
+                        quarantine_path: q_abs_str,
+                        byte_size: group.byte_size.max(0) as u64,
+                        status: "error".into(),
+                        detail: copy_res.detail,
+                    });
+                }
+            }
+        }
+    }
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Jsonl => {
+            for item in &report.items {
+                println!("{}", serde_json::to_string(item)?);
+            }
+        }
+        OutputFormat::Text => {
+            let prefix = if report.dry_run { "[dry-run] " } else { "" };
+            println!(
+                "{prefix}Quarantine -> {}: quarantined={} would_quarantine={} skipped_unsafe={} errors={} reclaimable={}",
+                report.quarantine_root,
+                report.quarantined,
+                report.would_quarantine,
+                report.skipped_unsafe,
+                report.errors,
+                human_bytes(report.bytes_reclaimed)
+            );
+            for item in &report.items {
+                let qid = item
+                    .quarantine_record_id
+                    .map(|i| format!(" (q#{i})"))
+                    .unwrap_or_default();
+                let detail = item
+                    .detail
+                    .as_deref()
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default();
+                println!(
+                    "  - [{:<16}] {}:{} -> {}{}{}",
+                    item.status,
+                    item.storage_id,
+                    item.rel_path,
+                    item.quarantine_path,
+                    qid,
+                    detail
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RestoreItemResult {
+    quarantine_record_id: i64,
+    file_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset_id: Option<i64>,
+    orig_storage_id: String,
+    orig_rel_path: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RestoreReport {
+    dry_run: bool,
+    restored: u64,
+    would_restore: u64,
+    errors: u64,
+    items: Vec<RestoreItemResult>,
+}
+
+fn cmd_restore(
+    config_path: &Path,
+    id: Option<i64>,
+    all: bool,
+    dry_run: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    if id.is_none() && !all {
+        anyhow::bail!("specify a quarantine record <ID> or `--all`");
+    }
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("failed to load config: {}", config_path.display()))?;
+    if !cfg.general.db_path.exists() {
+        anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+    }
+
+    let mut db = if dry_run {
+        Database::open_read_only(&cfg.general.db_path)?
+    } else {
+        let db = Database::open(&cfg.general.db_path)?;
+        db.upsert_host(&cfg.host.id, &cfg.host.name, current_host_os())?;
+        db
+    };
+
+    let targets = if all {
+        db.list_quarantine_records(true, None)?
+    } else {
+        let rid = id.unwrap();
+        match db.get_quarantine_record(rid)? {
+            Some(r) if r.status == "quarantined" => vec![r],
+            Some(r) => anyhow::bail!("quarantine record #{rid} is already '{}'", r.status),
+            None => anyhow::bail!("quarantine record #{rid} not found"),
+        }
+    };
+
+    let storage_map: std::collections::HashMap<&str, &StorageConfig> = cfg
+        .storages
+        .iter()
+        .map(|s| (s.id.as_str(), s))
+        .collect();
+    let op_group_id = format!("restore-{}", chrono::Utc::now().timestamp_millis());
+    let mut report = RestoreReport {
+        dry_run,
+        restored: 0,
+        would_restore: 0,
+        errors: 0,
+        items: Vec::new(),
+    };
+
+    for rec in targets {
+        let Some(st) = storage_map.get(rec.orig_storage_id.as_str()) else {
+            report.errors += 1;
+            report.items.push(RestoreItemResult {
+                quarantine_record_id: rec.id,
+                file_id: rec.file_id,
+                asset_id: rec.asset_id,
+                orig_storage_id: rec.orig_storage_id,
+                orig_rel_path: rec.orig_rel_path,
+                status: "error".into(),
+                detail: Some("original storage not configured".into()),
+            });
+            continue;
+        };
+        if !st.allows_mutation() || !st.root.is_dir() {
+            report.errors += 1;
+            report.items.push(RestoreItemResult {
+                quarantine_record_id: rec.id,
+                file_id: rec.file_id,
+                asset_id: rec.asset_id,
+                orig_storage_id: rec.orig_storage_id,
+                orig_rel_path: rec.orig_rel_path,
+                status: "error".into(),
+                detail: Some("original storage is offline or read-only (Fail Closed)".into()),
+            });
+            continue;
+        }
+        let expected_vid = st
+            .volume_id
+            .clone()
+            .or_else(|| db.get_storage_volume_id(&st.id).ok().flatten());
+        if !verify_volume_identity(&st.root, expected_vid.as_deref()).is_ok() {
+            report.errors += 1;
+            report.items.push(RestoreItemResult {
+                quarantine_record_id: rec.id,
+                file_id: rec.file_id,
+                asset_id: rec.asset_id,
+                orig_storage_id: rec.orig_storage_id,
+                orig_rel_path: rec.orig_rel_path,
+                status: "error".into(),
+                detail: Some("original storage volume_id check failed (Fail Closed)".into()),
+            });
+            continue;
+        }
+
+        let dst_abs = match safe_join_rel_path(&st.root, &rec.orig_rel_path, false) {
+            Ok(p) => p,
+            Err(err) => {
+                report.errors += 1;
+                report.items.push(RestoreItemResult {
+                    quarantine_record_id: rec.id,
+                    file_id: rec.file_id,
+                    asset_id: rec.asset_id,
+                    orig_storage_id: rec.orig_storage_id,
+                    orig_rel_path: rec.orig_rel_path,
+                    status: "error".into(),
+                    detail: Some(err),
+                });
+                continue;
+            }
+        };
+        let q_path = PathBuf::from(&rec.quarantine_path);
+        let algo = parse_hash_algo_str(&rec.hash_algo);
+
+        let journal_id = if !dry_run {
+            Some(db.insert_journal_entry(&JournalEntryInput {
+                op_group_id: op_group_id.clone(),
+                op_type: "restore".to_string(),
+                state: "planned".to_string(),
+                host_id: Some(cfg.host.id.clone()),
+                asset_id: rec.asset_id,
+                file_id: Some(rec.file_id),
+                src_storage_id: None,
+                src_rel_path: Some(rec.quarantine_path.clone()),
+                dst_storage_id: Some(rec.orig_storage_id.clone()),
+                dst_rel_path: Some(rec.orig_rel_path.clone()),
+                expected_algo: Some(rec.hash_algo.clone()),
+                expected_hash: Some(rec.hash_hex.clone()),
+                actual_hash: None,
+                byte_size: Some(rec.byte_size),
+                error_message: None,
+            })?)
+        } else {
+            None
+        };
+
+        let copy_res = verified_copy_file(&q_path, &dst_abs, algo, Some(&rec.hash_hex), dry_run);
+        match copy_res.status {
+            CopyStatus::WouldCopy => {
+                report.would_restore += 1;
+                report.items.push(RestoreItemResult {
+                    quarantine_record_id: rec.id,
+                    file_id: rec.file_id,
+                    asset_id: rec.asset_id,
+                    orig_storage_id: rec.orig_storage_id,
+                    orig_rel_path: rec.orig_rel_path,
+                    status: "would_restore".into(),
+                    detail: None,
+                });
+            }
+            CopyStatus::Copied | CopyStatus::SkippedIdentical => {
+                if let Some(jid) = journal_id {
+                    db.update_journal_state(jid, "verified", Some(&rec.hash_hex), None)?;
+                }
+                db.commit_quarantine_restore(rec.id)?;
+                let _ = std::fs::remove_file(&q_path);
+                if let Some(jid) = journal_id {
+                    db.update_journal_state(jid, "committed", Some(&rec.hash_hex), None)?;
+                }
+                report.restored += 1;
+                report.items.push(RestoreItemResult {
+                    quarantine_record_id: rec.id,
+                    file_id: rec.file_id,
+                    asset_id: rec.asset_id,
+                    orig_storage_id: rec.orig_storage_id,
+                    orig_rel_path: rec.orig_rel_path,
+                    status: "restored".into(),
+                    detail: None,
+                });
+            }
+            CopyStatus::ConflictDifferentContent | CopyStatus::MissingSource | CopyStatus::Failed => {
+                if let Some(jid) = journal_id {
+                    db.update_journal_state(jid, "failed", None, copy_res.detail.as_deref())?;
+                }
+                report.errors += 1;
+                report.items.push(RestoreItemResult {
+                    quarantine_record_id: rec.id,
+                    file_id: rec.file_id,
+                    asset_id: rec.asset_id,
+                    orig_storage_id: rec.orig_storage_id,
+                    orig_rel_path: rec.orig_rel_path,
+                    status: "error".into(),
+                    detail: copy_res.detail,
+                });
+            }
+        }
+    }
+
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Jsonl => {
+            for item in &report.items {
+                println!("{}", serde_json::to_string(item)?);
+            }
+        }
+        OutputFormat::Text => {
+            let prefix = if report.dry_run { "[dry-run] " } else { "" };
+            println!(
+                "{prefix}Restore: restored={} would_restore={} errors={}",
+                report.restored, report.would_restore, report.errors
+            );
+            for item in &report.items {
+                let detail = item
+                    .detail
+                    .as_deref()
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default();
+                println!(
+                    "  - [{:<13}] q#{} -> {}:{} (asset={:?}){}",
+                    item.status,
+                    item.quarantine_record_id,
+                    item.orig_storage_id,
+                    item.orig_rel_path,
+                    item.asset_id,
+                    detail
+                );
             }
         }
     }

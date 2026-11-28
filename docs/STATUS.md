@@ -1,7 +1,7 @@
 # WING PhotoVault — 開発ステータス・引き継ぎメモ
 
 - Last Updated: 2026-11-28
-- Current Phase: **Phase 2（操作ジャーナル・整合性検証・リムーバブル取り込み・安全隔離）進行中**
+- Current Phase: **Phase 2（操作ジャーナル・整合性検証・リムーバブル取り込み・安全隔離／復元）完了**
 - Branch: `main`（全 40 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
@@ -21,11 +21,12 @@
 - マニフェスト入力検証（`ScanManifestRecord::validate`: `..` パストラバーサル・不正ハッシュ拒否）
 
 ### DB (`crates/wing-photovault-db`)
-- SQLite WAL（`rusqlite` bundled）＋前方マイグレーション（**Schema v4** 適用済み）
+- SQLite WAL（`rusqlite` bundled）＋前方マイグレーション（**Schema v5** 適用済み）
   - v1: `storages`, `assets`, `contents`, `content_metadata`, `scan_runs`, `files`
   - v2: `hosts`, `storage_mounts`, `storages` 権限/状態/障害ドメイン、`assets.public_id`（UUIDv7）、`files.last_seen_at` / `last_verified_at`、ストレージ状態（`online`/`offline`/`failed`/`retired`）とファイル存在状態（`present`/`missing`/`corrupted`）の完全分離
   - v3: `idx_files_storage_presence_stem(storage_id, presence, file_stem)` 複合インデックス（大規模ストレージでのサイドカー親 Asset 検索・RAW+JPEG 統合を O(log N) 化）
   - v4: `operation_journal` テーブル（コピー・取り込み・移動・隔離・復元・整合性検証の監査ログ兼クラッシュリカバリ用状態遷移テーブル）
+  - v5: `quarantine_records` テーブル（重複隔離元・隔離先・復元用メタデータ、Asset ID 維持復元対応）
 - 差分スキャン（未変更ファイルは `last_seen_at` のみ更新し `last_verified_at` を保持）
 - RAW + JPEG 論理 Asset 統合（同一フォルダ＋兄弟 `RAW/`・`JPEG/` フォルダ対応、曖昧時は非統合）
   - O(1) バッチ内ペアリング（途中中断してもコミット済み分は統合済み）＋スキャン末尾の冪等スイープ
@@ -39,6 +40,7 @@
 - `link-derivatives`（Lightroom Classic 等のレタッチ済み／リサイズ書き出し JPEG を撮影日時 `captured_at`＋`subsec`/ファイル名/カメラ・シリアル互換ガードで元の論理 Asset に関連付け、`role = 'exported'` 付与・元 Asset ID 維持・曖昧時 Fail Closed・`--dry-run` 読み取り専用プレビュー対応）
 - `verify` / `journal`（Phase 2-1: 実体ファイルのハッシュ再計算によるサイレントビットロット・欠損・外部変更検知、他ストレージ上の健全コピー有無の即時表示、`--older-than-days` / `--limit` / `--cooldown-*` / `--dry-run` 対応、異常の `operation_journal` 記録と `journal [--incomplete]` 閲覧）
 - `ingest` & `volume_id` 本人確認（Phase 2-2: SD/CFexpress 等の使い捨て一時メディアからの安全取り込み — カードは読み取り専用＆`storages` 非登録、既出ハッシュ自動スキップ、`YYYY/YYYY_MM_DD/` 日付整理＋ハッシュ検証付きコピー＋即時 DB 登録＆RAW+JPEG 統合＋`operation_journal` 記録、`--dry-run` 対応。外付け HDD 等には `<root>/.wing-volume-id` によるボリューム取り違え Fail Closed 保護を `scan`/`verify`/`ingest` 全般に適用）
+- `quarantine` / `restore`（Phase 2-3: 管理対象ストレージの重複ファイルを「keep コピー実体検証 → 隔離先へハッシュ検証付きコピー → `operation_journal` / `quarantine_records` 記録 → 元ファイル削除」の順序で安全隔離、`read_only`/`backup`/`external` および最後の1コピーは完全保護、`restore <ID>|--all` で元パス＆元 Asset ID をそのまま復元、いずれも `--dry-run` 対応）
 - `status` / `stats`（`--percent`, `--by-year`, `--gear-history` 使用機材年表、`--cost-per-shot` 1ショット単価、`--split-extenders` テレコン分解集計、`--focal-dist` / `--focal-35mm` 焦点距離＆35mm換算分布ヒストグラム＋`[stats.camera_crop_factors]`、`--year`/`--camera`/`--lens` 絞り込み、`--export-timeline-svg` スタンドアロン SVG 年表出力、未バックアップ件数＆切り捨て%表示対応）/ `duplicates`（読み取り専用重複検出、`read_only`/`external` バックアップ保護、`--include-backups`/`--include-sidecars`/`--min-bytes`/`--limit` 対応）/ `find`（キーセットページング `--cursor`, `--page-info`、焦点距離/ISO/F値/パス/`--asset-id`/`--unbacked` フィルタ、ハッシュ検証付き安全コピー `--copy-to` + `--with-companions` + `--flat` + `--dry-run` 対応）/ `benchmark`（ディレクトリ実測＋`--db-scale <N>` 大規模ダミー DB ベンチマーク、`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
 
 ### テスト用ミニ UI (`tools/wingpv-mini-ui` / バイナリ名 `wingpv-mini-ui`)

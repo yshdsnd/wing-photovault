@@ -190,6 +190,42 @@ pub struct VerifyCandidateRow {
     pub last_verified_at: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct QuarantineRecordInput {
+    pub file_id: i64,
+    pub asset_id: Option<i64>,
+    pub content_id: i64,
+    pub orig_storage_id: String,
+    pub orig_rel_path: String,
+    pub orig_role: String,
+    pub quarantine_path: String,
+    pub hash_algo: String,
+    pub hash_hex: String,
+    pub byte_size: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuarantineRecordRow {
+    pub id: i64,
+    pub file_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<i64>,
+    pub content_id: i64,
+    pub orig_storage_id: String,
+    pub orig_rel_path: String,
+    pub orig_role: String,
+    pub quarantine_path: String,
+    pub hash_algo: String,
+    pub hash_hex: String,
+    pub byte_size: i64,
+    pub reason: String,
+    pub status: String,
+    pub quarantined_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restored_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScanRunSummary {
     pub scan_run_id: i64,
@@ -1905,6 +1941,7 @@ impl Database {
         Ok(out)
     }
 
+
     /// Select present files with recorded hashes on a storage for integrity verification,
     /// prioritized by never-verified first, then oldest `last_verified_at`.
     pub fn select_verify_candidates(
@@ -1965,6 +2002,7 @@ impl Database {
         Ok(out)
     }
 
+
     /// Batch-update `last_verified_at` and `last_seen_at` for verified-healthy files.
     pub fn record_verify_ok_batch(&mut self, file_ids: &[i64]) -> DbResult<u64> {
         if file_ids.is_empty() {
@@ -2018,6 +2056,152 @@ impl Database {
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?
             ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2-3: Quarantine & Restore Records (preserving Asset ID)
+    // -------------------------------------------------------------------------
+
+    /// Record a completed file quarantine and update the `files` row to `role = 'quarantined'`,
+    /// `presence = 'missing'` in a single atomic transaction (preserving `asset_id`).
+    pub fn commit_quarantine_record(&mut self, input: &QuarantineRecordInput) -> DbResult<i64> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO quarantine_records (
+                file_id, asset_id, content_id, orig_storage_id, orig_rel_path, orig_role,
+                quarantine_path, hash_algo, hash_hex, byte_size, reason, status, quarantined_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'quarantined', ?12)",
+            params![
+                input.file_id,
+                input.asset_id,
+                input.content_id,
+                input.orig_storage_id,
+                input.orig_rel_path,
+                input.orig_role,
+                input.quarantine_path,
+                input.hash_algo,
+                input.hash_hex,
+                input.byte_size,
+                input.reason,
+                now,
+            ],
+        )?;
+        let rec_id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE files SET role = 'quarantined', presence = 'missing', updated_at = ?1 WHERE id = ?2",
+            params![now, input.file_id],
+        )?;
+        tx.commit()?;
+        Ok(rec_id)
+    }
+
+    /// Mark a quarantine record as restored and restore the original `files` row (`presence = 'present'`,
+    /// `role = orig_role`, preserving `file_id` and `asset_id`).
+    pub fn commit_quarantine_restore(&mut self, record_id: i64) -> DbResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        let (file_id, orig_role): (i64, String) = tx.query_row(
+            "SELECT file_id, orig_role FROM quarantine_records WHERE id = ?1",
+            params![record_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        tx.execute(
+            "UPDATE files
+             SET role = ?1, presence = 'present', last_seen_at = ?2, last_verified_at = ?2, updated_at = ?2
+             WHERE id = ?3",
+            params![orig_role, now, file_id],
+        )?;
+        tx.execute(
+            "UPDATE quarantine_records
+             SET status = 'restored', restored_at = ?1
+             WHERE id = ?2",
+            params![now, record_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_quarantine_record(&self, record_id: i64) -> DbResult<Option<QuarantineRecordRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, file_id, asset_id, content_id, orig_storage_id, orig_rel_path, orig_role,
+                        quarantine_path, hash_algo, hash_hex, byte_size, reason, status,
+                        quarantined_at, restored_at
+                 FROM quarantine_records
+                 WHERE id = ?1",
+                params![record_id],
+                |r| {
+                    Ok(QuarantineRecordRow {
+                        id: r.get(0)?,
+                        file_id: r.get(1)?,
+                        asset_id: r.get(2)?,
+                        content_id: r.get(3)?,
+                        orig_storage_id: r.get(4)?,
+                        orig_rel_path: r.get(5)?,
+                        orig_role: r.get(6)?,
+                        quarantine_path: r.get(7)?,
+                        hash_algo: r.get(8)?,
+                        hash_hex: r.get(9)?,
+                        byte_size: r.get(10)?,
+                        reason: r.get(11)?,
+                        status: r.get(12)?,
+                        quarantined_at: r.get(13)?,
+                        restored_at: r.get(14)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_quarantine_records(
+        &self,
+        only_active: bool,
+        limit: Option<usize>,
+    ) -> DbResult<Vec<QuarantineRecordRow>> {
+        let mut sql = String::from(
+            "SELECT id, file_id, asset_id, content_id, orig_storage_id, orig_rel_path, orig_role,
+                    quarantine_path, hash_algo, hash_hex, byte_size, reason, status,
+                    quarantined_at, restored_at
+             FROM quarantine_records",
+        );
+        if only_active {
+            sql.push_str(" WHERE status = 'quarantined'");
+        }
+        sql.push_str(" ORDER BY id DESC");
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(lim) = limit {
+            if lim > 0 {
+                sql.push_str(" LIMIT ?");
+                binds.push((lim as i64).into());
+            }
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
+            Ok(QuarantineRecordRow {
+                id: r.get(0)?,
+                file_id: r.get(1)?,
+                asset_id: r.get(2)?,
+                content_id: r.get(3)?,
+                orig_storage_id: r.get(4)?,
+                orig_rel_path: r.get(5)?,
+                orig_role: r.get(6)?,
+                quarantine_path: r.get(7)?,
+                hash_algo: r.get(8)?,
+                hash_hex: r.get(9)?,
+                byte_size: r.get(10)?,
+                reason: r.get(11)?,
+                status: r.get(12)?,
+                quarantined_at: r.get(13)?,
+                restored_at: r.get(14)?,
+            })
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -6042,7 +6226,7 @@ mod tests {
     #[test]
     fn operation_journal_lifecycle_and_verify_candidates_work() {
         let mut db = Database::open_in_memory().unwrap();
-        assert_eq!(db.status().unwrap().schema_version, 4);
+        assert_eq!(db.status().unwrap().schema_version, 5);
 
         db.upsert_host("h1", "Host", "windows").unwrap();
         let hot = StorageConfig {
@@ -6197,5 +6381,42 @@ mod tests {
         assert_eq!(inc.len(), 1);
         assert_eq!(inc[0].op_type, "quarantine");
         assert_eq!(inc[0].state, "copied");
+
+        // Quarantine & restore DB lifecycle preserves Asset ID
+        let orig_aid = cands[0].asset_id;
+        let qid = db
+            .commit_quarantine_record(&QuarantineRecordInput {
+                file_id: cands[0].file_id,
+                asset_id: orig_aid,
+                content_id: cands[0].content_id,
+                orig_storage_id: "ssd_hot".into(),
+                orig_rel_path: cands[0].rel_path.clone(),
+                orig_role: "original".into(),
+                quarantine_path: r"Q:\ssd_hot\2026\IMG_1.JPG".into(),
+                hash_algo: "blake3".into(),
+                hash_hex: "hash_ok".into(),
+                byte_size: 1024,
+                reason: "duplicate".into(),
+            })
+            .unwrap();
+        assert_eq!(db.list_quarantine_records(true, None).unwrap().len(), 1);
+        // File is no longer present while quarantined
+        assert!(!db
+            .find(&FindFilter::default())
+            .unwrap()
+            .iter()
+            .any(|f| f.file_id == cands[0].file_id));
+
+        // Restore brings file back as present with identical Asset ID
+        db.commit_quarantine_restore(qid).unwrap();
+        assert_eq!(db.list_quarantine_records(true, None).unwrap().len(), 0);
+        let restored = db
+            .find(&FindFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|f| f.file_id == cands[0].file_id)
+            .unwrap();
+        assert_eq!(restored.asset_id, orig_aid);
+        assert_eq!(restored.role, "original");
     }
 }
