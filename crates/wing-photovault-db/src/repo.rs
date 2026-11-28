@@ -149,6 +149,46 @@ pub struct GearHistoryReport {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct StatsFilter {
+    /// Filter assets to a specific 4-digit capture year (e.g. `"2025"`).
+    pub year: Option<String>,
+    /// Case-insensitive substring filter on `assets.camera_model`.
+    pub camera: Option<String>,
+    /// Case-insensitive substring filter on `assets.lens_model`.
+    pub lens: Option<String>,
+    /// Split lens + teleconverter strings so both parent lens and extender are credited.
+    pub split_extenders: bool,
+}
+
+impl StatsFilter {
+    pub fn has_asset_filter(&self) -> bool {
+        self.year.is_some() || self.camera.is_some() || self.lens.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FocalBucketRow {
+    pub label: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FocalExactRow {
+    pub focal_mm: i64,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FocalDistributionReport {
+    pub total_with_focal: i64,
+    pub min_mm: Option<f64>,
+    pub max_mm: Option<f64>,
+    pub avg_mm: Option<f64>,
+    pub buckets: Vec<FocalBucketRow>,
+    pub top_exact_mm: Vec<FocalExactRow>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DuplicateFilter {
     /// Restrict detection to duplicates within a single storage ID.
     pub storage_id: Option<String>,
@@ -1252,47 +1292,139 @@ impl Database {
     }
 
     pub fn stats_with_options(&self, split_extenders: bool) -> DbResult<StatsReport> {
+        self.stats_filtered(&StatsFilter {
+            split_extenders,
+            ..Default::default()
+        })
+    }
+
+    pub fn stats_filtered(&self, filter: &StatsFilter) -> DbResult<StatsReport> {
         let st = self.status()?;
+        let has_filter = filter.has_asset_filter();
 
-        let backed_up_contents: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT f.content_id)
-             FROM files f
-             JOIN storages s ON s.id = f.storage_id
-             WHERE f.presence = 'present' AND f.content_id IS NOT NULL AND s.tier = 'backup'",
-            [],
-            |r| r.get(0),
-        )?;
+        let (
+            total_assets,
+            total_contents,
+            total_present_files,
+            total_present_bytes,
+            backed_up_contents,
+            by_format,
+        ) = if !has_filter {
+            let backed_up: i64 = self.conn.query_row(
+                "SELECT COUNT(DISTINCT f.content_id)
+                 FROM files f
+                 JOIN storages s ON s.id = f.storage_id
+                 WHERE f.presence = 'present' AND f.content_id IS NOT NULL AND s.tier = 'backup'",
+                [],
+                |r| r.get(0),
+            )?;
+            let fmt_buckets = self.query_buckets(
+                "SELECT COALESCE(c.format, 'unknown'), COUNT(*), COALESCE(SUM(f.byte_size), 0)
+                 FROM files f
+                 LEFT JOIN contents c ON c.id = f.content_id
+                 WHERE f.presence = 'present'
+                 GROUP BY COALESCE(c.format, 'unknown')
+                 ORDER BY COUNT(*) DESC",
+            )?;
+            (
+                st.total_assets,
+                st.total_contents,
+                st.total_present_files,
+                st.total_present_bytes,
+                backed_up,
+                fmt_buckets,
+            )
+        } else {
+            let mut w = String::from("WHERE 1=1");
+            let mut b: Vec<rusqlite::types::Value> = Vec::new();
+            append_stats_asset_where("a", filter, &mut w, &mut b);
 
-        let by_format = self.query_buckets(
-            "SELECT COALESCE(c.format, 'unknown'), COUNT(*), COALESCE(SUM(f.byte_size), 0)
-             FROM files f
-             LEFT JOIN contents c ON c.id = f.content_id
-             WHERE f.presence = 'present'
-             GROUP BY COALESCE(c.format, 'unknown')
-             ORDER BY COUNT(*) DESC",
-        )?;
+            let total_assets: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM assets a {w}"),
+                rusqlite::params_from_iter(b.clone()),
+                |r| r.get(0),
+            )?;
+            let (total_contents, total_present_files, total_present_bytes): (i64, i64, i64) =
+                self.conn.query_row(
+                    &format!(
+                        "SELECT COUNT(DISTINCT f.content_id), COUNT(*), COALESCE(SUM(f.byte_size), 0)
+                         FROM files f
+                         JOIN assets a ON a.id = f.asset_id
+                         {w} AND f.presence = 'present'"
+                    ),
+                    rusqlite::params_from_iter(b.clone()),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            let backed_up: i64 = self.conn.query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT f.content_id)
+                     FROM files f
+                     JOIN assets a ON a.id = f.asset_id
+                     JOIN storages s ON s.id = f.storage_id
+                     {w} AND f.presence = 'present' AND f.content_id IS NOT NULL AND s.tier = 'backup'"
+                ),
+                rusqlite::params_from_iter(b.clone()),
+                |r| r.get(0),
+            )?;
+            let fmt_buckets = self.query_buckets_with_params(
+                &format!(
+                    "SELECT COALESCE(c.format, 'unknown'), COUNT(*), COALESCE(SUM(f.byte_size), 0)
+                     FROM files f
+                     JOIN assets a ON a.id = f.asset_id
+                     LEFT JOIN contents c ON c.id = f.content_id
+                     {w} AND f.presence = 'present'
+                     GROUP BY COALESCE(c.format, 'unknown')
+                     ORDER BY COUNT(*) DESC"
+                ),
+                b,
+            )?;
+            (
+                total_assets,
+                total_contents,
+                total_present_files,
+                total_present_bytes,
+                backed_up,
+                fmt_buckets,
+            )
+        };
 
-        let by_camera = self.query_buckets(
-            "SELECT COALESCE(a.camera_model, '(unknown)'), COUNT(DISTINCT a.id), 0
-             FROM assets a
-             GROUP BY COALESCE(a.camera_model, '(unknown)')
-             ORDER BY COUNT(DISTINCT a.id) DESC
-             LIMIT 30",
-        )?;
+        let mut asset_where = String::from("WHERE 1=1");
+        let mut asset_binds: Vec<rusqlite::types::Value> = Vec::new();
+        append_stats_asset_where("a", filter, &mut asset_where, &mut asset_binds);
 
-        let by_lens = if !split_extenders {
-            self.query_buckets(
-                "SELECT COALESCE(a.lens_model, '(unknown)'), COUNT(DISTINCT a.id), 0
+        let by_camera = self.query_buckets_with_params(
+            &format!(
+                "SELECT COALESCE(a.camera_model, '(unknown)'), COUNT(DISTINCT a.id), 0
                  FROM assets a
-                 GROUP BY COALESCE(a.lens_model, '(unknown)')
+                 {asset_where}
+                 GROUP BY COALESCE(a.camera_model, '(unknown)')
                  ORDER BY COUNT(DISTINCT a.id) DESC
-                 LIMIT 30",
+                 LIMIT 30"
+            ),
+            asset_binds.clone(),
+        )?;
+
+        let by_lens = if !filter.split_extenders {
+            self.query_buckets_with_params(
+                &format!(
+                    "SELECT COALESCE(a.lens_model, '(unknown)'), COUNT(DISTINCT a.id), 0
+                     FROM assets a
+                     {asset_where}
+                     GROUP BY COALESCE(a.lens_model, '(unknown)')
+                     ORDER BY COUNT(DISTINCT a.id) DESC
+                     LIMIT 30"
+                ),
+                asset_binds,
             )?
         } else {
-            let raw_buckets = self.query_buckets(
-                "SELECT COALESCE(a.lens_model, '(unknown)'), COUNT(DISTINCT a.id), 0
-                 FROM assets a
-                 GROUP BY COALESCE(a.lens_model, '(unknown)')",
+            let raw_buckets = self.query_buckets_with_params(
+                &format!(
+                    "SELECT COALESCE(a.lens_model, '(unknown)'), COUNT(DISTINCT a.id), 0
+                     FROM assets a
+                     {asset_where}
+                     GROUP BY COALESCE(a.lens_model, '(unknown)')"
+                ),
+                asset_binds,
             )?;
             let mut merged: HashMap<String, i64> = HashMap::new();
             for b in raw_buckets {
@@ -1320,10 +1452,10 @@ impl Database {
         };
 
         Ok(StatsReport {
-            total_assets: st.total_assets,
-            total_contents: st.total_contents,
-            total_present_files: st.total_present_files,
-            total_present_bytes: st.total_present_bytes,
+            total_assets,
+            total_contents,
+            total_present_files,
+            total_present_bytes,
             backed_up_contents,
             by_format,
             by_camera,
@@ -1339,23 +1471,37 @@ impl Database {
     }
 
     pub fn stats_by_year_with_options(&self, split_extenders: bool) -> DbResult<Vec<YearStatsRow>> {
-        const YEAR_EXPR: &str = "CASE WHEN captured_at IS NOT NULL AND length(captured_at) >= 10 \
-             AND substr(captured_at, 1, 4) >= '1970' AND substr(captured_at, 1, 4) <= '2999' \
-             THEN substr(captured_at, 1, 4) ELSE '(unknown)' END";
-        const DAY_EXPR: &str = "CASE WHEN captured_at IS NOT NULL AND length(captured_at) >= 10 \
-             AND substr(captured_at, 1, 4) >= '1970' AND substr(captured_at, 1, 4) <= '2999' \
-             THEN substr(captured_at, 1, 10) ELSE NULL END";
+        self.stats_by_year_filtered(&StatsFilter {
+            split_extenders,
+            ..Default::default()
+        })
+    }
+
+    pub fn stats_by_year_filtered(&self, filter: &StatsFilter) -> DbResult<Vec<YearStatsRow>> {
+        const YEAR_EXPR: &str = "CASE WHEN a.captured_at IS NOT NULL AND length(a.captured_at) >= 10 \
+             AND substr(a.captured_at, 1, 4) >= '1970' AND substr(a.captured_at, 1, 4) <= '2999' \
+             THEN substr(a.captured_at, 1, 4) ELSE '(unknown)' END";
+        const DAY_EXPR: &str = "CASE WHEN a.captured_at IS NOT NULL AND length(a.captured_at) >= 10 \
+             AND substr(a.captured_at, 1, 4) >= '1970' AND substr(a.captured_at, 1, 4) <= '2999' \
+             THEN substr(a.captured_at, 1, 10) ELSE NULL END";
+
+        let mut asset_where = String::from("WHERE 1=1");
+        let mut asset_binds: Vec<rusqlite::types::Value> = Vec::new();
+        append_stats_asset_where("a", filter, &mut asset_where, &mut asset_binds);
 
         let mut base_rows: Vec<(String, i64, i64)> = Vec::new();
         {
             let sql = format!(
                 "SELECT {YEAR_EXPR} AS yr, COUNT(*), COUNT(DISTINCT {DAY_EXPR})
-                 FROM assets
+                 FROM assets a
+                 {asset_where}
                  GROUP BY yr
                  ORDER BY CASE WHEN yr = '(unknown)' THEN 1 ELSE 0 END, yr ASC"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds.clone()), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
             for row in rows {
                 base_rows.push(row?);
             }
@@ -1364,13 +1510,13 @@ impl Database {
         let mut top_cam_by_year: HashMap<String, (String, i64)> = HashMap::new();
         {
             let sql = format!(
-                "SELECT {YEAR_EXPR} AS yr, camera_model, COUNT(*)
-                 FROM assets
-                 WHERE camera_model IS NOT NULL
-                 GROUP BY yr, camera_model"
+                "SELECT {YEAR_EXPR} AS yr, a.camera_model, COUNT(*)
+                 FROM assets a
+                 {asset_where} AND a.camera_model IS NOT NULL
+                 GROUP BY yr, a.camera_model"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds.clone()), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             })?;
             for row in rows {
@@ -1390,16 +1536,16 @@ impl Database {
         let mut top_lens_by_year: HashMap<String, (String, i64)> = HashMap::new();
         {
             let sql = format!(
-                "SELECT {YEAR_EXPR} AS yr, lens_model, COUNT(*)
-                 FROM assets
-                 WHERE lens_model IS NOT NULL
-                 GROUP BY yr, lens_model"
+                "SELECT {YEAR_EXPR} AS yr, a.lens_model, COUNT(*)
+                 FROM assets a
+                 {asset_where} AND a.lens_model IS NOT NULL
+                 GROUP BY yr, a.lens_model"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             })?;
-            if !split_extenders {
+            if !filter.split_extenders {
                 for row in rows {
                     let (yr, lens, cnt) = row?;
                     let replace = match top_lens_by_year.get(&yr) {
@@ -1456,24 +1602,36 @@ impl Database {
     }
 
     pub fn gear_history_with_options(&self, split_extenders: bool) -> DbResult<GearHistoryReport> {
-        const VALID_DAY: &str = "CASE WHEN captured_at IS NOT NULL AND length(captured_at) >= 10 \
-             AND substr(captured_at, 1, 4) >= '1970' AND substr(captured_at, 1, 4) <= '2999' \
-             THEN substr(captured_at, 1, 10) ELSE NULL END";
+        self.gear_history_filtered(&StatsFilter {
+            split_extenders,
+            ..Default::default()
+        })
+    }
+
+    pub fn gear_history_filtered(&self, filter: &StatsFilter) -> DbResult<GearHistoryReport> {
+        const VALID_DAY: &str = "CASE WHEN a.captured_at IS NOT NULL AND length(a.captured_at) >= 10 \
+             AND substr(a.captured_at, 1, 4) >= '1970' AND substr(a.captured_at, 1, 4) <= '2999' \
+             THEN substr(a.captured_at, 1, 10) ELSE NULL END";
+
+        let mut asset_where = String::from("WHERE 1=1");
+        let mut asset_binds: Vec<rusqlite::types::Value> = Vec::new();
+        append_stats_asset_where("a", filter, &mut asset_where, &mut asset_binds);
 
         // Compute top partner lens per camera and top partner camera per lens in one pass.
         let mut top_lens_for_cam: HashMap<String, (String, i64)> = HashMap::new();
         let mut top_cam_for_lens: HashMap<String, (String, i64)> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare(
-                "SELECT camera_model, lens_model, COUNT(*)
-                 FROM assets
-                 WHERE camera_model IS NOT NULL AND lens_model IS NOT NULL
-                 GROUP BY camera_model, lens_model",
-            )?;
-            let rows = stmt.query_map([], |r| {
+            let sql = format!(
+                "SELECT a.camera_model, a.lens_model, COUNT(*)
+                 FROM assets a
+                 {asset_where} AND a.camera_model IS NOT NULL AND a.lens_model IS NOT NULL
+                 GROUP BY a.camera_model, a.lens_model"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds.clone()), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             })?;
-            if !split_extenders {
+            if !filter.split_extenders {
                 for row in rows {
                     let (cam, lens, cnt) = row?;
                     let update_cam = match top_lens_for_cam.get(&cam) {
@@ -1537,16 +1695,16 @@ impl Database {
         let mut cameras = Vec::new();
         {
             let sql = format!(
-                "SELECT camera_model, COUNT(*), COUNT(DISTINCT {VALID_DAY}),
+                "SELECT a.camera_model, COUNT(*), COUNT(DISTINCT {VALID_DAY}),
                         MIN({VALID_DAY}), MAX({VALID_DAY})
-                 FROM assets
-                 WHERE camera_model IS NOT NULL
-                 GROUP BY camera_model
+                 FROM assets a
+                 {asset_where} AND a.camera_model IS NOT NULL
+                 GROUP BY a.camera_model
                  ORDER BY CASE WHEN MIN({VALID_DAY}) IS NULL THEN 1 ELSE 0 END,
-                          MIN({VALID_DAY}) ASC, COUNT(*) DESC, camera_model ASC"
+                          MIN({VALID_DAY}) ASC, COUNT(*) DESC, a.camera_model ASC"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds.clone()), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -1570,18 +1728,18 @@ impl Database {
         }
 
         let mut lenses = Vec::new();
-        if !split_extenders {
+        if !filter.split_extenders {
             let sql = format!(
-                "SELECT lens_model, COUNT(*), COUNT(DISTINCT {VALID_DAY}),
+                "SELECT a.lens_model, COUNT(*), COUNT(DISTINCT {VALID_DAY}),
                         MIN({VALID_DAY}), MAX({VALID_DAY})
-                 FROM assets
-                 WHERE lens_model IS NOT NULL
-                 GROUP BY lens_model
+                 FROM assets a
+                 {asset_where} AND a.lens_model IS NOT NULL
+                 GROUP BY a.lens_model
                  ORDER BY CASE WHEN MIN({VALID_DAY}) IS NULL THEN 1 ELSE 0 END,
-                          MIN({VALID_DAY}) ASC, COUNT(*) DESC, lens_model ASC"
+                          MIN({VALID_DAY}) ASC, COUNT(*) DESC, a.lens_model ASC"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -1626,13 +1784,13 @@ impl Database {
             }
 
             let sql = format!(
-                "SELECT lens_model, {VALID_DAY} AS d, COUNT(*)
-                 FROM assets
-                 WHERE lens_model IS NOT NULL
-                 GROUP BY lens_model, d"
+                "SELECT a.lens_model, {VALID_DAY} AS d, COUNT(*)
+                 FROM assets a
+                 {asset_where} AND a.lens_model IS NOT NULL
+                 GROUP BY a.lens_model, d"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
@@ -1673,6 +1831,87 @@ impl Database {
         }
 
         Ok(GearHistoryReport { cameras, lenses })
+    }
+
+    /// Focal-length distribution histogram (range buckets + top exact rounded mm values).
+    pub fn focal_distribution(&self, filter: &StatsFilter) -> DbResult<FocalDistributionReport> {
+        let mut asset_where = String::from("WHERE a.focal_length_mm IS NOT NULL AND a.focal_length_mm > 0");
+        let mut asset_binds: Vec<rusqlite::types::Value> = Vec::new();
+        append_stats_asset_where("a", filter, &mut asset_where, &mut asset_binds);
+
+        let (total_with_focal, min_mm, max_mm, avg_mm): (i64, Option<f64>, Option<f64>, Option<f64>) =
+            self.conn.query_row(
+                &format!(
+                    "SELECT COUNT(*), MIN(a.focal_length_mm), MAX(a.focal_length_mm), AVG(a.focal_length_mm)
+                     FROM assets a
+                     {asset_where}"
+                ),
+                rusqlite::params_from_iter(asset_binds.clone()),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+
+        const BUCKET_DEFS: [(&str, i64, i64); 11] = [
+            ("< 24mm", 0, 23),
+            ("24-35mm", 24, 35),
+            ("36-70mm", 36, 70),
+            ("71-135mm", 71, 135),
+            ("136-200mm", 136, 200),
+            ("201-300mm", 201, 300),
+            ("301-400mm", 301, 400),
+            ("401-500mm", 401, 500),
+            ("501-600mm", 501, 600),
+            ("601-800mm", 601, 800),
+            ("> 800mm", 801, i64::MAX),
+        ];
+        let mut bucket_counts = [0i64; 11];
+        let mut exact_rows: Vec<FocalExactRow> = Vec::new();
+
+        {
+            let sql = format!(
+                "SELECT CAST(ROUND(a.focal_length_mm) AS INTEGER) AS mm, COUNT(*)
+                 FROM assets a
+                 {asset_where}
+                 GROUP BY mm"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (mm, cnt) = row?;
+                for (idx, &(_, lo, hi)) in BUCKET_DEFS.iter().enumerate() {
+                    if mm >= lo && mm <= hi {
+                        bucket_counts[idx] += cnt;
+                        break;
+                    }
+                }
+                exact_rows.push(FocalExactRow {
+                    focal_mm: mm,
+                    count: cnt,
+                });
+            }
+        }
+
+        exact_rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.focal_mm.cmp(&b.focal_mm)));
+        exact_rows.truncate(12);
+
+        let buckets = BUCKET_DEFS
+            .iter()
+            .enumerate()
+            .map(|(idx, &(label, _, _))| FocalBucketRow {
+                label: label.to_string(),
+                count: bucket_counts[idx],
+            })
+            .collect();
+
+        Ok(FocalDistributionReport {
+            total_with_focal,
+            min_mm,
+            max_mm,
+            avg_mm,
+            buckets,
+            top_exact_mm: exact_rows,
+        })
     }
 
     /// Read-only duplicate content detection respecting backup & read-only protection invariants.
@@ -2597,8 +2836,16 @@ impl Database {
     }
 
     fn query_buckets(&self, sql: &str) -> DbResult<Vec<BucketCount>> {
+        self.query_buckets_with_params(sql, Vec::new())
+    }
+
+    fn query_buckets_with_params(
+        &self,
+        sql: &str,
+        bind_values: Vec<rusqlite::types::Value>,
+    ) -> DbResult<Vec<BucketCount>> {
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_values), |r| {
             Ok(BucketCount {
                 label: r.get(0)?,
                 count: r.get(1)?,
@@ -2737,6 +2984,30 @@ fn find_in_batch_sidecar_parent_asset(
         }
     }
     Ok(matched)
+}
+
+fn append_stats_asset_where(
+    alias: &str,
+    filter: &StatsFilter,
+    sql: &mut String,
+    binds: &mut Vec<rusqlite::types::Value>,
+) {
+    if let Some(yr) = &filter.year {
+        sql.push_str(&format!(" AND substr({alias}.captured_at, 1, 4) = ?"));
+        binds.push(yr.clone().into());
+    }
+    if let Some(cam) = &filter.camera {
+        sql.push_str(&format!(
+            " AND LOWER(COALESCE({alias}.camera_model, '')) LIKE LOWER(?)"
+        ));
+        binds.push(format!("%{cam}%").into());
+    }
+    if let Some(lens) = &filter.lens {
+        sql.push_str(&format!(
+            " AND LOWER(COALESCE({alias}.lens_model, '')) LIKE LOWER(?)"
+        ));
+        binds.push(format!("%{lens}%").into());
+    }
 }
 
 fn dir_key(rel_path: &str) -> String {
@@ -4179,5 +4450,22 @@ mod tests {
             .unwrap();
         assert_eq!(wide.len(), 1);
         assert_eq!(wide[0].rel_path, "2025/2025_11_03/IMG_2.JPG");
+
+        // Filtered stats & focal distribution
+        let f_filter = StatsFilter {
+            year: Some("2025".into()),
+            camera: Some("R5m2".into()),
+            ..Default::default()
+        };
+        let f_stats = db.stats_filtered(&f_filter).unwrap();
+        assert_eq!(f_stats.total_assets, 2);
+
+        let f_dist = db.focal_distribution(&f_filter).unwrap();
+        assert_eq!(f_dist.total_with_focal, 2);
+        assert_eq!(f_dist.min_mm, Some(35.0));
+        assert_eq!(f_dist.max_mm, Some(800.0));
+        assert!(f_dist.buckets.iter().any(|b| b.label == "601-800mm" && b.count == 1));
+        assert!(f_dist.buckets.iter().any(|b| b.label == "24-35mm" && b.count == 1));
+        assert!(f_dist.top_exact_mm.iter().any(|e| e.focal_mm == 800 && e.count == 1));
     }
 }

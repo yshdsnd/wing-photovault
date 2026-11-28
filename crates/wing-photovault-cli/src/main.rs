@@ -27,8 +27,12 @@ use wing_photovault_core::model::{
     MediaType, ScanManifestRecord, StorageStatus, StorageTier,
 };
 use wing_photovault_core::scanner::{discover_storage_files, walk_storage_files, DiscoveredFile};
+use wing_photovault_core::timeline_svg::{
+    render_timeline_svg, AnnualBar, TimelineBar, TimelineSvgInput,
+};
 use wing_photovault_db::{
-    Database, DuplicateFilter, FindCursor, FindFilter, ScanRunSummary, UpsertFileInput,
+    Database, DuplicateFilter, FindCursor, FindFilter, FocalDistributionReport, ScanRunSummary,
+    StatsFilter, UpsertFileInput,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -132,28 +136,8 @@ enum Commands {
     /// Show database and storage status
     Status,
 
-    /// Show asset, content, format, camera, lens, and backup statistics
-    Stats {
-        /// Also show percentage share for backup coverage, formats, cameras, and lenses
-        #[arg(long)]
-        percent: bool,
-
-        /// Include yearly asset counts, active shooting days, and top camera/lens per year
-        #[arg(long)]
-        by_year: bool,
-
-        /// Include chronological camera and lens usage timeline (first..last capture dates)
-        #[arg(long)]
-        gear_history: bool,
-
-        /// Show cost per shot for cameras/lenses configured in [stats.camera_prices] / [stats.lens_prices]
-        #[arg(long)]
-        cost_per_shot: bool,
-
-        /// Split lens + teleconverter entries (e.g. "+ EXTENDER RF1.4x") so both parent lens and extender are counted
-        #[arg(long)]
-        split_extenders: bool,
-    },
+    /// Show asset, content, format, camera, lens, focal-length, and backup statistics
+    Stats(Box<StatsArgs>),
 
     /// Detect exact duplicate files (read-only; never flags intentional cross-tier backups)
     Duplicates {
@@ -199,6 +183,57 @@ enum Commands {
         #[arg(long)]
         db_scale: Option<usize>,
     },
+}
+
+#[derive(Debug, Args)]
+struct StatsArgs {
+    /// Also show percentage share for backup coverage, formats, cameras, and lenses
+    #[arg(long)]
+    percent: bool,
+
+    /// Include yearly asset counts, active shooting days, and top camera/lens per year
+    #[arg(long)]
+    by_year: bool,
+
+    /// Include chronological camera and lens usage timeline (first..last capture dates)
+    #[arg(long)]
+    gear_history: bool,
+
+    /// Show cost per shot for cameras/lenses configured in [stats.camera_prices] / [stats.lens_prices]
+    #[arg(long)]
+    cost_per_shot: bool,
+
+    /// Split lens + teleconverter entries (e.g. "+ EXTENDER RF1.4x") so both parent lens and extender are counted
+    #[arg(long)]
+    split_extenders: bool,
+
+    /// Show focal-length distribution histogram and top exact focal lengths (mm)
+    #[arg(long)]
+    focal_dist: bool,
+
+    /// Filter statistics to a specific 4-digit capture year (e.g. 2025)
+    #[arg(long)]
+    year: Option<String>,
+
+    /// Filter statistics by camera model substring (case-insensitive)
+    #[arg(long)]
+    camera: Option<String>,
+
+    /// Filter statistics by lens model substring (case-insensitive)
+    #[arg(long)]
+    lens: Option<String>,
+
+    /// Export a standalone dark-theme SVG camera/lens/extender timeline chart to this path
+    #[arg(long)]
+    export_timeline_svg: Option<PathBuf>,
+
+    /// Minimum shot count for cameras/lenses included in `--export-timeline-svg`
+    #[arg(long, default_value_t = 100)]
+    min_shots: i64,
+
+    /// Exclude camera models matching this substring from `--export-timeline-svg` (repeatable)
+    #[arg(long)]
+    exclude_camera: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -300,23 +335,40 @@ fn main() -> Result<()> {
             cmd_normalize_lenses(&cli.config, dry_run, cli.format)
         }
         Commands::Status => cmd_status(&cli.config, cli.format),
-        Commands::Stats {
-            percent,
-            by_year,
-            gear_history,
-            cost_per_shot,
-            split_extenders,
-        } => cmd_stats(
-            &cli.config,
-            StatsOpts {
-                show_percent: percent,
-                show_by_year: by_year,
-                show_gear_history: gear_history,
-                show_cost_per_shot: cost_per_shot,
+        Commands::Stats(args) => {
+            let StatsArgs {
+                percent,
+                by_year,
+                gear_history,
+                cost_per_shot,
                 split_extenders,
-            },
-            cli.format,
-        ),
+                focal_dist,
+                year,
+                camera,
+                lens,
+                export_timeline_svg,
+                min_shots,
+                exclude_camera,
+            } = *args;
+            cmd_stats(
+                &cli.config,
+                StatsOpts {
+                    show_percent: percent,
+                    show_by_year: by_year,
+                    show_gear_history: gear_history,
+                    show_cost_per_shot: cost_per_shot,
+                    split_extenders,
+                    show_focal_dist: focal_dist,
+                    year,
+                    camera,
+                    lens,
+                    export_timeline_svg,
+                    min_shots,
+                    exclude_camera,
+                },
+                cli.format,
+            )
+        }
         Commands::Duplicates {
             storage,
             include_backups,
@@ -1325,13 +1377,20 @@ fn cmd_status(config_path: &Path, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct StatsOpts {
     show_percent: bool,
     show_by_year: bool,
     show_gear_history: bool,
     show_cost_per_shot: bool,
     split_extenders: bool,
+    show_focal_dist: bool,
+    year: Option<String>,
+    camera: Option<String>,
+    lens: Option<String>,
+    export_timeline_svg: Option<PathBuf>,
+    min_shots: i64,
+    exclude_camera: Vec<String>,
 }
 
 fn calc_percent(part: i64, total: i64) -> f64 {
@@ -1377,8 +1436,9 @@ fn format_stats_text(
     report: &wing_photovault_db::StatsReport,
     by_year: Option<&[wing_photovault_db::YearStatsRow]>,
     gear_history: Option<&wing_photovault_db::GearHistoryReport>,
+    focal_dist: Option<&FocalDistributionReport>,
     stats_cfg: &StatsConfig,
-    opts: StatsOpts,
+    opts: &StatsOpts,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -1391,6 +1451,19 @@ fn format_stats_text(
     };
 
     let mut out = String::new();
+    let mut filter_parts: Vec<String> = Vec::new();
+    if let Some(y) = &opts.year {
+        filter_parts.push(format!("year={y}"));
+    }
+    if let Some(c) = &opts.camera {
+        filter_parts.push(format!("camera~\"{c}\""));
+    }
+    if let Some(l) = &opts.lens {
+        filter_parts.push(format!("lens~\"{l}\""));
+    }
+    if !filter_parts.is_empty() {
+        let _ = writeln!(out, "Filter            : {}", filter_parts.join(", "));
+    }
     let _ = writeln!(out, "Logical Assets    : {}", report.total_assets);
     let _ = writeln!(out, "Unique Contents   : {}", report.total_contents);
     let unbacked = (report.total_contents - report.backed_up_contents).max(0);
@@ -1622,23 +1695,173 @@ fn format_stats_text(
         }
     }
 
+    if let Some(fd) = focal_dist {
+        let _ = writeln!(out, "\nFocal Length Distribution (Assets with EXIF focal length: {}):", fd.total_with_focal);
+        if let (Some(mn), Some(mx), Some(avg)) = (fd.min_mm, fd.max_mm, fd.avg_mm) {
+            let _ = writeln!(out, "  Range: {mn:.0}mm .. {mx:.0}mm  (avg: {avg:.1}mm)");
+        }
+        let max_bucket = fd.buckets.iter().map(|b| b.count).max().unwrap_or(0).max(1);
+        for b in &fd.buckets {
+            if b.count == 0 {
+                continue;
+            }
+            let bar_len = ((b.count as f64 / max_bucket as f64) * 28.0).round() as usize;
+            let bar = "#".repeat(bar_len.max(1));
+            let pct_col = if show_percent {
+                format!(" ({:>6.2}%)", calc_percent(b.count, fd.total_with_focal))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(out, "  - {:<10} {:>8}{}  {}", b.label, b.count, pct_col, bar);
+        }
+        if !fd.top_exact_mm.is_empty() {
+            let _ = writeln!(out, "\nTop Exact Focal Lengths (rounded mm):");
+            for e in &fd.top_exact_mm {
+                let pct_col = if show_percent {
+                    format!(" ({:>6.2}%)", calc_percent(e.count, fd.total_with_focal))
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(out, "  - {:>4}mm     {:>8}{}", e.focal_mm, e.count, pct_col);
+            }
+        }
+    }
+
     out
+}
+
+fn is_extender_label(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("extender ")
+        || lower.starts_with("teleconverter ")
+        || lower.starts_with("tc-")
+        || lower.starts_with("tc ")
 }
 
 fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Result<()> {
     let cfg = load_config_or_default(config_path)?;
-    let db = Database::open(&cfg.general.db_path)?;
-    let report = db.stats_with_options(opts.split_extenders)?;
-    let by_year = if opts.show_by_year {
-        Some(db.stats_by_year_with_options(opts.split_extenders)?)
+    if !cfg.general.db_path.exists() {
+        anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+    }
+    let db = Database::open_read_only(&cfg.general.db_path)?;
+    let filter = StatsFilter {
+        year: opts.year.clone(),
+        camera: opts.camera.clone(),
+        lens: opts.lens.clone(),
+        split_extenders: opts.split_extenders,
+    };
+    let report = db.stats_filtered(&filter)?;
+    let need_year = opts.show_by_year || opts.export_timeline_svg.is_some();
+    let need_gear = opts.show_gear_history || opts.export_timeline_svg.is_some();
+    let by_year = if need_year {
+        Some(db.stats_by_year_filtered(&filter)?)
     } else {
         None
     };
-    let gear_history = if opts.show_gear_history {
-        Some(db.gear_history_with_options(opts.split_extenders)?)
+    let gear_history = if need_gear {
+        Some(db.gear_history_filtered(&filter)?)
     } else {
         None
     };
+    let focal_dist = if opts.show_focal_dist {
+        Some(db.focal_distribution(&filter)?)
+    } else {
+        None
+    };
+
+    let mut svg_written_path: Option<String> = None;
+    if let Some(svg_path) = &opts.export_timeline_svg {
+        let gh = gear_history.as_ref().unwrap();
+        let ys = by_year.as_deref().unwrap_or(&[]);
+        let min_shots = opts.min_shots.max(1);
+        let excluded: Vec<String> = opts
+            .exclude_camera
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+
+        let cameras: Vec<TimelineBar> = gh
+            .cameras
+            .iter()
+            .filter(|c| c.assets >= min_shots && c.first_captured.is_some())
+            .filter(|c| {
+                let lower = c.name.to_ascii_lowercase();
+                !excluded.iter().any(|ex| lower.contains(ex))
+            })
+            .map(|c| TimelineBar {
+                name: c.name.clone(),
+                first_date: c.first_captured.clone().unwrap_or_default(),
+                last_date: c.last_captured.clone().unwrap_or_default(),
+                shots: c.assets,
+                active_days: c.active_days,
+            })
+            .collect();
+
+        let mut lenses: Vec<TimelineBar> = Vec::new();
+        let mut extenders: Vec<TimelineBar> = Vec::new();
+        for l in &gh.lenses {
+            if l.assets < min_shots || l.first_captured.is_none() {
+                continue;
+            }
+            let bar = TimelineBar {
+                name: l.name.clone(),
+                first_date: l.first_captured.clone().unwrap_or_default(),
+                last_date: l.last_captured.clone().unwrap_or_default(),
+                shots: l.assets,
+                active_days: l.active_days,
+            };
+            if opts.split_extenders && is_extender_label(&l.name) {
+                extenders.push(bar);
+            } else {
+                lenses.push(bar);
+            }
+        }
+
+        let annual: Vec<AnnualBar> = ys
+            .iter()
+            .filter_map(|y| {
+                let yr = y.year.parse::<i32>().ok()?;
+                Some(AnnualBar {
+                    year: yr,
+                    shots: y.assets,
+                })
+            })
+            .collect();
+
+        let (min_y, max_y) = annual
+            .iter()
+            .fold((i32::MAX, i32::MIN), |(mn, mx), a| (mn.min(a.year), mx.max(a.year)));
+        let title = if min_y <= max_y {
+            format!("Camera & Lens History ({min_y} - {max_y})")
+        } else {
+            "Camera & Lens History".to_string()
+        };
+        let subtitle = format!(
+            "{} assets / {} files ({})  |  min_shots >= {}{}",
+            report.total_assets,
+            report.total_present_files,
+            human_bytes(report.total_present_bytes.max(0) as u64),
+            min_shots,
+            if opts.split_extenders { "  |  --split-extenders" } else { "" }
+        );
+
+        let svg = render_timeline_svg(&TimelineSvgInput {
+            title,
+            subtitle,
+            cameras,
+            lenses,
+            extenders,
+            annual,
+        });
+        if let Some(parent) = svg_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(svg_path, svg)?;
+        svg_written_path = Some(svg_path.to_string_lossy().into_owned());
+        eprintln!("Exported SVG timeline -> {}", svg_path.display());
+    }
 
     let show_percent = opts.show_percent;
     let show_cost = opts.show_cost_per_shot;
@@ -1649,13 +1872,26 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
         cfg.stats.currency.trim()
     };
 
+    let by_year_out = if opts.show_by_year {
+        by_year.as_deref()
+    } else {
+        None
+    };
+    let gear_history_out = if opts.show_gear_history {
+        gear_history.as_ref()
+    } else {
+        None
+    };
+
     match format {
         OutputFormat::Json | OutputFormat::Jsonl => {
             if !show_percent
                 && !show_cost
                 && !split_extenders
-                && by_year.is_none()
-                && gear_history.is_none()
+                && by_year_out.is_none()
+                && gear_history_out.is_none()
+                && focal_dist.is_none()
+                && svg_written_path.is_none()
             {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1731,6 +1967,10 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                     by_year: Option<Vec<YearStatsJson<'a>>>,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     gear_history: Option<GearHistoryJson<'a>>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    focal_distribution: Option<&'a FocalDistributionReport>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    timeline_svg_path: Option<&'a str>,
                 }
 
                 let enriched = StatsReportExtended {
@@ -1799,7 +2039,7 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                         })
                         .collect(),
                     by_storage: &report.by_storage,
-                    by_year: by_year.as_deref().map(|list| {
+                    by_year: by_year_out.map(|list| {
                         list.iter()
                             .map(|y| YearStatsJson {
                                 year: &y.year,
@@ -1813,7 +2053,7 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                             })
                             .collect()
                     }),
-                    gear_history: gear_history.as_ref().map(|gh| GearHistoryJson {
+                    gear_history: gear_history_out.map(|gh| GearHistoryJson {
                         cameras: gh
                             .cameras
                             .iter()
@@ -1861,6 +2101,8 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                             })
                             .collect(),
                     }),
+                    focal_distribution: focal_dist.as_ref(),
+                    timeline_svg_path: svg_written_path.as_deref(),
                 };
                 println!("{}", serde_json::to_string_pretty(&enriched)?);
             }
@@ -1870,10 +2112,11 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                 "{}",
                 format_stats_text(
                     &report,
-                    by_year.as_deref(),
-                    gear_history.as_ref(),
+                    by_year_out,
+                    gear_history_out,
+                    focal_dist.as_ref(),
                     &cfg.stats,
-                    opts
+                    &opts
                 )
             );
         }
@@ -2814,7 +3057,7 @@ backup_mode = "external"
             .lens_prices
             .insert("RF100-500mm F4.5-7.1 L IS USM".into(), 360_000.0);
 
-        let plain = format_stats_text(&report, None, None, &stats_cfg, StatsOpts::default());
+        let plain = format_stats_text(&report, None, None, None, &stats_cfg, &StatsOpts::default());
         assert!(plain.contains("Backed-up Contents: 150 / 200 (unbacked: 50)\n"));
         assert!(!plain.contains('%'));
         assert!(!plain.contains("JPY/shot"));
@@ -2844,20 +3087,39 @@ backup_mode = "external"
                 top_partner: Some("Canon EOS R5m2".into()),
             }],
         };
+        let fd = FocalDistributionReport {
+            total_with_focal: 50,
+            min_mm: Some(100.0),
+            max_mm: Some(500.0),
+            avg_mm: Some(420.0),
+            buckets: vec![wing_photovault_db::FocalBucketRow {
+                label: "401-500mm".into(),
+                count: 40,
+            }],
+            top_exact_mm: vec![wing_photovault_db::FocalExactRow {
+                focal_mm: 500,
+                count: 35,
+            }],
+        };
 
         let with_pct = format_stats_text(
             &report,
             Some(&yearly),
             Some(&gh),
+            Some(&fd),
             &stats_cfg,
-            StatsOpts {
+            &StatsOpts {
                 show_percent: true,
                 show_by_year: true,
                 show_gear_history: true,
                 show_cost_per_shot: true,
                 split_extenders: true,
+                show_focal_dist: true,
+                year: Some("2025".into()),
+                ..Default::default()
             },
         );
+        assert!(with_pct.contains("Filter            : year=2025"));
         assert!(with_pct.contains("Backed-up Contents: 150 / 200 (75.00%, unbacked: 50)"));
         assert!((calc_backup_percent(400_959, 400_960) - 99.99).abs() < 1e-9);
         assert!((calc_backup_percent(400_960, 400_960) - 100.0).abs() < 1e-9);
@@ -2873,6 +3135,8 @@ backup_mode = "external"
         assert!(with_pct.contains("[8000 JPY/shot]"));
         assert!(with_pct.contains("[7200 JPY/shot]"));
         assert!(with_pct.contains("Cost Per Shot Summary (JPY):"));
+        assert!(with_pct.contains("Focal Length Distribution"));
+        assert!(with_pct.contains("500mm"));
 
         // Zero-division guard on empty DB
         let empty = StatsReport {
@@ -2890,8 +3154,9 @@ backup_mode = "external"
             &empty,
             None,
             None,
+            None,
             &stats_cfg,
-            StatsOpts {
+            &StatsOpts {
                 show_percent: true,
                 show_cost_per_shot: true,
                 ..Default::default()

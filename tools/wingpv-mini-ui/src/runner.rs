@@ -118,6 +118,7 @@ pub fn build_normalize_lenses_args(config_path: &Path, json: bool, dry_run: bool
     args
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_stats_args(
     config_path: &Path,
     json: bool,
@@ -126,6 +127,7 @@ pub fn build_stats_args(
     gear_history: bool,
     cost_per_shot: bool,
     split_extenders: bool,
+    focal_dist: bool,
 ) -> Vec<String> {
     let mut args = build_simple_args(config_path, json, "stats");
     if percent {
@@ -142,6 +144,9 @@ pub fn build_stats_args(
     }
     if split_extenders {
         args.push("--split-extenders".to_string());
+    }
+    if focal_dist {
+        args.push("--focal-dist".to_string());
     }
     args
 }
@@ -509,7 +514,7 @@ mod tests {
             ]
         );
 
-        let stats_args = build_stats_args(cfg, false, true, true, true, true, true);
+        let stats_args = build_stats_args(cfg, false, true, true, true, true, true, true);
         assert_eq!(
             stats_args,
             vec![
@@ -521,6 +526,7 @@ mod tests {
                 "--gear-history",
                 "--cost-per-shot",
                 "--split-extenders",
+                "--focal-dist",
             ]
         );
 
