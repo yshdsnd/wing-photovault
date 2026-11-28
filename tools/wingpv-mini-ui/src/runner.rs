@@ -128,6 +128,7 @@ pub fn build_stats_args(
     cost_per_shot: bool,
     split_extenders: bool,
     focal_dist: bool,
+    focal_35mm: bool,
 ) -> Vec<String> {
     let mut args = build_simple_args(config_path, json, "stats");
     if percent {
@@ -147,6 +148,9 @@ pub fn build_stats_args(
     }
     if focal_dist {
         args.push("--focal-dist".to_string());
+    }
+    if focal_35mm {
+        args.push("--focal-35mm".to_string());
     }
     args
 }
@@ -514,7 +518,7 @@ mod tests {
             ]
         );
 
-        let stats_args = build_stats_args(cfg, false, true, true, true, true, true, true);
+        let stats_args = build_stats_args(cfg, false, true, true, true, true, true, true, true);
         assert_eq!(
             stats_args,
             vec![
@@ -527,6 +531,7 @@ mod tests {
                 "--cost-per-shot",
                 "--split-extenders",
                 "--focal-dist",
+                "--focal-35mm",
             ]
         );
 

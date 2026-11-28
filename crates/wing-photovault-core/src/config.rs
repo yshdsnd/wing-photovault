@@ -174,7 +174,8 @@ impl Default for ExifConfig {
     }
 }
 
-/// Optional fun/personal statistics settings (e.g. purchase prices for `--cost-per-shot`).
+/// Optional fun/personal statistics settings (e.g. purchase prices for `--cost-per-shot`
+/// and sensor crop factors for 35mm-equivalent focal length statistics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsConfig {
     #[serde(default = "default_currency")]
@@ -183,6 +184,8 @@ pub struct StatsConfig {
     pub camera_prices: HashMap<String, f64>,
     #[serde(default)]
     pub lens_prices: HashMap<String, f64>,
+    #[serde(default)]
+    pub camera_crop_factors: HashMap<String, f64>,
 }
 
 impl Default for StatsConfig {
@@ -191,6 +194,7 @@ impl Default for StatsConfig {
             currency: default_currency(),
             camera_prices: HashMap::new(),
             lens_prices: HashMap::new(),
+            camera_crop_factors: HashMap::new(),
         }
     }
 }
@@ -273,6 +277,13 @@ impl Config {
             if !price.is_finite() || price < 0.0 {
                 return Err(CoreError::ConfigInvalid(format!(
                     "stats.lens_prices['{name}'] must be a finite non-negative number"
+                )));
+            }
+        }
+        for (name, &factor) in &self.stats.camera_crop_factors {
+            if !factor.is_finite() || factor <= 0.0 {
+                return Err(CoreError::ConfigInvalid(format!(
+                    "stats.camera_crop_factors['{name}'] must be a finite positive number"
                 )));
             }
         }
@@ -426,6 +437,23 @@ mod tests {
     fn rejects_negative_gear_prices_in_stats_config() {
         let mut stats = StatsConfig::default();
         stats.lens_prices.insert("RF100-500mm".into(), -100.0);
+        let cfg = Config {
+            host: HostConfig::default(),
+            general: GeneralConfig::default(),
+            scan: ScanConfig::default(),
+            hash: HashConfig::default(),
+            performance: PerformanceConfig::default(),
+            exif: ExifConfig::default(),
+            stats,
+            storages: vec![],
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_positive_crop_factor_in_stats_config() {
+        let mut stats = StatsConfig::default();
+        stats.camera_crop_factors.insert("Canon EOS R7".into(), 0.0);
         let cfg = Config {
             host: HostConfig::default(),
             general: GeneralConfig::default(),

@@ -281,6 +281,274 @@ fn normalize_extender_name(parent: &str, ext_raw: &str) -> String {
     }
 }
 
+/// Source used to determine a 35mm-equivalent focal length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focal35Source {
+    /// Explicitly configured in `[stats.camera_crop_factors]`.
+    ConfigCrop,
+    /// Read directly from EXIF `FocalLengthIn35mmFilm` (`0xA405`).
+    Exif35mm,
+    /// Derived from built-in camera sensor crop-factor lookup.
+    BuiltinCrop,
+}
+
+impl Focal35Source {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Focal35Source::ConfigCrop => "config",
+            Focal35Source::Exif35mm => "exif",
+            Focal35Source::BuiltinCrop => "builtin",
+        }
+    }
+}
+
+/// Result of resolving an asset's 35mm-equivalent focal length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Focal35Resolution {
+    pub focal_35mm: f64,
+    pub crop_factor: f64,
+    pub source: Focal35Source,
+}
+
+/// Returns `true` when `crop_factor` represents a 35mm full-frame sensor (~1.0x).
+pub fn is_full_frame_crop(crop_factor: f64) -> bool {
+    (crop_factor - 1.0).abs() < 0.02
+}
+
+/// Resolve an asset's 35mm-equivalent focal length.
+///
+/// Priority (Fail Closed — unknown cameras without EXIF 35mm return `None` rather than guessing `1.0x`):
+/// 1. Explicit `[stats.camera_crop_factors]` override (exact match, then case-insensitive match).
+/// 2. EXIF `focal_length_35mm` when present and positive.
+/// 3. Built-in sensor crop factor table (`infer_camera_crop_factor`).
+pub fn resolve_focal_length_35mm(
+    focal_mm: f64,
+    exif_focal_35mm: Option<f64>,
+    camera_model: Option<&str>,
+    custom_crop_factors: &HashMap<String, f64>,
+) -> Option<Focal35Resolution> {
+    if !focal_mm.is_finite() || focal_mm <= 0.0 {
+        return None;
+    }
+
+    if let Some(cam) = camera_model.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(&factor) = custom_crop_factors.get(cam).or_else(|| {
+            let lower = cam.to_ascii_lowercase();
+            custom_crop_factors
+                .iter()
+                .find(|(k, _)| k.trim().to_ascii_lowercase() == lower)
+                .map(|(_, v)| v)
+        }) {
+            if factor.is_finite() && factor > 0.0 {
+                return Some(Focal35Resolution {
+                    focal_35mm: focal_mm * factor,
+                    crop_factor: factor,
+                    source: Focal35Source::ConfigCrop,
+                });
+            }
+        }
+    }
+
+    if let Some(f35) = exif_focal_35mm {
+        if f35.is_finite() && f35 > 0.0 {
+            return Some(Focal35Resolution {
+                focal_35mm: f35,
+                crop_factor: f35 / focal_mm,
+                source: Focal35Source::Exif35mm,
+            });
+        }
+    }
+
+    if let Some(cam) = camera_model {
+        if let Some(factor) = infer_camera_crop_factor(cam) {
+            return Some(Focal35Resolution {
+                focal_35mm: focal_mm * factor,
+                crop_factor: factor,
+                source: Focal35Source::BuiltinCrop,
+            });
+        }
+    }
+
+    None
+}
+
+fn has_prefix_boundary(s: &str, prefix: &str) -> bool {
+    if let Some(rest) = s.strip_prefix(prefix) {
+        rest.is_empty()
+            || rest.starts_with(' ')
+            || rest.starts_with('-')
+            || rest.starts_with('_')
+            || rest.starts_with('/')
+    } else {
+        false
+    }
+}
+
+/// Infer standard 35mm crop factor from a camera model string when EXIF `FocalLengthIn35mmFilm`
+/// is missing (notably Canon EOS cameras, which never populate EXIF tag `0xA405`).
+pub fn infer_camera_crop_factor(camera_model: &str) -> Option<f64> {
+    let norm: String = camera_model
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    if norm.is_empty() {
+        return None;
+    }
+
+    // 1. Canon EOS bodies
+    if let Some(eos_raw) = norm
+        .strip_prefix("CANON EOS ")
+        .or_else(|| norm.strip_prefix("CANON EOS-"))
+        .or_else(|| norm.strip_prefix("EOS "))
+        .or_else(|| norm.strip_prefix("EOS-"))
+    {
+        let eos = eos_raw.trim();
+
+        // Canon EOS APS-C (1.6x) — check multi-digit R7/R10/R50/R100 before R/R1/R5/R6
+        const CANON_APSC_PREFIXES: &[&str] = &[
+            "R7", "R10", "R50", "R100", "7D", "10D", "20D", "20DA", "30D", "40D", "50D", "60D",
+            "60DA", "70D", "77D", "80D", "90D", "D30", "D60", "100D", "200D", "250D", "300D",
+            "350D", "400D", "450D", "500D", "550D", "600D", "650D", "700D", "750D", "760D", "800D",
+            "850D", "1000D", "1100D", "1200D", "1300D", "1500D", "2000D", "3000D", "4000D",
+            "KISS", "REBEL", "DIGITAL REBEL", "M", "M2", "M3", "M5", "M6", "M10", "M50", "M100",
+            "M200",
+        ];
+        if CANON_APSC_PREFIXES
+            .iter()
+            .any(|p| has_prefix_boundary(eos, p))
+        {
+            return Some(1.6);
+        }
+
+        // Canon EOS Full Frame (1.0x)
+        const CANON_FF_PREFIXES: &[&str] = &[
+            "R", "RP", "R1", "R3", "R5", "R5M2", "R5C", "R6", "R6M2", "R8", "5D", "5DS", "6D",
+            "1DS", "1D X", "1DX", "1D C", "1DC",
+        ];
+        if CANON_FF_PREFIXES
+            .iter()
+            .any(|p| has_prefix_boundary(eos, p))
+        {
+            return Some(1.0);
+        }
+
+        // Canon EOS-1D (APS-H 1.3x: 1D, 1D Mark II/IIN/III/IV)
+        if has_prefix_boundary(eos, "1D") {
+            return Some(1.3);
+        }
+    }
+
+    // 2. Nikon bodies
+    if let Some(nk) = norm.strip_prefix("NIKON ").map(str::trim) {
+        const NIKON_APSC: &[&str] = &[
+            "Z 30", "Z30", "Z 50", "Z50", "Z FC", "ZFC", "D1", "D1H", "D1X", "D2H", "D2HS", "D2X",
+            "D2XS", "D40", "D40X", "D50", "D60", "D70", "D70S", "D80", "D90", "D100", "D200",
+            "D300", "D300S", "D500", "D3000", "D3100", "D3200", "D3300", "D3400", "D3500", "D5000",
+            "D5100", "D5200", "D5300", "D5500", "D5600", "D7000", "D7100", "D7200", "D7500",
+        ];
+        if NIKON_APSC.iter().any(|p| has_prefix_boundary(nk, p)) {
+            return Some(1.5);
+        }
+        const NIKON_FF: &[&str] = &[
+            "Z 5", "Z5", "Z 6", "Z6", "Z 6_2", "Z6_2", "Z 6_3", "Z6_3", "Z 7", "Z7", "Z 7_2",
+            "Z7_2", "Z 8", "Z8", "Z 9", "Z9", "Z F", "ZF", "D3", "D3S", "D3X", "D4", "D4S", "D5",
+            "D6", "D600", "D610", "D700", "D750", "D780", "D800", "D800E", "D810", "D810A", "D850",
+            "DF",
+        ];
+        if NIKON_FF.iter().any(|p| has_prefix_boundary(nk, p)) {
+            return Some(1.0);
+        }
+    }
+
+    // 3. Sony Alpha / NEX
+    if norm.starts_with("ILCE-6")
+        || norm.starts_with("ILCE-5")
+        || norm.starts_with("ILCE-3")
+        || norm.starts_with("NEX-")
+        || norm.starts_with("ZV-E10")
+        || norm.starts_with("ILME-FX30")
+    {
+        return Some(1.5);
+    }
+    if norm.starts_with("ILCE-7")
+        || norm.starts_with("ILCE-9")
+        || norm.starts_with("ILCE-1")
+        || has_prefix_boundary(&norm, "ZV-E1")
+        || norm.starts_with("DSC-RX1")
+        || has_prefix_boundary(&norm, "DSLR-A850")
+        || has_prefix_boundary(&norm, "DSLR-A900")
+        || norm.starts_with("SLT-A99")
+    {
+        return Some(1.0);
+    }
+
+    // 4. Fujifilm / Medium Format / Micro Four Thirds / Leica / Panasonic FF
+    if norm.starts_with("GFX") || norm.starts_with("X1D") || norm.starts_with("X2D") {
+        return Some(0.79);
+    }
+    if norm == "MAMIYA ZD" {
+        return Some(0.72);
+    }
+    if norm.starts_with("X-T")
+        || norm.starts_with("X-H")
+        || norm.starts_with("X-PRO")
+        || norm.starts_with("X-E")
+        || norm.starts_with("X-S")
+        || norm.starts_with("X-M")
+        || norm.starts_with("X100")
+        || norm.starts_with("GR III")
+        || norm == "GR II"
+        || norm == "GR"
+    {
+        return Some(1.5);
+    }
+    if norm.starts_with("OM-1")
+        || norm.starts_with("OM-5")
+        || norm.starts_with("E-M1")
+        || norm.starts_with("E-M5")
+        || norm.starts_with("E-M10")
+        || norm.starts_with("PEN-F")
+        || norm.starts_with("E-PL")
+        || norm.starts_with("DC-G9")
+        || norm.starts_with("DC-GH")
+        || norm.starts_with("DMC-G")
+        || norm.starts_with("DMC-GH")
+        || norm.starts_with("DMC-GX")
+        || norm.starts_with("DMC-GM")
+        || norm.starts_with("DMC-GF")
+    {
+        return Some(2.0);
+    }
+    if norm.starts_with("DC-S1")
+        || norm.starts_with("DC-S5")
+        || has_prefix_boundary(&norm, "DC-S9")
+        || norm.starts_with("LEICA M")
+        || norm.starts_with("LEICA SL")
+        || norm.starts_with("LEICA Q")
+        || norm.starts_with("SIGMA FP")
+    {
+        return Some(1.0);
+    }
+
+    // 5. Notable fixed-lens compacts (fallback only when EXIF FocalLengthIn35mmFilm is absent)
+    match norm.as_str() {
+        "DMC-FZ1" => Some(7.61),
+        "DIMAGE X" => Some(6.49),
+        "CANON IXY DIGITAL 910 IS" | "CANON POWERSHOT SD870 IS" | "CANON DIGITAL IXUS 860 IS" => {
+            Some(6.08)
+        }
+        "CANON DIGITAL IXUS 40" | "CANON IXY DIGITAL 50" | "CANON POWERSHOT SD300" => Some(6.03),
+        "CANON IXY DIGITAL 500" | "CANON POWERSHOT S500" | "CANON DIGITAL IXUS 500" => Some(4.86),
+        "CANON POWERSHOT G3" => Some(4.87),
+        "FINEPIX F30" => Some(4.50),
+        "FINEPIX4500" => Some(4.14),
+        "DSC-F828" => Some(3.93),
+        "DSC-P150" => Some(4.81),
+        _ => None,
+    }
+}
+
 /// Fast Rust-native EXIF extraction for JPEG, CR2/TIFF, Canon CR3 (ISOBMFF CMT1/CMT2),
 /// and Canon CRW via companion `.THM` (standard JPEG EXIF sidecar).
 pub fn extract_native(path: &Path, ext: &str) -> Option<ExtractedMetadata> {
@@ -1176,5 +1444,56 @@ mod tests {
             split_lens_extender("Some Lens + Hood"),
             ("Some Lens + Hood".to_string(), None)
         );
+    }
+
+    #[test]
+    fn infers_camera_crop_factors_and_resolves_35mm_equivalent() {
+        // Canon Full Frame (1.0x)
+        assert_eq!(infer_camera_crop_factor("Canon EOS R5m2"), Some(1.0));
+        assert_eq!(infer_camera_crop_factor("Canon EOS R6m2"), Some(1.0));
+        assert_eq!(infer_camera_crop_factor("Canon EOS 6D Mark II"), Some(1.0));
+        assert_eq!(infer_camera_crop_factor("Canon EOS R"), Some(1.0));
+        assert_eq!(infer_camera_crop_factor("Canon EOS-1Ds Mark III"), Some(1.0));
+
+        // Canon APS-C (1.6x) & APS-H (1.3x)
+        assert_eq!(infer_camera_crop_factor("Canon EOS R7"), Some(1.6));
+        assert_eq!(infer_camera_crop_factor("Canon EOS R10"), Some(1.6));
+        assert_eq!(infer_camera_crop_factor("Canon EOS 7D Mark II"), Some(1.6));
+        assert_eq!(infer_camera_crop_factor("Canon EOS 90D"), Some(1.6));
+        assert_eq!(infer_camera_crop_factor("Canon EOS 10D"), Some(1.6));
+        assert_eq!(infer_camera_crop_factor("Canon EOS-1D Mark II"), Some(1.3));
+
+        // Nikon / Sony / MFT / Medium Format / Compacts
+        assert_eq!(infer_camera_crop_factor("NIKON D3"), Some(1.0));
+        assert_eq!(infer_camera_crop_factor("NIKON D80"), Some(1.5));
+        assert_eq!(infer_camera_crop_factor("NIKON Z 50"), Some(1.5));
+        assert_eq!(infer_camera_crop_factor("NIKON Z 8"), Some(1.0));
+        assert_eq!(infer_camera_crop_factor("ILCE-7"), Some(1.0));
+        assert_eq!(infer_camera_crop_factor("ILCE-6700"), Some(1.5));
+        assert_eq!(infer_camera_crop_factor("OM-1"), Some(2.0));
+        assert_eq!(infer_camera_crop_factor("MAMIYA ZD"), Some(0.72));
+        assert_eq!(infer_camera_crop_factor("DiMAGE X"), Some(6.49));
+        assert_eq!(infer_camera_crop_factor("Unknown Mystery Cam"), None);
+
+        // Priority: ConfigCrop > Exif35mm > BuiltinCrop
+        let empty = HashMap::new();
+        let r7 = resolve_focal_length_35mm(500.0, None, Some("Canon EOS R7"), &empty).unwrap();
+        assert_eq!(r7.source, Focal35Source::BuiltinCrop);
+        assert!((r7.focal_35mm - 800.0).abs() < 1e-6);
+        assert!(!is_full_frame_crop(r7.crop_factor));
+
+        let fz1 = resolve_focal_length_35mm(55.2, Some(420.0), Some("DMC-FZ1"), &empty).unwrap();
+        assert_eq!(fz1.source, Focal35Source::Exif35mm);
+        assert!((fz1.focal_35mm - 420.0).abs() < 1e-6);
+
+        let mut custom = HashMap::new();
+        custom.insert("Unknown Mystery Cam".to_string(), 2.7);
+        let cust = resolve_focal_length_35mm(10.0, Some(30.0), Some("Unknown Mystery Cam"), &custom)
+            .unwrap();
+        assert_eq!(cust.source, Focal35Source::ConfigCrop);
+        assert!((cust.focal_35mm - 27.0).abs() < 1e-6);
+
+        // Fail Closed: unknown camera without EXIF 35mm returns None
+        assert!(resolve_focal_length_35mm(10.0, None, Some("Unknown Mystery Cam"), &empty).is_none());
     }
 }

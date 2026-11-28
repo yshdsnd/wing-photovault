@@ -7,7 +7,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
 use wing_photovault_core::config::StorageConfig;
-use wing_photovault_core::metadata::{resolve_lens_alias, split_lens_extender};
+use wing_photovault_core::metadata::{
+    is_full_frame_crop, resolve_focal_length_35mm, resolve_lens_alias, split_lens_extender,
+    Focal35Source,
+};
 use wing_photovault_core::model::{
     sidecar_parent_stem, ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, ScanManifestRecord,
     StorageStatus,
@@ -178,6 +181,30 @@ pub struct FocalExactRow {
     pub count: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CameraCropSummary {
+    pub camera: String,
+    pub crop_factor: f64,
+    pub source: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Focal35DistributionReport {
+    pub resolved_count: i64,
+    pub converted_non_ff_count: i64,
+    pub exif_35mm_count: i64,
+    pub crop_calculated_count: i64,
+    pub unresolved_count: i64,
+    pub unresolved_cameras: Vec<String>,
+    pub applied_crop_factors: Vec<CameraCropSummary>,
+    pub min_mm: Option<f64>,
+    pub max_mm: Option<f64>,
+    pub avg_mm: Option<f64>,
+    pub buckets: Vec<FocalBucketRow>,
+    pub top_exact_mm: Vec<FocalExactRow>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FocalDistributionReport {
     pub total_with_focal: i64,
@@ -186,6 +213,8 @@ pub struct FocalDistributionReport {
     pub avg_mm: Option<f64>,
     pub buckets: Vec<FocalBucketRow>,
     pub top_exact_mm: Vec<FocalExactRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equiv_35mm: Option<Focal35DistributionReport>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -339,6 +368,8 @@ pub struct FindRow {
     pub camera_model: Option<String>,
     pub lens_model: Option<String>,
     pub focal_length_mm: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focal_length_35mm: Option<f64>,
     pub f_number: Option<f64>,
     pub shutter_speed_str: Option<String>,
     pub iso: Option<i64>,
@@ -1833,24 +1864,18 @@ impl Database {
         Ok(GearHistoryReport { cameras, lenses })
     }
 
-    /// Focal-length distribution histogram (range buckets + top exact rounded mm values).
+    /// Focal-length distribution histogram (actual mm + 35mm-equivalent using EXIF/crop factors).
     pub fn focal_distribution(&self, filter: &StatsFilter) -> DbResult<FocalDistributionReport> {
-        let mut asset_where = String::from("WHERE a.focal_length_mm IS NOT NULL AND a.focal_length_mm > 0");
-        let mut asset_binds: Vec<rusqlite::types::Value> = Vec::new();
-        append_stats_asset_where("a", filter, &mut asset_where, &mut asset_binds);
+        self.focal_distribution_with_crops(filter, &HashMap::new())
+    }
 
-        let (total_with_focal, min_mm, max_mm, avg_mm): (i64, Option<f64>, Option<f64>, Option<f64>) =
-            self.conn.query_row(
-                &format!(
-                    "SELECT COUNT(*), MIN(a.focal_length_mm), MAX(a.focal_length_mm), AVG(a.focal_length_mm)
-                     FROM assets a
-                     {asset_where}"
-                ),
-                rusqlite::params_from_iter(asset_binds.clone()),
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
-
-        const BUCKET_DEFS: [(&str, i64, i64); 11] = [
+    /// Focal-length distribution histogram (actual mm + 35mm-equivalent with optional custom crop overrides).
+    pub fn focal_distribution_with_crops(
+        &self,
+        filter: &StatsFilter,
+        custom_crop_factors: &HashMap<String, f64>,
+    ) -> DbResult<FocalDistributionReport> {
+        const BUCKET_DEFS: [(&str, i64, i64); 12] = [
             ("< 24mm", 0, 23),
             ("24-35mm", 24, 35),
             ("36-70mm", 36, 70),
@@ -1861,56 +1886,198 @@ impl Database {
             ("401-500mm", 401, 500),
             ("501-600mm", 501, 600),
             ("601-800mm", 601, 800),
-            ("> 800mm", 801, i64::MAX),
+            ("801-1200mm", 801, 1200),
+            ("> 1200mm", 1201, i64::MAX),
         ];
-        let mut bucket_counts = [0i64; 11];
-        let mut exact_rows: Vec<FocalExactRow> = Vec::new();
+
+        let mut asset_where =
+            String::from("WHERE a.focal_length_mm IS NOT NULL AND a.focal_length_mm > 0");
+        let mut asset_binds: Vec<rusqlite::types::Value> = Vec::new();
+        append_stats_asset_where("a", filter, &mut asset_where, &mut asset_binds);
+
+        let mut total_with_focal = 0i64;
+        let mut actual_sum = 0.0f64;
+        let mut actual_min: Option<f64> = None;
+        let mut actual_max: Option<f64> = None;
+        let mut actual_buckets = [0i64; 12];
+        let mut actual_exact_map: HashMap<i64, i64> = HashMap::new();
+
+        let mut eq_resolved = 0i64;
+        let mut eq_non_ff = 0i64;
+        let mut eq_exif = 0i64;
+        let mut eq_crop = 0i64;
+        let mut eq_unresolved = 0i64;
+        let mut eq_sum = 0.0f64;
+        let mut eq_min: Option<f64> = None;
+        let mut eq_max: Option<f64> = None;
+        let mut eq_buckets = [0i64; 12];
+        let mut eq_exact_map: HashMap<i64, i64> = HashMap::new();
+        let mut unresolved_cams: HashSet<String> = HashSet::new();
+        // (camera_name, source) -> (weighted_crop_sum, count)
+        let mut non_ff_crops: HashMap<(String, &'static str), (f64, i64)> = HashMap::new();
 
         {
             let sql = format!(
-                "SELECT CAST(ROUND(a.focal_length_mm) AS INTEGER) AS mm, COUNT(*)
+                "SELECT a.camera_model, a.focal_length_mm, a.focal_length_35mm, COUNT(*)
                  FROM assets a
                  {asset_where}
-                 GROUP BY mm"
+                 GROUP BY a.camera_model, a.focal_length_mm, a.focal_length_35mm"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(asset_binds), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, Option<f64>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
             })?;
             for row in rows {
-                let (mm, cnt) = row?;
+                let (cam_opt, focal_mm, exif_35_opt, cnt) = row?;
+                if !focal_mm.is_finite() || focal_mm <= 0.0 || cnt <= 0 {
+                    continue;
+                }
+
+                // Actual focal length accumulation
+                total_with_focal += cnt;
+                actual_sum += focal_mm * (cnt as f64);
+                actual_min = Some(actual_min.map_or(focal_mm, |m| m.min(focal_mm)));
+                actual_max = Some(actual_max.map_or(focal_mm, |m| m.max(focal_mm)));
+                let mm_round = focal_mm.round() as i64;
                 for (idx, &(_, lo, hi)) in BUCKET_DEFS.iter().enumerate() {
-                    if mm >= lo && mm <= hi {
-                        bucket_counts[idx] += cnt;
+                    if mm_round >= lo && mm_round <= hi {
+                        actual_buckets[idx] += cnt;
                         break;
                     }
                 }
-                exact_rows.push(FocalExactRow {
-                    focal_mm: mm,
-                    count: cnt,
-                });
+                *actual_exact_map.entry(mm_round).or_insert(0) += cnt;
+
+                // 35mm-equivalent resolution
+                match resolve_focal_length_35mm(
+                    focal_mm,
+                    exif_35_opt,
+                    cam_opt.as_deref(),
+                    custom_crop_factors,
+                ) {
+                    Some(res) => {
+                        eq_resolved += cnt;
+                        eq_sum += res.focal_35mm * (cnt as f64);
+                        eq_min = Some(eq_min.map_or(res.focal_35mm, |m| m.min(res.focal_35mm)));
+                        eq_max = Some(eq_max.map_or(res.focal_35mm, |m| m.max(res.focal_35mm)));
+                        let mm35_round = res.focal_35mm.round() as i64;
+                        for (idx, &(_, lo, hi)) in BUCKET_DEFS.iter().enumerate() {
+                            if mm35_round >= lo && mm35_round <= hi {
+                                eq_buckets[idx] += cnt;
+                                break;
+                            }
+                        }
+                        *eq_exact_map.entry(mm35_round).or_insert(0) += cnt;
+
+                        match res.source {
+                            Focal35Source::Exif35mm => eq_exif += cnt,
+                            Focal35Source::ConfigCrop | Focal35Source::BuiltinCrop => eq_crop += cnt,
+                        }
+
+                        if !is_full_frame_crop(res.crop_factor) {
+                            eq_non_ff += cnt;
+                            let cam_label = cam_opt
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let entry = non_ff_crops
+                                .entry((cam_label, res.source.as_str()))
+                                .or_insert((0.0, 0));
+                            entry.0 += res.crop_factor * (cnt as f64);
+                            entry.1 += cnt;
+                        }
+                    }
+                    None => {
+                        eq_unresolved += cnt;
+                        if let Some(c) = cam_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            unresolved_cams.insert(c.to_string());
+                        } else {
+                            unresolved_cams.insert("(no camera model)".to_string());
+                        }
+                    }
+                }
             }
         }
 
-        exact_rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.focal_mm.cmp(&b.focal_mm)));
-        exact_rows.truncate(12);
+        let to_top_exact = |map: HashMap<i64, i64>| -> Vec<FocalExactRow> {
+            let mut v: Vec<FocalExactRow> = map
+                .into_iter()
+                .map(|(focal_mm, count)| FocalExactRow { focal_mm, count })
+                .collect();
+            v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.focal_mm.cmp(&b.focal_mm)));
+            v.truncate(12);
+            v
+        };
+        let to_buckets = |counts: [i64; 12]| -> Vec<FocalBucketRow> {
+            BUCKET_DEFS
+                .iter()
+                .enumerate()
+                .map(|(idx, &(label, _, _))| FocalBucketRow {
+                    label: label.to_string(),
+                    count: counts[idx],
+                })
+                .collect()
+        };
 
-        let buckets = BUCKET_DEFS
-            .iter()
-            .enumerate()
-            .map(|(idx, &(label, _, _))| FocalBucketRow {
-                label: label.to_string(),
-                count: bucket_counts[idx],
+        let avg_mm = if total_with_focal > 0 {
+            Some(actual_sum / (total_with_focal as f64))
+        } else {
+            None
+        };
+
+        let equiv_35mm = if eq_resolved > 0 || eq_unresolved > 0 {
+            let mut applied_crop_factors: Vec<CameraCropSummary> = non_ff_crops
+                .into_iter()
+                .map(|((camera, source), (weighted_sum, count))| CameraCropSummary {
+                    camera,
+                    crop_factor: ((weighted_sum / (count as f64)) * 100.0).round() / 100.0,
+                    source: source.to_string(),
+                    count,
+                })
+                .collect();
+            applied_crop_factors
+                .sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.camera.cmp(&b.camera)));
+
+            let mut unresolved_cameras: Vec<String> = unresolved_cams.into_iter().collect();
+            unresolved_cameras.sort();
+            unresolved_cameras.truncate(10);
+
+            Some(Focal35DistributionReport {
+                resolved_count: eq_resolved,
+                converted_non_ff_count: eq_non_ff,
+                exif_35mm_count: eq_exif,
+                crop_calculated_count: eq_crop,
+                unresolved_count: eq_unresolved,
+                unresolved_cameras,
+                applied_crop_factors,
+                min_mm: eq_min,
+                max_mm: eq_max,
+                avg_mm: if eq_resolved > 0 {
+                    Some(eq_sum / (eq_resolved as f64))
+                } else {
+                    None
+                },
+                buckets: to_buckets(eq_buckets),
+                top_exact_mm: to_top_exact(eq_exact_map),
             })
-            .collect();
+        } else {
+            None
+        };
 
         Ok(FocalDistributionReport {
             total_with_focal,
-            min_mm,
-            max_mm,
+            min_mm: actual_min,
+            max_mm: actual_max,
             avg_mm,
-            buckets,
-            top_exact_mm: exact_rows,
+            buckets: to_buckets(actual_buckets),
+            top_exact_mm: to_top_exact(actual_exact_map),
+            equiv_35mm,
         })
     }
 
@@ -2193,7 +2360,7 @@ impl Database {
             "SELECT f.id, f.asset_id, a.public_id, f.storage_id, f.rel_path,
                     COALESCE(c.format, f.ext), f.byte_size,
                     a.captured_at, a.camera_model, a.lens_model,
-                    a.focal_length_mm, a.f_number, a.shutter_speed_str, a.iso,
+                    a.focal_length_mm, a.focal_length_35mm, a.f_number, a.shutter_speed_str, a.iso,
                     a.duration_ms, a.fps
              FROM files f
              LEFT JOIN contents c ON c.id = f.content_id
@@ -2301,11 +2468,12 @@ impl Database {
                 camera_model: r.get(8)?,
                 lens_model: r.get(9)?,
                 focal_length_mm: r.get(10)?,
-                f_number: r.get(11)?,
-                shutter_speed_str: r.get(12)?,
-                iso: r.get(13)?,
-                duration_ms: r.get(14)?,
-                fps: r.get(15)?,
+                focal_length_35mm: r.get(11)?,
+                f_number: r.get(12)?,
+                shutter_speed_str: r.get(13)?,
+                iso: r.get(14)?,
+                duration_ms: r.get(15)?,
+                fps: r.get(16)?,
             })
         })?;
 
@@ -4467,5 +4635,99 @@ mod tests {
         assert!(f_dist.buckets.iter().any(|b| b.label == "601-800mm" && b.count == 1));
         assert!(f_dist.buckets.iter().any(|b| b.label == "24-35mm" && b.count == 1));
         assert!(f_dist.top_exact_mm.iter().any(|e| e.focal_mm == 800 && e.count == 1));
+        // Full-frame R5m2 has 0 non-FF conversions
+        let eq = f_dist.equiv_35mm.as_ref().unwrap();
+        assert_eq!(eq.resolved_count, 2);
+        assert_eq!(eq.converted_non_ff_count, 0);
+        assert_eq!(eq.unresolved_count, 0);
+    }
+
+    #[test]
+    fn focal_distribution_computes_35mm_equivalent_for_non_full_frame_cameras() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("h1", "Host", "windows").unwrap();
+        let st = StorageConfig {
+            id: "ssd_hot".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Ssd,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&st, "h1", StorageStatus::Online).unwrap();
+        let run = db.start_scan_run("ssd_hot", "full").unwrap();
+
+        let mk_cam = |name: &str, hash: &str, cam: &str, focal: f64, f35: Option<f64>| UpsertFileInput {
+            storage_id: "ssd_hot".into(),
+            rel_path: format!("2025/{name}"),
+            file_name: name.into(),
+            file_stem: name.trim_end_matches(".JPG").into(),
+            ext: ".jpg".into(),
+            byte_size: 1000,
+            mtime_ns: 1,
+            ctime_ns: None,
+            media_kind: MediaKind::Image,
+            format: "jpeg".into(),
+            role: FileRole::Original,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: Some(ExtractedMetadata {
+                extractor: "native".into(),
+                captured_at: Some("2025-11-03T10:00:00".into()),
+                camera_model: Some(cam.into()),
+                focal_length_mm: Some(focal),
+                focal_length_35mm: f35,
+                ..Default::default()
+            }),
+        };
+
+        db.upsert_scanned_batch(
+            &[
+                // Canon APS-C 1.6x: 500mm -> 800mm eq (no EXIF 35mm)
+                mk_cam("A1.JPG", "h1", "Canon EOS R7", 500.0, None),
+                // Canon APS-C 1.6x: 800mm -> 1280mm eq (bucket > 1200mm)
+                mk_cam("A2.JPG", "h2", "Canon EOS R7", 800.0, None),
+                // Canon Full Frame 1.0x: 500mm -> 500mm eq
+                mk_cam("A3.JPG", "h3", "Canon EOS R5m2", 500.0, None),
+                // Compact with EXIF 35mm: 55.2mm -> 420mm eq
+                mk_cam("A4.JPG", "h4", "DMC-FZ1", 55.2, Some(420.0)),
+                // Unknown camera without EXIF 35mm -> unresolved by default
+                mk_cam("A5.JPG", "h5", "MysteryCam X1", 10.0, None),
+            ],
+            run,
+        )
+        .unwrap();
+
+        let dist = db.focal_distribution(&StatsFilter::default()).unwrap();
+        assert_eq!(dist.total_with_focal, 5);
+        let eq = dist.equiv_35mm.as_ref().unwrap();
+        assert_eq!(eq.resolved_count, 4);
+        assert_eq!(eq.converted_non_ff_count, 3); // 2 R7 + 1 DMC-FZ1
+        assert_eq!(eq.exif_35mm_count, 1);
+        assert_eq!(eq.crop_calculated_count, 3);
+        assert_eq!(eq.unresolved_count, 1);
+        assert_eq!(eq.unresolved_cameras, vec!["MysteryCam X1".to_string()]);
+        assert_eq!(eq.min_mm, Some(420.0));
+        assert_eq!(eq.max_mm, Some(1280.0));
+        assert!(eq.buckets.iter().any(|b| b.label == "> 1200mm" && b.count == 1));
+        assert!(eq.buckets.iter().any(|b| b.label == "601-800mm" && b.count == 1));
+        assert!(eq
+            .applied_crop_factors
+            .iter()
+            .any(|c| c.camera == "Canon EOS R7" && (c.crop_factor - 1.6).abs() < 0.01 && c.count == 2));
+
+        // With custom crop factor override for MysteryCam X1 (3.5x -> 35mm eq)
+        let mut custom = HashMap::new();
+        custom.insert("MysteryCam X1".to_string(), 3.5);
+        let dist2 = db
+            .focal_distribution_with_crops(&StatsFilter::default(), &custom)
+            .unwrap();
+        let eq2 = dist2.equiv_35mm.as_ref().unwrap();
+        assert_eq!(eq2.resolved_count, 5);
+        assert_eq!(eq2.unresolved_count, 0);
+        assert_eq!(eq2.min_mm, Some(35.0));
     }
 }

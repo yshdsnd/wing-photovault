@@ -55,6 +55,12 @@ currency = "JPY"
 # "RF100-500mm F4.5-7.1 L IS USM" = 360000
 # "EF100-400mm f/4.5-5.6L IS II USM" = 250000
 
+[stats.camera_crop_factors]
+# 35mm換算焦点距離 (`wingpv stats --focal-dist` / `--focal-35mm`) の任意上書き
+# 未設定のカメラは EXIF FocalLengthIn35mmFilm または内蔵センサー係数 (Canon APS-C 1.6x 等) を自動使用
+# "Canon EOS R7" = 1.6
+# "DiMAGE X" = 6.49
+
 # 複数ストレージ定義（同一階層に複数ドライブ登録可能、UNCパス対応）
 # access_mode: "managed" | "read_only"
 # backup_mode: "none" | "managed" | "external"

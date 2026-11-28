@@ -21,7 +21,9 @@ use wing_photovault_core::copy::{
     safe_join_rel_path, verified_copy_file, CopyStatus, VerifiedCopyResult,
 };
 use wing_photovault_core::hashing::hash_file;
-use wing_photovault_core::metadata::{apply_lens_aliases, extract_native, MetadataSession};
+use wing_photovault_core::metadata::{
+    apply_lens_aliases, extract_native, resolve_focal_length_35mm, MetadataSession,
+};
 use wing_photovault_core::model::{
     current_host_os, is_sidecar_extension, AccessMode, BackupMode, FileRole, HashAlgorithm,
     MediaType, ScanManifestRecord, StorageStatus, StorageTier,
@@ -207,9 +209,13 @@ struct StatsArgs {
     #[arg(long)]
     split_extenders: bool,
 
-    /// Show focal-length distribution histogram and top exact focal lengths (mm)
+    /// Show focal-length distribution histogram and top exact focal lengths (mm); automatically adds 35mm equivalent when non-full-frame cameras are present
     #[arg(long)]
     focal_dist: bool,
+
+    /// Show 35mm-equivalent focal-length distribution (using EXIF 35mm, built-in crop factors, and [stats.camera_crop_factors])
+    #[arg(long)]
+    focal_35mm: bool,
 
     /// Filter statistics to a specific 4-digit capture year (e.g. 2025)
     #[arg(long)]
@@ -343,6 +349,7 @@ fn main() -> Result<()> {
                 cost_per_shot,
                 split_extenders,
                 focal_dist,
+                focal_35mm,
                 year,
                 camera,
                 lens,
@@ -359,6 +366,7 @@ fn main() -> Result<()> {
                     show_cost_per_shot: cost_per_shot,
                     split_extenders,
                     show_focal_dist: focal_dist,
+                    show_focal_35mm: focal_35mm,
                     year,
                     camera,
                     lens,
@@ -1385,6 +1393,7 @@ struct StatsOpts {
     show_cost_per_shot: bool,
     split_extenders: bool,
     show_focal_dist: bool,
+    show_focal_35mm: bool,
     year: Option<String>,
     camera: Option<String>,
     lens: Option<String>,
@@ -1696,33 +1705,111 @@ fn format_stats_text(
     }
 
     if let Some(fd) = focal_dist {
-        let _ = writeln!(out, "\nFocal Length Distribution (Assets with EXIF focal length: {}):", fd.total_with_focal);
-        if let (Some(mn), Some(mx), Some(avg)) = (fd.min_mm, fd.max_mm, fd.avg_mm) {
-            let _ = writeln!(out, "  Range: {mn:.0}mm .. {mx:.0}mm  (avg: {avg:.1}mm)");
-        }
-        let max_bucket = fd.buckets.iter().map(|b| b.count).max().unwrap_or(0).max(1);
-        for b in &fd.buckets {
-            if b.count == 0 {
-                continue;
+        if opts.show_focal_dist {
+            let _ = writeln!(
+                out,
+                "\nFocal Length Distribution (Actual mm, Assets with EXIF focal length: {}):",
+                fd.total_with_focal
+            );
+            if let (Some(mn), Some(mx), Some(avg)) = (fd.min_mm, fd.max_mm, fd.avg_mm) {
+                let _ = writeln!(out, "  Range: {mn:.0}mm .. {mx:.0}mm  (avg: {avg:.1}mm)");
             }
-            let bar_len = ((b.count as f64 / max_bucket as f64) * 28.0).round() as usize;
-            let bar = "#".repeat(bar_len.max(1));
-            let pct_col = if show_percent {
-                format!(" ({:>6.2}%)", calc_percent(b.count, fd.total_with_focal))
-            } else {
-                String::new()
-            };
-            let _ = writeln!(out, "  - {:<10} {:>8}{}  {}", b.label, b.count, pct_col, bar);
-        }
-        if !fd.top_exact_mm.is_empty() {
-            let _ = writeln!(out, "\nTop Exact Focal Lengths (rounded mm):");
-            for e in &fd.top_exact_mm {
+            let max_bucket = fd.buckets.iter().map(|b| b.count).max().unwrap_or(0).max(1);
+            for b in &fd.buckets {
+                if b.count == 0 {
+                    continue;
+                }
+                let bar_len = ((b.count as f64 / max_bucket as f64) * 28.0).round() as usize;
+                let bar = "#".repeat(bar_len.max(1));
                 let pct_col = if show_percent {
-                    format!(" ({:>6.2}%)", calc_percent(e.count, fd.total_with_focal))
+                    format!(" ({:>6.2}%)", calc_percent(b.count, fd.total_with_focal))
                 } else {
                     String::new()
                 };
-                let _ = writeln!(out, "  - {:>4}mm     {:>8}{}", e.focal_mm, e.count, pct_col);
+                let _ = writeln!(out, "  - {:<10} {:>8}{}  {}", b.label, b.count, pct_col, bar);
+            }
+            if !fd.top_exact_mm.is_empty() {
+                let _ = writeln!(out, "\nTop Exact Focal Lengths (rounded mm):");
+                for e in &fd.top_exact_mm {
+                    let pct_col = if show_percent {
+                        format!(" ({:>6.2}%)", calc_percent(e.count, fd.total_with_focal))
+                    } else {
+                        String::new()
+                    };
+                    let _ = writeln!(out, "  - {:>4}mm     {:>8}{}", e.focal_mm, e.count, pct_col);
+                }
+            }
+        }
+
+        if let Some(eq) = &fd.equiv_35mm {
+            if opts.show_focal_35mm || eq.converted_non_ff_count > 0 {
+                let _ = writeln!(
+                    out,
+                    "\nFocal Length Distribution (35mm Equivalent, resolved: {} / {}, non-FF converted: {}):",
+                    eq.resolved_count, fd.total_with_focal, eq.converted_non_ff_count
+                );
+                if let (Some(mn), Some(mx), Some(avg)) = (eq.min_mm, eq.max_mm, eq.avg_mm) {
+                    let _ = writeln!(out, "  Range: {mn:.0}mm .. {mx:.0}mm  (avg: {avg:.1}mm eq)");
+                }
+                let max_bucket = eq.buckets.iter().map(|b| b.count).max().unwrap_or(0).max(1);
+                for b in &eq.buckets {
+                    if b.count == 0 {
+                        continue;
+                    }
+                    let bar_len = ((b.count as f64 / max_bucket as f64) * 28.0).round() as usize;
+                    let bar = "#".repeat(bar_len.max(1));
+                    let pct_col = if show_percent {
+                        format!(" ({:>6.2}%)", calc_percent(b.count, eq.resolved_count))
+                    } else {
+                        String::new()
+                    };
+                    let _ = writeln!(out, "  - {:<10} {:>8}{}  {}", b.label, b.count, pct_col, bar);
+                }
+                if !eq.top_exact_mm.is_empty() {
+                    let _ = writeln!(out, "\nTop Exact 35mm-Equivalent Focal Lengths (rounded mm):");
+                    for e in &eq.top_exact_mm {
+                        let pct_col = if show_percent {
+                            format!(" ({:>6.2}%)", calc_percent(e.count, eq.resolved_count))
+                        } else {
+                            String::new()
+                        };
+                        let _ = writeln!(out, "  - {:>4}mm eq  {:>8}{}", e.focal_mm, e.count, pct_col);
+                    }
+                }
+                if !eq.applied_crop_factors.is_empty() {
+                    let _ = writeln!(out, "\nNon-Full-Frame Crop Factors Applied:");
+                    for c in eq.applied_crop_factors.iter().take(12) {
+                        let _ = writeln!(
+                            out,
+                            "  - {:<28} {:>5.2}x  ({:<7} {:>8} assets)",
+                            c.camera,
+                            c.crop_factor,
+                            format!("{},", c.source),
+                            c.count
+                        );
+                    }
+                    if eq.applied_crop_factors.len() > 12 {
+                        let _ = writeln!(
+                            out,
+                            "  ... and {} more non-FF camera(s)",
+                            eq.applied_crop_factors.len() - 12
+                        );
+                    }
+                }
+                if eq.unresolved_count > 0 {
+                    let _ = writeln!(
+                        out,
+                        "  Note: {} asset(s) excluded from 35mm eq (unknown crop factor: {}; set [stats.camera_crop_factors] to include)",
+                        eq.unresolved_count,
+                        eq.unresolved_cameras.join(", ")
+                    );
+                }
+            } else if opts.show_focal_dist && eq.resolved_count > 0 {
+                let _ = writeln!(
+                    out,
+                    "\n35mm Equivalent: all {} resolved asset(s) are Full Frame (1.0x)",
+                    eq.resolved_count
+                );
             }
         }
     }
@@ -1763,8 +1850,8 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
     } else {
         None
     };
-    let focal_dist = if opts.show_focal_dist {
-        Some(db.focal_distribution(&filter)?)
+    let focal_dist = if opts.show_focal_dist || opts.show_focal_35mm {
+        Some(db.focal_distribution_with_crops(&filter, &cfg.stats.camera_crop_factors)?)
     } else {
         None
     };
@@ -2211,7 +2298,19 @@ fn cmd_find(
         anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
     }
     let db = Database::open_read_only(&cfg.general.db_path)?;
-    let page = db.find_page(&filter)?;
+    let mut page = db.find_page(&filter)?;
+    for row in &mut page.items {
+        if let Some(fl) = row.focal_length_mm {
+            if let Some(res) = resolve_focal_length_35mm(
+                fl,
+                row.focal_length_35mm,
+                row.camera_model.as_deref(),
+                &cfg.stats.camera_crop_factors,
+            ) {
+                row.focal_length_35mm = Some((res.focal_35mm * 10.0).round() / 10.0);
+            }
+        }
+    }
 
     if let Some(dest_dir) = exec_opts.copy_to.as_deref() {
         return run_verified_copy_to(
@@ -3100,6 +3199,31 @@ backup_mode = "external"
                 focal_mm: 500,
                 count: 35,
             }],
+            equiv_35mm: Some(wing_photovault_db::Focal35DistributionReport {
+                resolved_count: 50,
+                converted_non_ff_count: 10,
+                exif_35mm_count: 0,
+                crop_calculated_count: 50,
+                unresolved_count: 0,
+                unresolved_cameras: vec![],
+                applied_crop_factors: vec![wing_photovault_db::CameraCropSummary {
+                    camera: "Canon EOS R7".into(),
+                    crop_factor: 1.6,
+                    source: "builtin".into(),
+                    count: 10,
+                }],
+                min_mm: Some(100.0),
+                max_mm: Some(800.0),
+                avg_mm: Some(480.0),
+                buckets: vec![wing_photovault_db::FocalBucketRow {
+                    label: "601-800mm".into(),
+                    count: 10,
+                }],
+                top_exact_mm: vec![wing_photovault_db::FocalExactRow {
+                    focal_mm: 800,
+                    count: 10,
+                }],
+            }),
         };
 
         let with_pct = format_stats_text(
@@ -3137,6 +3261,9 @@ backup_mode = "external"
         assert!(with_pct.contains("Cost Per Shot Summary (JPY):"));
         assert!(with_pct.contains("Focal Length Distribution"));
         assert!(with_pct.contains("500mm"));
+        assert!(with_pct.contains("Focal Length Distribution (35mm Equivalent"));
+        assert!(with_pct.contains("800mm eq"));
+        assert!(with_pct.contains("Canon EOS R7"));
 
         // Zero-division guard on empty DB
         let empty = StatsReport {

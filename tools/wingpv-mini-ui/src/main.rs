@@ -99,6 +99,7 @@ struct MiniUiApp {
     stats_cost_per_shot: bool,
     stats_split_extenders: bool,
     stats_focal_dist: bool,
+    stats_focal_35mm: bool,
     duplicates_include_backups: bool,
     confirm_normalize_apply: bool,
     find_params: FindParams,
@@ -156,6 +157,7 @@ impl MiniUiApp {
             stats_cost_per_shot: false,
             stats_split_extenders: false,
             stats_focal_dist: false,
+            stats_focal_35mm: false,
             duplicates_include_backups: false,
             confirm_normalize_apply: false,
             find_params: FindParams::default(),
@@ -768,6 +770,7 @@ impl MiniUiApp {
             ui.checkbox(&mut self.stats_cost_per_shot, "--cost-per-shot");
             ui.checkbox(&mut self.stats_split_extenders, "--split-extenders");
             ui.checkbox(&mut self.stats_focal_dist, "--focal-dist");
+            ui.checkbox(&mut self.stats_focal_35mm, "--focal-35mm");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {
@@ -789,6 +792,7 @@ impl MiniUiApp {
                         self.stats_cost_per_shot,
                         self.stats_split_extenders,
                         self.stats_focal_dist,
+                        self.stats_focal_35mm,
                     );
                     self.run_cli(ctx, args);
                 }
