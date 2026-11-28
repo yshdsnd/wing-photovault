@@ -3348,4 +3348,34 @@ mod tests {
         assert_eq!(ext14.first_captured.as_deref(), Some("2025-05-01"));
         assert_eq!(ext14.last_captured.as_deref(), Some("2025-05-02"));
     }
+
+    #[test]
+    fn sidecar_parent_lookup_uses_storage_presence_stem_index() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT asset_id, rel_path
+                 FROM files
+                 WHERE file_stem IN (?1, ?2, ?3)
+                   AND storage_id = ?4
+                   AND presence = 'present'
+                   AND role != 'sidecar'
+                   AND asset_id IS NOT NULL",
+            )
+            .unwrap();
+        let details: Vec<String> = stmt
+            .query_map(params!["IMG_0001", "IMG_0001", "img_0001", "nas"], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = details.join("\n");
+        assert!(
+            plan.contains("idx_files_storage_presence_stem"),
+            "expected idx_files_storage_presence_stem in query plan, got:\n{plan}"
+        );
+    }
 }

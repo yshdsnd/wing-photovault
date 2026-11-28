@@ -2,7 +2,7 @@
 
 - Last Updated: 2026-11-28
 - Current Phase: **Phase 1（読み取り専用インデックス・検索・統計・ベンチマーク・NAS マニフェスト連携）**
-- Branch: `main`（全 26 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
+- Branch: `main`（全 27 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
 
@@ -21,9 +21,10 @@
 - マニフェスト入力検証（`ScanManifestRecord::validate`: `..` パストラバーサル・不正ハッシュ拒否）
 
 ### DB (`crates/wing-photovault-db`)
-- SQLite WAL（`rusqlite` bundled）＋前方マイグレーション（**Schema v2** 適用済み）
+- SQLite WAL（`rusqlite` bundled）＋前方マイグレーション（**Schema v3** 適用済み）
   - v1: `storages`, `assets`, `contents`, `content_metadata`, `scan_runs`, `files`
   - v2: `hosts`, `storage_mounts`, `storages` 権限/状態/障害ドメイン、`assets.public_id`（UUIDv7）、`files.last_seen_at` / `last_verified_at`、ストレージ状態（`online`/`offline`/`failed`/`retired`）とファイル存在状態（`present`/`missing`/`corrupted`）の完全分離
+  - v3: `idx_files_storage_presence_stem(storage_id, presence, file_stem)` 複合インデックス（大規模ストレージでのサイドカー親 Asset 検索・RAW+JPEG 統合を O(log N) 化）
 - 差分スキャン（未変更ファイルは `last_seen_at` のみ更新し `last_verified_at` を保持）
 - RAW + JPEG 論理 Asset 統合（同一フォルダ＋兄弟 `RAW/`・`JPEG/` フォルダ対応、曖昧時は非統合）
   - O(1) バッチ内ペアリング（途中中断してもコミット済み分は統合済み）＋スキャン末尾の冪等スイープ

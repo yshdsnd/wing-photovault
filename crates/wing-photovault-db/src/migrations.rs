@@ -10,6 +10,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "v2_multihost_permissions_and_verification",
         V2_MULTIHOST_PERMISSIONS_AND_VERIFICATION,
     ),
+    (
+        3,
+        "v3_storage_presence_stem_index",
+        V3_STORAGE_PRESENCE_STEM_INDEX,
+    ),
 ];
 
 const V1_INITIAL_SCHEMA: &str = r#"
@@ -177,6 +182,13 @@ UPDATE files SET presence = 'present' WHERE presence = 'offline';
 
 CREATE INDEX IF NOT EXISTS idx_assets_captured_id ON assets(captured_at DESC, id ASC);
 CREATE INDEX IF NOT EXISTS idx_files_last_verified ON files(storage_id, last_verified_at);
+"#;
+
+const V3_STORAGE_PRESENCE_STEM_INDEX: &str = r#"
+-- Composite index so in-batch sidecar parent lookup and RAW+JPEG stem lookup
+-- use O(log N) B-tree probes instead of scanning all present files in a storage.
+CREATE INDEX IF NOT EXISTS idx_files_storage_presence_stem
+    ON files(storage_id, presence, file_stem);
 "#;
 
 pub fn run_migrations(conn: &mut Connection) -> DbResult<()> {

@@ -695,7 +695,8 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
             drop(done_tx);
 
             // Stage 3: Batched SQLite writer, JSONL exporter, and HDD cooldown controller
-            let mut unchanged_batch: Vec<i64> = Vec::with_capacity(batch_size);
+            let mut unchanged_batch: Vec<i64> = Vec::with_capacity(batch_size.max(5_000));
+            let unchanged_batch_cap = batch_size.max(5_000);
             let mut batch_inputs: Vec<UpsertFileInput> = Vec::with_capacity(batch_size);
             let mut processed_since_cooldown: usize = 0;
             let mut processed_total: u64 = 0;
@@ -710,7 +711,7 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
                         PipelineMsg::Unchanged(file_id) => {
                             summary.files_skipped += 1;
                             unchanged_batch.push(file_id);
-                            if unchanged_batch.len() >= batch_size {
+                            if unchanged_batch.len() >= unchanged_batch_cap {
                                 db.touch_unchanged_files(&unchanged_batch, scan_run_id)?;
                                 unchanged_batch.clear();
                             }
@@ -816,9 +817,16 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
         if !truncated_by_max_files.load(Ordering::Acquire) {
             summary.files_missing = db.mark_unseen_as_missing(&storage.id, scan_run_id)?;
         }
-        let pair_report = db.pair_raw_jpeg_assets(&storage.id)?;
+        let needs_post_sweep =
+            mode == "full" || summary.files_added > 0 || summary.files_updated > 0;
+        let (pair_report, sidecar_report) = if needs_post_sweep {
+            let pr = db.pair_raw_jpeg_assets(&storage.id)?;
+            let sr = db.link_sidecar_files(&storage.id)?;
+            (pr, sr)
+        } else {
+            (Default::default(), Default::default())
+        };
         summary.raw_jpeg_merged = pair_report.pairs_merged;
-        let sidecar_report = db.link_sidecar_files(&storage.id)?;
         db.finish_scan_run(&summary, None)?;
 
         info!(
