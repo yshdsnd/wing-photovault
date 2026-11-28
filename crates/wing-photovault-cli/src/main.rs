@@ -21,6 +21,9 @@ use wing_photovault_core::copy::{
     safe_join_rel_path, verified_copy_file, CopyStatus, VerifiedCopyResult,
 };
 use wing_photovault_core::hashing::hash_file;
+use wing_photovault_core::ingest::{
+    build_ingest_rel_path, sanitize_subdir_suffix, IngestDateLayout,
+};
 use wing_photovault_core::metadata::{
     apply_lens_aliases, extract_native, resolve_focal_length_35mm, MetadataSession,
 };
@@ -32,6 +35,7 @@ use wing_photovault_core::scanner::{discover_storage_files, walk_storage_files, 
 use wing_photovault_core::timeline_svg::{
     render_timeline_svg, AnnualBar, TimelineBar, TimelineSvgInput,
 };
+use wing_photovault_core::volume::{verify_volume_identity, VolumeCheck};
 use wing_photovault_db::{
     Database, DerivativeLinkOptions, DuplicateFilter, FindCursor, FindFilter,
     FocalDistributionReport, JournalEntryInput, JournalFilter, ScanRunSummary, StatsFilter,
@@ -231,6 +235,32 @@ enum Commands {
         /// Maximum number of entries to display (0 = unlimited)
         #[arg(long, default_value_t = 50)]
         limit: usize,
+    },
+
+    /// Safely ingest new photos/videos from temporary removable media (SD / CFexpress card) into a managed storage (card is read-only and never registered in storages)
+    Ingest {
+        /// Source directory on the memory card (read-only; never mutated or deleted)
+        source: PathBuf,
+
+        /// Destination managed storage ID configured in the TOML file (e.g. ssd_hot_g)
+        #[arg(long)]
+        to: String,
+
+        /// Folder layout under destination root: YYYY/YYYY_MM_DD (default), YYYY/MM/YYYY_MM_DD, YYYY-MM-DD, or flat
+        #[arg(long, default_value = "YYYY/YYYY_MM_DD")]
+        date_layout: String,
+
+        /// Optional safe folder suffix appended to the date folder (e.g. haneda -> 2026/2026_11_28_haneda/)
+        #[arg(long)]
+        subdir: Option<String>,
+
+        /// Also ingest sidecar files (.xmp, .thm) from the card
+        #[arg(long)]
+        include_sidecars: bool,
+
+        /// Preview ingest plan without creating directories, copying files, or modifying DB/journal
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Benchmark scanning/hashing/EXIF on a directory, or SQLite query/aggregation scale via `--db-scale <N>`
@@ -578,6 +608,26 @@ fn main() -> Result<()> {
             },
             cli.format,
         ),
+        Commands::Ingest {
+            source,
+            to,
+            date_layout,
+            subdir,
+            include_sidecars,
+            dry_run,
+        } => cmd_ingest(
+            &cli.config,
+            IngestOpts {
+                source: &source,
+                dst_storage_id: &to,
+                date_layout_raw: &date_layout,
+                subdir: subdir.as_deref(),
+                include_sidecars,
+                dry_run,
+                quiet: cli.quiet,
+            },
+            cli.format,
+        ),
         Commands::Benchmark {
             path,
             limit,
@@ -781,6 +831,41 @@ fn cmd_scan(config_path: &Path, opts: ScanOpts<'_>) -> Result<()> {
             );
             db.upsert_storage(storage, &cfg.host.id, StorageStatus::Offline)?;
             continue;
+        }
+
+        let expected_vid = storage
+            .volume_id
+            .clone()
+            .or_else(|| db.get_storage_volume_id(&storage.id).ok().flatten());
+        match verify_volume_identity(&storage.root, expected_vid.as_deref()) {
+            VolumeCheck::Matched(_) => {}
+            VolumeCheck::Unconstrained { detected } => {
+                if let Some(vid) = detected {
+                    db.upsert_storage(storage, &cfg.host.id, StorageStatus::Online)?;
+                    db.set_storage_volume_id(&storage.id, &vid)?;
+                }
+            }
+            VolumeCheck::MissingMarker { expected } => {
+                warn!(
+                    storage_id = %storage.id,
+                    root = %storage.root.display(),
+                    expected_volume_id = %expected,
+                    "volume_id marker missing on removable storage (Fail Closed); skipping without marking files missing"
+                );
+                db.upsert_storage(storage, &cfg.host.id, StorageStatus::Offline)?;
+                continue;
+            }
+            VolumeCheck::Mismatch { expected, found } => {
+                warn!(
+                    storage_id = %storage.id,
+                    root = %storage.root.display(),
+                    expected_volume_id = %expected,
+                    found_volume_id = %found,
+                    "wrong removable volume mounted (Fail Closed); skipping without marking files missing"
+                );
+                db.upsert_storage(storage, &cfg.host.id, StorageStatus::Offline)?;
+                continue;
+            }
         }
 
         db.upsert_storage(storage, &cfg.host.id, StorageStatus::Online)?;
@@ -2684,6 +2769,65 @@ fn cmd_verify(config_path: &Path, opts: VerifyOpts<'_>, format: OutputFormat) ->
             continue;
         }
 
+        let expected_vid = storage
+            .volume_id
+            .clone()
+            .or_else(|| db.get_storage_volume_id(&storage.id).ok().flatten());
+        match verify_volume_identity(&storage.root, expected_vid.as_deref()) {
+            VolumeCheck::Matched(_) | VolumeCheck::Unconstrained { .. } => {}
+            VolumeCheck::MissingMarker { expected } => {
+                if !opts.dry_run {
+                    db.upsert_storage(storage, &cfg.host.id, StorageStatus::Offline)?;
+                }
+                warn!(
+                    storage_id = %storage.id,
+                    expected_volume_id = %expected,
+                    "volume_id marker missing (Fail Closed); skipping verify"
+                );
+                reports.push(VerifyStorageReport {
+                    storage_id: storage.id.clone(),
+                    skipped_offline: true,
+                    dry_run: opts.dry_run,
+                    checked: 0,
+                    ok: 0,
+                    corrupted: 0,
+                    modified: 0,
+                    missing: 0,
+                    io_errors: 0,
+                    bytes_read: 0,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    anomalies: Vec::new(),
+                });
+                continue;
+            }
+            VolumeCheck::Mismatch { expected, found } => {
+                if !opts.dry_run {
+                    db.upsert_storage(storage, &cfg.host.id, StorageStatus::Offline)?;
+                }
+                warn!(
+                    storage_id = %storage.id,
+                    expected_volume_id = %expected,
+                    found_volume_id = %found,
+                    "wrong removable volume mounted (Fail Closed); skipping verify"
+                );
+                reports.push(VerifyStorageReport {
+                    storage_id: storage.id.clone(),
+                    skipped_offline: true,
+                    dry_run: opts.dry_run,
+                    checked: 0,
+                    ok: 0,
+                    corrupted: 0,
+                    modified: 0,
+                    missing: 0,
+                    io_errors: 0,
+                    bytes_read: 0,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    anomalies: Vec::new(),
+                });
+                continue;
+            }
+        }
+
         if !opts.dry_run {
             db.upsert_storage(storage, &cfg.host.id, StorageStatus::Online)?;
         }
@@ -3027,6 +3171,461 @@ fn cmd_journal(config_path: &Path, filter: JournalFilter, format: OutputFormat) 
     Ok(())
 }
 
+struct IngestOpts<'a> {
+    source: &'a Path,
+    dst_storage_id: &'a str,
+    date_layout_raw: &'a str,
+    subdir: Option<&'a str>,
+    include_sidecars: bool,
+    dry_run: bool,
+    quiet: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IngestItemResult {
+    src_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dst_rel_path: Option<String>,
+    byte_size: u64,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IngestReport {
+    dry_run: bool,
+    source: String,
+    dst_storage_id: String,
+    discovered: u64,
+    copied: u64,
+    would_copy: u64,
+    skipped_in_catalog: u64,
+    skipped_identical: u64,
+    conflicts: u64,
+    errors: u64,
+    bytes_copied: u64,
+    raw_jpeg_merged: u64,
+    sidecars_linked: u64,
+    elapsed_ms: u128,
+    items: Vec<IngestItemResult>,
+}
+
+fn cmd_ingest(config_path: &Path, opts: IngestOpts<'_>, format: OutputFormat) -> Result<()> {
+    let started = Instant::now();
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("failed to load config: {}", config_path.display()))?;
+
+    let layout = IngestDateLayout::parse(opts.date_layout_raw)
+        .map_err(|msg| anyhow::anyhow!(msg))?;
+    let subdir_clean = match opts.subdir {
+        Some(raw) => {
+            let s = sanitize_subdir_suffix(raw).map_err(|msg| anyhow::anyhow!(msg))?;
+            if s.is_empty() { None } else { Some(s) }
+        }
+        None => None,
+    };
+
+    if !opts.source.is_dir() {
+        anyhow::bail!("ingest source directory does not exist: {}", opts.source.display());
+    }
+
+    let Some(dst_storage) = cfg.storages.iter().find(|s| s.id == opts.dst_storage_id) else {
+        anyhow::bail!(
+            "destination storage '{}' is not configured in {}",
+            opts.dst_storage_id,
+            config_path.display()
+        );
+    };
+
+    // Fail Closed: never ingest into read_only, backup tier, or external backup storages.
+    if !dst_storage.allows_mutation() || dst_storage.tier == StorageTier::Backup {
+        anyhow::bail!(
+            "refusing to ingest into storage '{}' (tier={}, access_mode={}, backup_mode={}): destination must be a writable non-backup storage",
+            dst_storage.id,
+            dst_storage.tier,
+            dst_storage.access_mode,
+            dst_storage.backup_mode
+        );
+    }
+    if !dst_storage.root.is_dir() {
+        anyhow::bail!(
+            "destination storage '{}' root is offline/inaccessible: {}",
+            dst_storage.id,
+            dst_storage.root.display()
+        );
+    }
+
+    let mut db = if opts.dry_run {
+        if !cfg.general.db_path.exists() {
+            anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+        }
+        Database::open_read_only(&cfg.general.db_path)?
+    } else {
+        let db = Database::open(&cfg.general.db_path)?;
+        db.upsert_host(&cfg.host.id, &cfg.host.name, current_host_os())?;
+        db
+    };
+
+    // Enforce volume_id identity on destination storage if configured/recorded
+    let expected_vid = dst_storage
+        .volume_id
+        .clone()
+        .or_else(|| db.get_storage_volume_id(&dst_storage.id).ok().flatten());
+    match verify_volume_identity(&dst_storage.root, expected_vid.as_deref()) {
+        VolumeCheck::Matched(_) | VolumeCheck::Unconstrained { .. } => {}
+        VolumeCheck::MissingMarker { expected } => {
+            anyhow::bail!(
+                "destination storage '{}' is missing .wing-volume-id marker (expected '{}'); refusing ingest (Fail Closed)",
+                dst_storage.id,
+                expected
+            );
+        }
+        VolumeCheck::Mismatch { expected, found } => {
+            anyhow::bail!(
+                "destination storage '{}' has wrong volume mounted (expected '{}', found '{}'); refusing ingest (Fail Closed)",
+                dst_storage.id,
+                expected,
+                found
+            );
+        }
+    }
+
+    // Ensure destination storage row exists in DB before inserting journal entries (FK constraint)
+    if !opts.dry_run {
+        db.upsert_storage(dst_storage, &cfg.host.id, StorageStatus::Online)?;
+    }
+
+    // Build read-only ephemeral walker config (NEVER registered in `storages` table!)
+    let card_walker_cfg = StorageConfig {
+        id: "__ephemeral_ingest_card__".to_string(),
+        root: opts.source.to_path_buf(),
+        media: MediaType::Removable,
+        tier: StorageTier::Inbox,
+        access_mode: AccessMode::ReadOnly,
+        backup_mode: BackupMode::None,
+        failure_domain: None,
+        volume_id: None,
+        exclude_paths: Vec::new(),
+    };
+    let allowed_exts = cfg.normalized_extensions();
+    let discovery = discover_storage_files(&card_walker_cfg, &allowed_exts, false);
+    let card_files: Vec<DiscoveredFile> = discovery
+        .files
+        .into_iter()
+        .filter(|f| opts.include_sidecars || !is_sidecar_extension(&f.ext))
+        .collect();
+
+    let total = card_files.len() as u64;
+    let pb = if opts.quiet || total == 0 {
+        ProgressBar::hidden()
+    } else {
+        let p = ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr());
+        p.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] ingest {pos}/{len} ({percent}%) {msg}",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        p
+    };
+
+    let meta_session = MetadataSession::new(cfg.exif.clone());
+    let op_group_id = format!("ingest-{}", chrono::Utc::now().timestamp_millis());
+    let mut report = IngestReport {
+        dry_run: opts.dry_run,
+        source: opts.source.to_string_lossy().into_owned(),
+        dst_storage_id: dst_storage.id.clone(),
+        discovered: total,
+        copied: 0,
+        would_copy: 0,
+        skipped_in_catalog: 0,
+        skipped_identical: 0,
+        conflicts: 0,
+        errors: discovery.errors.len() as u64,
+        bytes_copied: 0,
+        raw_jpeg_merged: 0,
+        sidecars_linked: 0,
+        elapsed_ms: 0,
+        items: Vec::new(),
+    };
+
+    let mut ingested_inputs: Vec<UpsertFileInput> = Vec::new();
+    let mut seen_hashes_this_run: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for f in card_files {
+        pb.inc(1);
+        let src_str = f.abs_path.to_string_lossy().into_owned();
+        let hash = match hash_file(
+            &f.abs_path,
+            cfg.hash.algorithm,
+            cfg.hash.partial_hash_enabled,
+        ) {
+            Ok(h) => h,
+            Err(err) => {
+                report.errors += 1;
+                report.items.push(IngestItemResult {
+                    src_path: src_str,
+                    dst_rel_path: None,
+                    byte_size: f.byte_size,
+                    status: "error".into(),
+                    detail: Some(err.to_string()),
+                });
+                continue;
+            }
+        };
+
+        // Duplicate content skip: if already present anywhere in catalog (or already copied in this run), skip!
+        let already_in_db = db.has_present_content_hash(hash.algorithm, &hash.hash_hex)?;
+        if already_in_db || !seen_hashes_this_run.insert(hash.hash_hex.clone()) {
+            report.skipped_in_catalog += 1;
+            report.items.push(IngestItemResult {
+                src_path: src_str,
+                dst_rel_path: None,
+                byte_size: f.byte_size,
+                status: "skipped_in_catalog".into(),
+                detail: Some("content hash already present in catalog".into()),
+            });
+            continue;
+        }
+
+        let is_sidecar = is_sidecar_extension(&f.ext);
+        let meta = if is_sidecar {
+            None
+        } else {
+            meta_session.extract(&f.abs_path, &f.ext)
+        };
+        let captured_at = meta.as_ref().and_then(|m| m.captured_at.as_deref());
+        let dst_rel_path = build_ingest_rel_path(
+            layout,
+            captured_at,
+            f.mtime_ns,
+            subdir_clean.as_deref(),
+            &f.file_name,
+        );
+        let dst_abs = match safe_join_rel_path(&dst_storage.root, &dst_rel_path, false) {
+            Ok(p) => p,
+            Err(err) => {
+                report.errors += 1;
+                report.items.push(IngestItemResult {
+                    src_path: src_str,
+                    dst_rel_path: Some(dst_rel_path),
+                    byte_size: f.byte_size,
+                    status: "error".into(),
+                    detail: Some(err),
+                });
+                continue;
+            }
+        };
+
+        let journal_id = if !opts.dry_run {
+            Some(db.insert_journal_entry(&JournalEntryInput {
+                op_group_id: op_group_id.clone(),
+                op_type: "ingest".to_string(),
+                state: "planned".to_string(),
+                host_id: Some(cfg.host.id.clone()),
+                asset_id: None,
+                file_id: None,
+                src_storage_id: None,
+                src_rel_path: Some(src_str.clone()),
+                dst_storage_id: Some(dst_storage.id.clone()),
+                dst_rel_path: Some(dst_rel_path.clone()),
+                expected_algo: Some(hash.algorithm.as_str().to_string()),
+                expected_hash: Some(hash.hash_hex.clone()),
+                actual_hash: None,
+                byte_size: Some(f.byte_size as i64),
+                error_message: None,
+            })?)
+        } else {
+            None
+        };
+
+        let copy_res = verified_copy_file(
+            &f.abs_path,
+            &dst_abs,
+            hash.algorithm,
+            Some(&hash.hash_hex),
+            opts.dry_run,
+        );
+
+        match copy_res.status {
+            CopyStatus::WouldCopy => {
+                report.would_copy += 1;
+                report.items.push(IngestItemResult {
+                    src_path: src_str,
+                    dst_rel_path: Some(dst_rel_path),
+                    byte_size: copy_res.byte_size,
+                    status: "would_copy".into(),
+                    detail: None,
+                });
+            }
+            CopyStatus::Copied => {
+                report.copied += 1;
+                report.bytes_copied += copy_res.byte_size;
+                if let Some(jid) = journal_id {
+                    db.update_journal_state(jid, "committed", Some(&hash.hash_hex), None)?;
+                }
+                let file_role = if is_sidecar {
+                    FileRole::Sidecar
+                } else {
+                    dst_storage.tier.default_file_role()
+                };
+                ingested_inputs.push(UpsertFileInput {
+                    storage_id: dst_storage.id.clone(),
+                    rel_path: dst_rel_path.clone(),
+                    file_name: f.file_name,
+                    file_stem: f.file_stem,
+                    ext: f.ext,
+                    byte_size: f.byte_size,
+                    mtime_ns: f.mtime_ns,
+                    ctime_ns: f.ctime_ns,
+                    media_kind: f.media_kind,
+                    format: f.format,
+                    role: file_role,
+                    hash_algo: hash.algorithm,
+                    hash_hex: hash.hash_hex,
+                    partial_hash: hash.partial_hash,
+                    metadata: meta,
+                });
+                report.items.push(IngestItemResult {
+                    src_path: src_str,
+                    dst_rel_path: Some(dst_rel_path),
+                    byte_size: copy_res.byte_size,
+                    status: "copied".into(),
+                    detail: None,
+                });
+            }
+            CopyStatus::SkippedIdentical => {
+                report.skipped_identical += 1;
+                if let Some(jid) = journal_id {
+                    db.update_journal_state(jid, "committed", Some(&hash.hash_hex), None)?;
+                }
+                report.items.push(IngestItemResult {
+                    src_path: src_str,
+                    dst_rel_path: Some(dst_rel_path),
+                    byte_size: copy_res.byte_size,
+                    status: "skipped_identical".into(),
+                    detail: copy_res.detail,
+                });
+            }
+            CopyStatus::ConflictDifferentContent => {
+                report.conflicts += 1;
+                if let Some(jid) = journal_id {
+                    db.update_journal_state(jid, "failed", None, copy_res.detail.as_deref())?;
+                }
+                report.items.push(IngestItemResult {
+                    src_path: src_str,
+                    dst_rel_path: Some(dst_rel_path),
+                    byte_size: copy_res.byte_size,
+                    status: "conflict".into(),
+                    detail: copy_res.detail,
+                });
+            }
+            CopyStatus::MissingSource | CopyStatus::Failed => {
+                report.errors += 1;
+                if let Some(jid) = journal_id {
+                    db.update_journal_state(jid, "failed", None, copy_res.detail.as_deref())?;
+                }
+                report.items.push(IngestItemResult {
+                    src_path: src_str,
+                    dst_rel_path: Some(dst_rel_path),
+                    byte_size: copy_res.byte_size,
+                    status: "error".into(),
+                    detail: copy_res.detail,
+                });
+            }
+        }
+        pb.set_message(format!(
+            "copied={} skipped={} ({})",
+            report.copied + report.would_copy,
+            report.skipped_in_catalog + report.skipped_identical,
+            human_bytes(report.bytes_copied)
+        ));
+    }
+    pb.finish_and_clear();
+
+    // Immediately index newly ingested files into destination storage (zero double hashing!)
+    if !opts.dry_run && !ingested_inputs.is_empty() {
+        db.upsert_storage(dst_storage, &cfg.host.id, StorageStatus::Online)?;
+        let scan_run_id = db.start_scan_run(&dst_storage.id, "ingest")?;
+        let batch_size = cfg.performance.db_batch_size.max(1);
+        let mut added_total = 0u64;
+        let mut updated_total = 0u64;
+        for chunk in ingested_inputs.chunks(batch_size) {
+            let (a, u) = db.upsert_scanned_batch(chunk, scan_run_id)?;
+            added_total += a;
+            updated_total += u;
+        }
+        let pr = db.pair_raw_jpeg_assets(&dst_storage.id)?;
+        let sr = db.link_sidecar_files(&dst_storage.id)?;
+        report.raw_jpeg_merged = pr.pairs_merged;
+        report.sidecars_linked = sr.linked;
+        db.finish_scan_run(
+            &ScanRunSummary {
+                scan_run_id,
+                storage_id: dst_storage.id.clone(),
+                mode: "ingest".to_string(),
+                status: "completed".to_string(),
+                files_scanned: report.discovered,
+                files_added: added_total,
+                files_updated: updated_total,
+                files_skipped: report.skipped_in_catalog + report.skipped_identical,
+                files_missing: 0,
+                bytes_hashed: report.bytes_copied,
+                error_count: report.errors + report.conflicts,
+                raw_jpeg_merged: pr.pairs_merged,
+            },
+            None,
+        )?;
+    }
+
+    report.elapsed_ms = started.elapsed().as_millis();
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Jsonl => {
+            for item in &report.items {
+                println!("{}", serde_json::to_string(item)?);
+            }
+        }
+        OutputFormat::Text => {
+            let prefix = if report.dry_run { "[dry-run] " } else { "" };
+            println!(
+                "{prefix}Ingest {} -> [{}] ({:.2}s): discovered={} copied={} would_copy={} skipped_in_catalog={} skipped_identical={} conflicts={} errors={} bytes={} paired={}",
+                report.source,
+                report.dst_storage_id,
+                report.elapsed_ms as f64 / 1000.0,
+                report.discovered,
+                report.copied,
+                report.would_copy,
+                report.skipped_in_catalog,
+                report.skipped_identical,
+                report.conflicts,
+                report.errors,
+                human_bytes(report.bytes_copied),
+                report.raw_jpeg_merged
+            );
+            for item in report.items.iter().take(30) {
+                let dst = item.dst_rel_path.as_deref().unwrap_or("-");
+                let detail = item
+                    .detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
+                println!("  - [{:<18}] {} -> {}{}", item.status, item.src_path, dst, detail);
+            }
+            if report.items.len() > 30 {
+                println!("  ... and {} more item(s)", report.items.len() - 30);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_verified_copy_to(
     cfg: &Config,
@@ -3272,6 +3871,7 @@ fn cmd_benchmark(
         access_mode: AccessMode::ReadOnly,
         backup_mode: BackupMode::None,
         failure_domain: None,
+        volume_id: None,
         exclude_paths: Vec::new(),
     };
 

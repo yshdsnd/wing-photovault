@@ -594,14 +594,15 @@ impl Database {
         let root_str = storage.root.to_string_lossy();
         self.conn.execute(
             "INSERT INTO storages (
-                id, root_path, media_type, tier, access_mode, backup_mode,
+                id, root_path, media_type, tier, volume_id, access_mode, backup_mode,
                 status, failure_domain, last_seen_at, created_at, updated_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
              ON CONFLICT(id) DO UPDATE SET
                root_path = excluded.root_path,
                media_type = excluded.media_type,
                tier = excluded.tier,
+               volume_id = COALESCE(excluded.volume_id, storages.volume_id),
                access_mode = excluded.access_mode,
                backup_mode = excluded.backup_mode,
                status = excluded.status,
@@ -613,6 +614,7 @@ impl Database {
                 root_str,
                 storage.media.as_str(),
                 storage.tier.as_str(),
+                storage.volume_id,
                 storage.access_mode.as_str(),
                 storage.backup_mode.as_str(),
                 status.as_str(),
@@ -631,6 +633,52 @@ impl Database {
             params![storage.id, host_id, root_str, now],
         )?;
         Ok(())
+    }
+
+    /// Return the previously recorded `volume_id` for a storage, if any.
+    pub fn get_storage_volume_id(&self, storage_id: &str) -> DbResult<Option<String>> {
+        let res: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT volume_id FROM storages WHERE id = ?1",
+                params![storage_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(res.flatten().filter(|s| !s.trim().is_empty()))
+    }
+
+    /// Update `storages.volume_id` when a marker is newly observed on disk.
+    pub fn set_storage_volume_id(&self, storage_id: &str, volume_id: &str) -> DbResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE storages SET volume_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![volume_id, now, storage_id],
+        )?;
+        Ok(())
+    }
+
+    /// Check whether a content hash already exists in the catalog with at least one present file
+    /// (O(log N) lookup via `UNIQUE(hash_algo, hash_hex)`), used by `wingpv ingest` to skip
+    /// already-imported files from reused SD/CFexpress cards without creating duplicates.
+    pub fn has_present_content_hash(
+        &self,
+        algo: HashAlgorithm,
+        hash_hex: &str,
+    ) -> DbResult<bool> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM contents c
+                JOIN files f ON f.content_id = c.id
+                WHERE c.hash_algo = ?1
+                  AND c.hash_hex = ?2
+                  AND f.presence = 'present'
+            )",
+            params![algo.as_str(), hash_hex],
+            |r| r.get(0),
+        )?;
+        Ok(exists != 0)
     }
 
     pub fn start_scan_run(&self, storage_id: &str, mode: &str) -> DbResult<i64> {
@@ -3571,6 +3619,7 @@ impl Database {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: Some("bench-nvme".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         let nas = StorageConfig {
@@ -3581,6 +3630,7 @@ impl Database {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: Some("bench-nas".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         self.upsert_storage(&hot, "bench-host", StorageStatus::Online)?;
@@ -4134,6 +4184,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: Some("pc-nvme-g".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         let nas_win = StorageConfig {
@@ -4144,6 +4195,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: Some("nas-eagle".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         let mut nas_bsd = nas_win.clone();
@@ -4226,6 +4278,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&hot, "main-pc", StorageStatus::Online)
@@ -4286,6 +4339,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&hot, "main-pc", StorageStatus::Online)
@@ -4464,6 +4518,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: Some("nas-eagle".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&nas, "eagle", StorageStatus::Online)
@@ -4623,6 +4678,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: Some("nas-eagle".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&nas, "eagle", StorageStatus::Online)
@@ -4762,6 +4818,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&st, "pc", StorageStatus::Online).unwrap();
@@ -4852,6 +4909,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&st, "pc", StorageStatus::Online).unwrap();
@@ -5048,6 +5106,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&st, "pc", StorageStatus::Online).unwrap();
@@ -5206,6 +5265,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: Some("pc-nvme".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         let nas = StorageConfig {
@@ -5216,6 +5276,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: Some("nas-eagle".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&hot, "pc", StorageStatus::Online).unwrap();
@@ -5333,6 +5394,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         let nas = StorageConfig {
@@ -5343,6 +5405,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&hot, "pc", StorageStatus::Online).unwrap();
@@ -5543,6 +5606,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&st, "h1", StorageStatus::Online).unwrap();
@@ -5632,6 +5696,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         let nas = StorageConfig {
@@ -5642,6 +5707,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: Some("eagle".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&hot, "h1", StorageStatus::Online).unwrap();
@@ -5987,6 +6053,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: None,
+            volume_id: None,
             exclude_paths: vec![],
         };
         let nas = StorageConfig {
@@ -5997,6 +6064,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: Some("eagle".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         db.upsert_storage(&hot, "h1", StorageStatus::Online).unwrap();

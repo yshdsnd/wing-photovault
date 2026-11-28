@@ -211,6 +211,9 @@ pub struct StorageConfig {
     pub backup_mode: BackupMode,
     #[serde(default)]
     pub failure_domain: Option<String>,
+    /// Optional volume identity matched against `<root>/.wing-volume-id` (Fail Closed guard for removable USB HDDs).
+    #[serde(default)]
+    pub volume_id: Option<String>,
     #[serde(default)]
     pub exclude_paths: Vec<PathBuf>,
 }
@@ -398,6 +401,7 @@ mod tests {
                 access_mode: AccessMode::Managed,
                 backup_mode: BackupMode::External,
                 failure_domain: Some("nas-eagle".into()),
+                volume_id: None,
                 exclude_paths: vec![],
             }],
         };
@@ -414,6 +418,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: Some("nas-eagle".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         assert!(!ext.allows_mutation());
@@ -427,6 +432,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::Managed,
             failure_domain: Some("nas-eagle".into()),
+            volume_id: None,
             exclude_paths: vec![],
         };
         assert!(managed_backup.allows_mutation());

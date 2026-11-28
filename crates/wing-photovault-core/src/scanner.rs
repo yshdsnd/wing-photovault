@@ -218,6 +218,7 @@ mod tests {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: Some("pc-nvme-test".into()),
+            volume_id: None,
             exclude_paths: vec![skip_dir],
         };
         let exts: HashSet<String> = [".jpg", ".cr3"].into_iter().map(String::from).collect();

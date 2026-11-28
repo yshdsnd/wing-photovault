@@ -65,6 +65,7 @@ currency = "JPY"
 # access_mode: "managed" | "read_only"
 # backup_mode: "none" | "managed" | "external"
 # failure_domain: 同一物理ディスク・同一筐体の識別子
+# volume_id: 任意。外付け USB HDD 等のルートに `.wing-volume-id` を置いた場合の本人確認用（不一致時は Fail Closed）
 [[storages]]
 id = "hdd_archive_f"
 root = 'F:\Photos'

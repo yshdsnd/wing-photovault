@@ -17,6 +17,7 @@ pub struct StorageDraft {
     pub access_mode: AccessMode,
     pub backup_mode: BackupMode,
     pub failure_domain: String,
+    pub volume_id: String,
     /// One path per line in the UI.
     pub exclude_paths_text: String,
 }
@@ -31,6 +32,7 @@ impl StorageDraft {
             access_mode: AccessMode::Managed,
             backup_mode: BackupMode::None,
             failure_domain: String::new(),
+            volume_id: String::new(),
             exclude_paths_text: String::new(),
         }
     }
@@ -44,6 +46,7 @@ impl StorageDraft {
             access_mode: AccessMode::ReadOnly,
             backup_mode: BackupMode::External,
             failure_domain: "nas-eagle".to_string(),
+            volume_id: String::new(),
             exclude_paths_text: String::new(),
         }
     }
@@ -70,6 +73,7 @@ impl StorageDraft {
             access_mode: s.access_mode,
             backup_mode: s.backup_mode,
             failure_domain: s.failure_domain.clone().unwrap_or_default(),
+            volume_id: s.volume_id.clone().unwrap_or_default(),
             exclude_paths_text,
         };
         draft.enforce_invariants();
@@ -92,6 +96,14 @@ impl StorageDraft {
                 Some(trimmed.to_string())
             }
         };
+        let volume_id = {
+            let trimmed = self.volume_id.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
         let access_mode = if self.backup_mode == BackupMode::External {
             AccessMode::ReadOnly
         } else {
@@ -106,6 +118,7 @@ impl StorageDraft {
             access_mode,
             backup_mode: self.backup_mode,
             failure_domain,
+            volume_id,
             exclude_paths,
         }
     }

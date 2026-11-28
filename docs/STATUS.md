@@ -2,7 +2,7 @@
 
 - Last Updated: 2026-11-28
 - Current Phase: **Phase 2（操作ジャーナル・整合性検証・リムーバブル取り込み・安全隔離）進行中**
-- Branch: `main`（全 38 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
+- Branch: `main`（全 40 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
 
@@ -38,6 +38,7 @@
 - `normalize-lenses`（再スキャン不要で既存 DB の `lens_model_raw` から `[exif.lens_aliases]` を再適用、`--dry-run` 読み取り専用プレビュー対応）
 - `link-derivatives`（Lightroom Classic 等のレタッチ済み／リサイズ書き出し JPEG を撮影日時 `captured_at`＋`subsec`/ファイル名/カメラ・シリアル互換ガードで元の論理 Asset に関連付け、`role = 'exported'` 付与・元 Asset ID 維持・曖昧時 Fail Closed・`--dry-run` 読み取り専用プレビュー対応）
 - `verify` / `journal`（Phase 2-1: 実体ファイルのハッシュ再計算によるサイレントビットロット・欠損・外部変更検知、他ストレージ上の健全コピー有無の即時表示、`--older-than-days` / `--limit` / `--cooldown-*` / `--dry-run` 対応、異常の `operation_journal` 記録と `journal [--incomplete]` 閲覧）
+- `ingest` & `volume_id` 本人確認（Phase 2-2: SD/CFexpress 等の使い捨て一時メディアからの安全取り込み — カードは読み取り専用＆`storages` 非登録、既出ハッシュ自動スキップ、`YYYY/YYYY_MM_DD/` 日付整理＋ハッシュ検証付きコピー＋即時 DB 登録＆RAW+JPEG 統合＋`operation_journal` 記録、`--dry-run` 対応。外付け HDD 等には `<root>/.wing-volume-id` によるボリューム取り違え Fail Closed 保護を `scan`/`verify`/`ingest` 全般に適用）
 - `status` / `stats`（`--percent`, `--by-year`, `--gear-history` 使用機材年表、`--cost-per-shot` 1ショット単価、`--split-extenders` テレコン分解集計、`--focal-dist` / `--focal-35mm` 焦点距離＆35mm換算分布ヒストグラム＋`[stats.camera_crop_factors]`、`--year`/`--camera`/`--lens` 絞り込み、`--export-timeline-svg` スタンドアロン SVG 年表出力、未バックアップ件数＆切り捨て%表示対応）/ `duplicates`（読み取り専用重複検出、`read_only`/`external` バックアップ保護、`--include-backups`/`--include-sidecars`/`--min-bytes`/`--limit` 対応）/ `find`（キーセットページング `--cursor`, `--page-info`、焦点距離/ISO/F値/パス/`--asset-id`/`--unbacked` フィルタ、ハッシュ検証付き安全コピー `--copy-to` + `--with-companions` + `--flat` + `--dry-run` 対応）/ `benchmark`（ディレクトリ実測＋`--db-scale <N>` 大規模ダミー DB ベンチマーク、`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
 
 ### テスト用ミニ UI (`tools/wingpv-mini-ui` / バイナリ名 `wingpv-mini-ui`)
