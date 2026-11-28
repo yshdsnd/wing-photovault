@@ -10,13 +10,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use wing_photovault_core::config::{Config, ExifBackend, StatsConfig, StorageConfig};
+use wing_photovault_core::copy::{
+    safe_join_rel_path, verified_copy_file, CopyStatus, VerifiedCopyResult,
+};
 use wing_photovault_core::hashing::hash_file;
 use wing_photovault_core::metadata::{apply_lens_aliases, extract_native, MetadataSession};
 use wing_photovault_core::model::{
@@ -175,29 +178,8 @@ enum Commands {
         limit: usize,
     },
 
-    /// Search indexed files
-    Find {
-        #[arg(long)]
-        storage: Option<String>,
-        #[arg(long = "ext-format")]
-        ext_format: Option<String>,
-        #[arg(long)]
-        camera: Option<String>,
-        #[arg(long)]
-        lens: Option<String>,
-        #[arg(long)]
-        from: Option<String>,
-        #[arg(long)]
-        to: Option<String>,
-        #[arg(long, default_value_t = 100)]
-        limit: i64,
-        /// Keyset pagination cursor returned by a previous page (`v1:<file_id>:<captured_at>`)
-        #[arg(long)]
-        cursor: Option<String>,
-        /// With `--format json`, wrap results in `{ items, has_more, next_cursor }`
-        #[arg(long)]
-        page_info: bool,
-    },
+    /// Search indexed files (and optionally perform verified safe copy to a working directory)
+    Find(Box<FindArgs>),
 
     /// Benchmark scanning/hashing/EXIF on a directory, or SQLite query/aggregation scale via `--db-scale <N>`
     Benchmark {
@@ -217,6 +199,69 @@ enum Commands {
         #[arg(long)]
         db_scale: Option<usize>,
     },
+}
+
+#[derive(Debug, Args)]
+struct FindArgs {
+    #[arg(long)]
+    storage: Option<String>,
+    #[arg(long = "ext-format")]
+    ext_format: Option<String>,
+    #[arg(long)]
+    camera: Option<String>,
+    #[arg(long)]
+    lens: Option<String>,
+    #[arg(long)]
+    from: Option<String>,
+    #[arg(long)]
+    to: Option<String>,
+    /// Minimum focal length in mm (e.g. 500)
+    #[arg(long)]
+    min_focal: Option<f64>,
+    /// Maximum focal length in mm
+    #[arg(long)]
+    max_focal: Option<f64>,
+    /// Minimum ISO sensitivity (e.g. 3200)
+    #[arg(long)]
+    min_iso: Option<i64>,
+    /// Maximum ISO sensitivity
+    #[arg(long)]
+    max_iso: Option<i64>,
+    /// Minimum aperture F-number (e.g. 2.8)
+    #[arg(long)]
+    min_f: Option<f64>,
+    /// Maximum aperture F-number (e.g. 2.8)
+    #[arg(long)]
+    max_f: Option<f64>,
+    /// Case-insensitive substring match against relative path (e.g. 2024_11_03)
+    #[arg(long)]
+    path: Option<String>,
+    /// Exact logical asset_id filter
+    #[arg(long)]
+    asset_id: Option<i64>,
+    /// Only show files whose content is NOT backed up on any backup-tier storage
+    #[arg(long)]
+    unbacked: bool,
+    #[arg(long, default_value_t = 100)]
+    limit: i64,
+    /// Keyset pagination cursor returned by a previous page (`v1:<file_id>:<captured_at>`)
+    #[arg(long)]
+    cursor: Option<String>,
+    /// With `--format json`, wrap results in `{ items, has_more, next_cursor }`
+    #[arg(long)]
+    page_info: bool,
+    /// Perform hash-verified non-destructive copy of matched files to this destination directory
+    #[arg(long)]
+    copy_to: Option<PathBuf>,
+    /// With `--copy-to`, also copy paired RAW/JPEG and linked .xmp/.thm sidecars of matched assets
+    #[arg(long)]
+    with_companions: bool,
+    /// With `--copy-to`, place copied files directly in `<copy-to>/<filename>` instead of preserving subdirectories
+    #[arg(long)]
+    flat: bool,
+    /// With `--copy-to`, preview the copy plan without creating directories or writing files
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn main() -> Result<()> {
@@ -289,17 +334,31 @@ fn main() -> Result<()> {
             },
             cli.format,
         ),
-        Commands::Find {
-            storage,
-            ext_format,
-            camera,
-            lens,
-            from,
-            to,
-            limit,
-            cursor,
-            page_info,
-        } => {
+        Commands::Find(args) => {
+            let FindArgs {
+                storage,
+                ext_format,
+                camera,
+                lens,
+                from,
+                to,
+                min_focal,
+                max_focal,
+                min_iso,
+                max_iso,
+                min_f,
+                max_f,
+                path,
+                asset_id,
+                unbacked,
+                limit,
+                cursor,
+                page_info,
+                copy_to,
+                with_companions,
+                flat,
+                dry_run,
+            } = *args;
             let decoded_cursor = match cursor {
                 Some(raw) => Some(
                     FindCursor::decode(&raw)
@@ -316,10 +375,25 @@ fn main() -> Result<()> {
                     lens,
                     from_date: from,
                     to_date: to,
+                    min_focal_mm: min_focal,
+                    max_focal_mm: max_focal,
+                    min_iso,
+                    max_iso,
+                    min_f_number: min_f,
+                    max_f_number: max_f,
+                    path_contains: path,
+                    asset_id,
+                    unbacked_only: unbacked,
                     limit: Some(limit),
                     cursor: decoded_cursor,
                 },
-                page_info,
+                FindExecOpts {
+                    page_info,
+                    copy_to,
+                    with_companions,
+                    flat,
+                    dry_run,
+                },
                 cli.format,
             )
         }
@@ -1875,19 +1949,43 @@ fn cmd_duplicates(
     Ok(())
 }
 
+struct FindExecOpts {
+    page_info: bool,
+    copy_to: Option<PathBuf>,
+    with_companions: bool,
+    flat: bool,
+    dry_run: bool,
+}
+
 fn cmd_find(
     config_path: &Path,
     filter: FindFilter,
-    page_info: bool,
+    exec_opts: FindExecOpts,
     format: OutputFormat,
 ) -> Result<()> {
     let cfg = load_config_or_default(config_path)?;
-    let db = Database::open(&cfg.general.db_path)?;
+    if !cfg.general.db_path.exists() {
+        anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+    }
+    let db = Database::open_read_only(&cfg.general.db_path)?;
     let page = db.find_page(&filter)?;
+
+    if let Some(dest_dir) = exec_opts.copy_to.as_deref() {
+        return run_verified_copy_to(
+            &cfg,
+            &db,
+            &page.items,
+            dest_dir,
+            exec_opts.with_companions,
+            exec_opts.flat,
+            exec_opts.dry_run,
+            format,
+        );
+    }
 
     match format {
         OutputFormat::Json => {
-            if page_info {
+            if exec_opts.page_info {
                 println!("{}", serde_json::to_string_pretty(&page)?);
             } else {
                 println!("{}", serde_json::to_string_pretty(&page.items)?);
@@ -1927,6 +2025,233 @@ fn cmd_find(
             }
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_verified_copy_to(
+    cfg: &Config,
+    db: &Database,
+    matched_rows: &[wing_photovault_db::FindRow],
+    dest_dir: &Path,
+    with_companions: bool,
+    flat: bool,
+    dry_run: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let storage_roots: std::collections::HashMap<&str, &Path> = cfg
+        .storages
+        .iter()
+        .map(|s| (s.id.as_str(), s.root.as_path()))
+        .collect();
+
+    let candidates = db.resolve_copy_candidates(matched_rows, with_companions)?;
+
+    // Deduplicate by content_id (preferring an existing local/higher-tier copy over an offline/NAS one).
+    let mut by_content: std::collections::BTreeMap<i64, Vec<&wing_photovault_db::CopyCandidateRow>> =
+        std::collections::BTreeMap::new();
+    let mut no_content: Vec<&wing_photovault_db::CopyCandidateRow> = Vec::new();
+    for c in &candidates {
+        if let Some(cid) = c.content_id {
+            by_content.entry(cid).or_default().push(c);
+        } else {
+            no_content.push(c);
+        }
+    }
+
+    let mut chosen: Vec<&wing_photovault_db::CopyCandidateRow> = Vec::new();
+    for (_cid, group) in by_content {
+        // Pick first copy whose source root is configured and file exists on disk; otherwise fallback to first.
+        let picked = group
+            .iter()
+            .copied()
+            .find(|c| {
+                storage_roots
+                    .get(c.storage_id.as_str())
+                    .and_then(|root| safe_join_rel_path(root, &c.rel_path, false).ok())
+                    .is_some_and(|p| p.is_file())
+            })
+            .unwrap_or(group[0]);
+        chosen.push(picked);
+    }
+    chosen.extend(no_content);
+
+    let mut planned_dsts: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut items: Vec<VerifiedCopyResult> = Vec::new();
+
+    for c in chosen {
+        let dst = match safe_join_rel_path(dest_dir, &c.rel_path, flat) {
+            Ok(p) => p,
+            Err(err) => {
+                items.push(VerifiedCopyResult {
+                    src_path: format!("{}:{}", c.storage_id, c.rel_path),
+                    dst_path: dest_dir.to_string_lossy().into_owned(),
+                    byte_size: c.byte_size.max(0) as u64,
+                    status: CopyStatus::Failed,
+                    detail: Some(err),
+                });
+                continue;
+            }
+        };
+
+        // Guard against two distinct files mapping to the same destination (e.g. under --flat)
+        if !planned_dsts.insert(dst.clone()) {
+            items.push(VerifiedCopyResult {
+                src_path: format!("{}:{}", c.storage_id, c.rel_path),
+                dst_path: dst.to_string_lossy().into_owned(),
+                byte_size: c.byte_size.max(0) as u64,
+                status: CopyStatus::ConflictDifferentContent,
+                detail: Some(
+                    "multiple matched files map to the same destination path (refusing overwrite)"
+                        .into(),
+                ),
+            });
+            continue;
+        }
+
+        let Some(root) = storage_roots.get(c.storage_id.as_str()) else {
+            items.push(VerifiedCopyResult {
+                src_path: format!("{}:{}", c.storage_id, c.rel_path),
+                dst_path: dst.to_string_lossy().into_owned(),
+                byte_size: c.byte_size.max(0) as u64,
+                status: CopyStatus::MissingSource,
+                detail: Some(format!(
+                    "storage '{}' is not configured with a local/UNC root in config",
+                    c.storage_id
+                )),
+            });
+            continue;
+        };
+
+        let src = match safe_join_rel_path(root, &c.rel_path, false) {
+            Ok(p) => p,
+            Err(err) => {
+                items.push(VerifiedCopyResult {
+                    src_path: format!("{}:{}", c.storage_id, c.rel_path),
+                    dst_path: dst.to_string_lossy().into_owned(),
+                    byte_size: c.byte_size.max(0) as u64,
+                    status: CopyStatus::Failed,
+                    detail: Some(err),
+                });
+                continue;
+            }
+        };
+
+        let algo = match c.hash_algo.as_str() {
+            "sha256" => HashAlgorithm::Sha256,
+            _ => HashAlgorithm::Blake3,
+        };
+        let res = verified_copy_file(&src, &dst, algo, c.hash_hex.as_deref(), dry_run);
+        items.push(res);
+    }
+
+    #[derive(Serialize)]
+    struct CopyToReport {
+        dry_run: bool,
+        dest_dir: String,
+        with_companions: bool,
+        flat: bool,
+        planned_files: usize,
+        copied: usize,
+        would_copy: usize,
+        skipped_identical: usize,
+        conflicts: usize,
+        missing_sources: usize,
+        failed: usize,
+        bytes_copied_or_planned: u64,
+        items: Vec<VerifiedCopyResult>,
+    }
+
+    let copied = items
+        .iter()
+        .filter(|i| i.status == CopyStatus::Copied)
+        .count();
+    let would_copy = items
+        .iter()
+        .filter(|i| i.status == CopyStatus::WouldCopy)
+        .count();
+    let skipped_identical = items
+        .iter()
+        .filter(|i| i.status == CopyStatus::SkippedIdentical)
+        .count();
+    let conflicts = items
+        .iter()
+        .filter(|i| i.status == CopyStatus::ConflictDifferentContent)
+        .count();
+    let missing_sources = items
+        .iter()
+        .filter(|i| i.status == CopyStatus::MissingSource)
+        .count();
+    let failed = items
+        .iter()
+        .filter(|i| i.status == CopyStatus::Failed)
+        .count();
+    let bytes_copied_or_planned: u64 = items
+        .iter()
+        .filter(|i| matches!(i.status, CopyStatus::Copied | CopyStatus::WouldCopy))
+        .map(|i| i.byte_size)
+        .sum();
+
+    let report = CopyToReport {
+        dry_run,
+        dest_dir: dest_dir.to_string_lossy().into_owned(),
+        with_companions,
+        flat,
+        planned_files: items.len(),
+        copied,
+        would_copy,
+        skipped_identical,
+        conflicts,
+        missing_sources,
+        failed,
+        bytes_copied_or_planned,
+        items,
+    };
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Jsonl => {
+            for item in &report.items {
+                println!("{}", serde_json::to_string(item)?);
+            }
+        }
+        OutputFormat::Text => {
+            let prefix = if report.dry_run { "[dry-run] " } else { "" };
+            println!(
+                "{prefix}Copy-to {}: planned={} copied={} would_copy={} skipped_identical={} conflicts={} missing={} failed={} ({})",
+                report.dest_dir,
+                report.planned_files,
+                report.copied,
+                report.would_copy,
+                report.skipped_identical,
+                report.conflicts,
+                report.missing_sources,
+                report.failed,
+                human_bytes(report.bytes_copied_or_planned),
+            );
+            for item in &report.items {
+                let tag = match item.status {
+                    CopyStatus::WouldCopy => "would-copy",
+                    CopyStatus::Copied => "copied",
+                    CopyStatus::SkippedIdentical => "skipped",
+                    CopyStatus::ConflictDifferentContent => "CONFLICT",
+                    CopyStatus::MissingSource => "MISSING",
+                    CopyStatus::Failed => "FAILED",
+                };
+                if let Some(detail) = &item.detail {
+                    println!(
+                        "  - [{:<10}] {} -> {} ({})",
+                        tag, item.src_path, item.dst_path, detail
+                    );
+                } else {
+                    println!("  - [{:<10}] {} -> {}", tag, item.src_path, item.dst_path);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

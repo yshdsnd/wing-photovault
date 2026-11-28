@@ -251,8 +251,32 @@ pub struct FindFilter {
     pub lens: Option<String>,
     pub from_date: Option<String>,
     pub to_date: Option<String>,
+    pub min_focal_mm: Option<f64>,
+    pub max_focal_mm: Option<f64>,
+    pub min_iso: Option<i64>,
+    pub max_iso: Option<i64>,
+    pub min_f_number: Option<f64>,
+    pub max_f_number: Option<f64>,
+    pub path_contains: Option<String>,
+    pub asset_id: Option<i64>,
+    pub unbacked_only: bool,
     pub limit: Option<i64>,
     pub cursor: Option<FindCursor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopyCandidateRow {
+    pub file_id: i64,
+    pub asset_id: Option<i64>,
+    pub content_id: Option<i64>,
+    pub storage_id: String,
+    pub storage_tier: String,
+    pub rel_path: String,
+    pub role: String,
+    pub format: String,
+    pub byte_size: i64,
+    pub hash_algo: String,
+    pub hash_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1963,6 +1987,50 @@ impl Database {
             sql.push_str(" AND a.captured_at <= ?");
             bind_values.push(to.clone().into());
         }
+        if let Some(min_fl) = filter.min_focal_mm {
+            sql.push_str(" AND a.focal_length_mm >= ?");
+            bind_values.push(min_fl.into());
+        }
+        if let Some(max_fl) = filter.max_focal_mm {
+            sql.push_str(" AND a.focal_length_mm <= ?");
+            bind_values.push(max_fl.into());
+        }
+        if let Some(min_iso) = filter.min_iso {
+            sql.push_str(" AND a.iso >= ?");
+            bind_values.push(min_iso.into());
+        }
+        if let Some(max_iso) = filter.max_iso {
+            sql.push_str(" AND a.iso <= ?");
+            bind_values.push(max_iso.into());
+        }
+        if let Some(min_f) = filter.min_f_number {
+            sql.push_str(" AND a.f_number >= ?");
+            bind_values.push(min_f.into());
+        }
+        if let Some(max_f) = filter.max_f_number {
+            sql.push_str(" AND a.f_number <= ?");
+            bind_values.push(max_f.into());
+        }
+        if let Some(path_sub) = &filter.path_contains {
+            sql.push_str(" AND LOWER(f.rel_path) LIKE LOWER(?)");
+            bind_values.push(format!("%{path_sub}%").into());
+        }
+        if let Some(aid) = filter.asset_id {
+            sql.push_str(" AND f.asset_id = ?");
+            bind_values.push(aid.into());
+        }
+        if filter.unbacked_only {
+            sql.push_str(
+                " AND f.content_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM files fb
+                      JOIN storages sb ON sb.id = fb.storage_id
+                      WHERE fb.content_id = f.content_id
+                        AND fb.presence = 'present'
+                        AND sb.tier = 'backup'
+                  )",
+            );
+        }
         if let Some(cursor) = &filter.cursor {
             sql.push_str(
                 " AND (COALESCE(a.captured_at, '') < ? OR (COALESCE(a.captured_at, '') = ? AND f.id > ?))",
@@ -2032,6 +2100,100 @@ impl Database {
             has_more,
             next_cursor,
         })
+    }
+
+    /// Resolve concrete present file copies (with content hashes) for a set of matched `FindRow`s.
+    /// When `with_companions` is `true`, also expands each matched `asset_id` to include paired
+    /// RAW/JPEG files and linked `.xmp`/`.thm` sidecars across all storages.
+    pub fn resolve_copy_candidates(
+        &self,
+        matched_rows: &[FindRow],
+        with_companions: bool,
+    ) -> DbResult<Vec<CopyCandidateRow>> {
+        if matched_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut seen_file_ids: HashSet<i64> = HashSet::new();
+        let mut results: Vec<CopyCandidateRow> = Vec::new();
+
+        let mut query_by_file_id = self.conn.prepare(
+            "SELECT f.id, f.asset_id, f.content_id, f.storage_id, s.tier,
+                    f.rel_path, f.role, COALESCE(c.format, f.ext), f.byte_size,
+                    COALESCE(c.hash_algo, 'blake3'), c.hash_hex
+             FROM files f
+             JOIN storages s ON s.id = f.storage_id
+             LEFT JOIN contents c ON c.id = f.content_id
+             WHERE f.id = ?1 AND f.presence = 'present'",
+        )?;
+        let mut query_by_asset_id = self.conn.prepare(
+            "SELECT f.id, f.asset_id, f.content_id, f.storage_id, s.tier,
+                    f.rel_path, f.role, COALESCE(c.format, f.ext), f.byte_size,
+                    COALESCE(c.hash_algo, 'blake3'), c.hash_hex
+             FROM files f
+             JOIN storages s ON s.id = f.storage_id
+             LEFT JOIN contents c ON c.id = f.content_id
+             WHERE f.asset_id = ?1 AND f.presence = 'present'
+             ORDER BY CASE s.tier WHEN 'hot' THEN 0 WHEN 'archive' THEN 1 WHEN 'backup' THEN 2 ELSE 3 END,
+                      f.id ASC",
+        )?;
+
+        let mut seen_assets: HashSet<i64> = HashSet::new();
+        for row in matched_rows {
+            if with_companions {
+                if let Some(aid) = row.asset_id {
+                    if seen_assets.insert(aid) {
+                        let mapped = query_by_asset_id.query_map(params![aid], |r| {
+                            Ok(CopyCandidateRow {
+                                file_id: r.get(0)?,
+                                asset_id: r.get(1)?,
+                                content_id: r.get(2)?,
+                                storage_id: r.get(3)?,
+                                storage_tier: r.get(4)?,
+                                rel_path: r.get(5)?,
+                                role: r.get(6)?,
+                                format: r.get(7)?,
+                                byte_size: r.get(8)?,
+                                hash_algo: r.get(9)?,
+                                hash_hex: r.get(10)?,
+                            })
+                        })?;
+                        for item in mapped {
+                            let c = item?;
+                            if seen_file_ids.insert(c.file_id) {
+                                results.push(c);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if seen_file_ids.insert(row.file_id) {
+                if let Some(c) = query_by_file_id
+                    .query_row(params![row.file_id], |r| {
+                        Ok(CopyCandidateRow {
+                            file_id: r.get(0)?,
+                            asset_id: r.get(1)?,
+                            content_id: r.get(2)?,
+                            storage_id: r.get(3)?,
+                            storage_tier: r.get(4)?,
+                            rel_path: r.get(5)?,
+                            role: r.get(6)?,
+                            format: r.get(7)?,
+                            byte_size: r.get(8)?,
+                            hash_algo: r.get(9)?,
+                            hash_hex: r.get(10)?,
+                        })
+                    })
+                    .optional()?
+                {
+                    results.push(c);
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Re-apply `[exif.lens_aliases]` to existing `assets` and `content_metadata` rows
@@ -3829,5 +3991,193 @@ mod tests {
             })
             .unwrap();
         assert_eq!(with_sidecar.total_groups, 2);
+    }
+
+    #[test]
+    fn find_filters_by_focal_iso_aperture_path_asset_unbacked_and_resolves_companions() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("pc", "PC", "windows").unwrap();
+        let hot = StorageConfig {
+            id: "ssd_hot".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Nvme,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        let nas = StorageConfig {
+            id: "nas_bak".into(),
+            root: PathBuf::from(r"\\eagle\photos"),
+            media: MediaType::Nas,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&hot, "pc", StorageStatus::Online).unwrap();
+        db.upsert_storage(&nas, "pc", StorageStatus::Online).unwrap();
+        let run_h = db.start_scan_run(&hot.id, "incremental").unwrap();
+        let run_n = db.start_scan_run(&nas.id, "incremental").unwrap();
+
+        let mk = |sid: &str,
+                  rel: &str,
+                  ext: &str,
+                  kind: MediaKind,
+                  fmt: &str,
+                  role: FileRole,
+                  hash: &str,
+                  fl: Option<f64>,
+                  fnum: Option<f64>,
+                  iso: Option<i64>| UpsertFileInput {
+            storage_id: sid.into(),
+            rel_path: rel.into(),
+            file_name: rel.rsplit('/').next().unwrap().into(),
+            file_stem: rel
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .split('.')
+                .next()
+                .unwrap()
+                .into(),
+            ext: ext.into(),
+            byte_size: 1024,
+            mtime_ns: 100,
+            ctime_ns: None,
+            media_kind: kind,
+            format: fmt.into(),
+            role,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: if role == FileRole::Sidecar {
+                None
+            } else {
+                Some(ExtractedMetadata {
+                    extractor: "native-cr3".into(),
+                    captured_at: Some("2025-11-03T10:00:00".into()),
+                    camera_model: Some("Canon EOS R5m2".into()),
+                    lens_model: Some("RF200-800mm F6.3-9 IS USM".into()),
+                    focal_length_mm: fl,
+                    f_number: fnum,
+                    iso,
+                    ..Default::default()
+                })
+            },
+        };
+
+        db.upsert_scanned_batch(
+            &[
+                mk(
+                    "ssd_hot",
+                    "2025/2025_11_03/IMG_1.CR3",
+                    ".cr3",
+                    MediaKind::Raw,
+                    "cr3",
+                    FileRole::Original,
+                    "h_cr3",
+                    Some(800.0),
+                    Some(9.0),
+                    Some(6400),
+                ),
+                mk(
+                    "ssd_hot",
+                    "2025/2025_11_03/IMG_1.JPG",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_jpg",
+                    Some(800.0),
+                    Some(9.0),
+                    Some(6400),
+                ),
+                mk(
+                    "ssd_hot",
+                    "2025/2025_11_03/IMG_1.xmp",
+                    ".xmp",
+                    MediaKind::Other,
+                    "xmp",
+                    FileRole::Sidecar,
+                    "h_xmp",
+                    None,
+                    None,
+                    None,
+                ),
+                mk(
+                    "ssd_hot",
+                    "2025/2025_11_03/IMG_2.JPG",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_wide",
+                    Some(35.0),
+                    Some(1.8),
+                    Some(100),
+                ),
+            ],
+            run_h,
+        )
+        .unwrap();
+        // Back up only IMG_1.CR3 to NAS; IMG_1.JPG and IMG_2.JPG remain unbacked
+        db.upsert_scanned_batch(
+            &[mk(
+                "nas_bak",
+                "2025/2025_11_03/IMG_1.CR3",
+                ".cr3",
+                MediaKind::Raw,
+                "cr3",
+                FileRole::Backup,
+                "h_cr3",
+                Some(800.0),
+                Some(9.0),
+                Some(6400),
+            )],
+            run_n,
+        )
+        .unwrap();
+
+        // Filter by focal >= 500, iso >= 3200, format = jpeg -> matches only IMG_1.JPG
+        let matched = db
+            .find(&FindFilter {
+                format: Some("jpeg".into()),
+                min_focal_mm: Some(500.0),
+                min_iso: Some(3200),
+                path_contains: Some("2025_11_03".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].rel_path, "2025/2025_11_03/IMG_1.JPG");
+
+        // Resolve companions for IMG_1.JPG -> pulls CR3 (hot + nas), JPG (hot), and XMP sidecar!
+        let comps = db.resolve_copy_candidates(&matched, true).unwrap();
+        assert!(comps.iter().any(|c| c.rel_path.ends_with("IMG_1.CR3") && c.storage_id == "ssd_hot"));
+        assert!(comps.iter().any(|c| c.rel_path.ends_with("IMG_1.JPG")));
+        assert!(comps.iter().any(|c| c.rel_path.ends_with("IMG_1.xmp") && c.role == "sidecar"));
+
+        // Unbacked filter excludes IMG_1.CR3 (backed up) and returns unbacked files
+        let unbacked = db
+            .find(&FindFilter {
+                unbacked_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!unbacked.iter().any(|r| r.rel_path.ends_with("IMG_1.CR3")));
+        assert!(unbacked.iter().any(|r| r.rel_path.ends_with("IMG_2.JPG")));
+
+        // Wide aperture filter (max_f_number = 2.0)
+        let wide = db
+            .find(&FindFilter {
+                max_f_number: Some(2.0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0].rel_path, "2025/2025_11_03/IMG_2.JPG");
     }
 }

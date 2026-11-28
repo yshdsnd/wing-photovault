@@ -856,21 +856,70 @@ impl MiniUiApp {
                 ui.add(egui::TextEdit::singleline(&mut self.find_params.to).desired_width(180.0));
                 ui.end_row();
 
-                ui.label("limit:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.find_params.limit).desired_width(100.0),
-                );
-                ui.label("cursor (任意):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.find_params.cursor)
-                        .desired_width(220.0)
-                        .hint_text("v1:<file_id>:<captured_at>"),
-                );
+                ui.label("min/max 焦点距離 (mm):");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.find_params.min_focal)
+                            .desired_width(65.0)
+                            .hint_text("min"),
+                    );
+                    ui.label("〜");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.find_params.max_focal)
+                            .desired_width(65.0)
+                            .hint_text("max"),
+                    );
+                });
+                ui.label("min ISO / path:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.find_params.min_iso)
+                            .desired_width(65.0)
+                            .hint_text("ISO"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.find_params.path_contains)
+                            .desired_width(120.0)
+                            .hint_text("パス部分一致"),
+                    );
+                });
                 ui.end_row();
 
-                ui.label("");
-                ui.checkbox(&mut self.find_params.page_info, "JSON ページ情報 (--page-info)");
-                ui.label("");
+                ui.label("limit / cursor:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.find_params.limit).desired_width(55.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.find_params.cursor)
+                            .desired_width(140.0)
+                            .hint_text("cursor (任意)"),
+                    );
+                });
+                ui.label("オプション:");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.find_params.unbacked, "--unbacked");
+                    ui.checkbox(&mut self.find_params.page_info, "--page-info");
+                });
+                ui.end_row();
+
+                ui.label("copy-to (作業用SSD等):");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.find_params.copy_to)
+                            .desired_width(180.0)
+                            .hint_text("空なら検索のみ"),
+                    );
+                    if ui.button("選択...").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            self.find_params.copy_to = dir.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.find_params.with_companions, "RAW/JPEG+XMP同伴");
+                    ui.checkbox(&mut self.find_params.copy_dry_run, "--dry-run");
+                });
                 ui.add_enabled_ui(!running, |ui| {
                     if ui.button("find 実行").clicked() {
                         self.find_params.json_output = self.query_json;

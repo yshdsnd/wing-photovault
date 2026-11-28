@@ -14,9 +14,17 @@ pub struct FindParams {
     pub lens: String,
     pub from: String,
     pub to: String,
+    pub min_focal: String,
+    pub max_focal: String,
+    pub min_iso: String,
+    pub path_contains: String,
+    pub unbacked: bool,
     pub limit: String,
     pub cursor: String,
     pub page_info: bool,
+    pub copy_to: String,
+    pub with_companions: bool,
+    pub copy_dry_run: bool,
     pub json_output: bool,
 }
 
@@ -29,9 +37,17 @@ impl Default for FindParams {
             lens: String::new(),
             from: String::new(),
             to: String::new(),
+            min_focal: String::new(),
+            max_focal: String::new(),
+            min_iso: String::new(),
+            path_contains: String::new(),
+            unbacked: false,
             limit: "100".to_string(),
             cursor: String::new(),
             page_info: false,
+            copy_to: String::new(),
+            with_companions: true,
+            copy_dry_run: true,
             json_output: false,
         }
     }
@@ -171,6 +187,25 @@ pub fn build_find_args(config_path: &Path, params: &FindParams) -> Vec<String> {
         args.push("--to".to_string());
         args.push(params.to.trim().to_string());
     }
+    if !params.min_focal.trim().is_empty() {
+        args.push("--min-focal".to_string());
+        args.push(params.min_focal.trim().to_string());
+    }
+    if !params.max_focal.trim().is_empty() {
+        args.push("--max-focal".to_string());
+        args.push(params.max_focal.trim().to_string());
+    }
+    if !params.min_iso.trim().is_empty() {
+        args.push("--min-iso".to_string());
+        args.push(params.min_iso.trim().to_string());
+    }
+    if !params.path_contains.trim().is_empty() {
+        args.push("--path".to_string());
+        args.push(params.path_contains.trim().to_string());
+    }
+    if params.unbacked {
+        args.push("--unbacked".to_string());
+    }
     if let Ok(n) = params.limit.trim().parse::<i64>() {
         if n > 0 {
             args.push("--limit".to_string());
@@ -183,6 +218,16 @@ pub fn build_find_args(config_path: &Path, params: &FindParams) -> Vec<String> {
     }
     if params.page_info {
         args.push("--page-info".to_string());
+    }
+    if !params.copy_to.trim().is_empty() {
+        args.push("--copy-to".to_string());
+        args.push(params.copy_to.trim().to_string());
+        if params.with_companions {
+            args.push("--with-companions".to_string());
+        }
+        if params.copy_dry_run {
+            args.push("--dry-run".to_string());
+        }
     }
     args
 }
