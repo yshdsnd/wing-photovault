@@ -241,7 +241,7 @@ failure_domain = "nas-eagle"
         .unwrap();
     assert!(out.status.success());
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(status["schema_version"], 3);
+    assert_eq!(status["schema_version"], 4);
     assert_eq!(status["total_missing_files"], 0);
     let nas_row = status["storages"]
         .as_array()

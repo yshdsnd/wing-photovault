@@ -15,6 +15,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "v3_storage_presence_stem_index",
         V3_STORAGE_PRESENCE_STEM_INDEX,
     ),
+    (4, "v4_operation_journal", V4_OPERATION_JOURNAL),
 ];
 
 const V1_INITIAL_SCHEMA: &str = r#"
@@ -189,6 +190,34 @@ const V3_STORAGE_PRESENCE_STEM_INDEX: &str = r#"
 -- use O(log N) B-tree probes instead of scanning all present files in a storage.
 CREATE INDEX IF NOT EXISTS idx_files_storage_presence_stem
     ON files(storage_id, presence, file_stem);
+"#;
+
+const V4_OPERATION_JOURNAL: &str = r#"
+-- Phase 2: Durable state-machine journal for copy/ingest/move/quarantine/restore/verify operations.
+CREATE TABLE IF NOT EXISTS operation_journal (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_group_id     TEXT NOT NULL,
+    op_type         TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    host_id         TEXT REFERENCES hosts(id),
+    asset_id        INTEGER REFERENCES assets(id),
+    file_id         INTEGER REFERENCES files(id),
+    src_storage_id  TEXT REFERENCES storages(id),
+    src_rel_path    TEXT,
+    dst_storage_id  TEXT REFERENCES storages(id),
+    dst_rel_path    TEXT,
+    expected_algo   TEXT,
+    expected_hash   TEXT,
+    actual_hash     TEXT,
+    byte_size       INTEGER,
+    error_message   TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_op_journal_group ON operation_journal(op_group_id);
+CREATE INDEX IF NOT EXISTS idx_op_journal_state ON operation_journal(state, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_op_journal_type_created ON operation_journal(op_type, created_at DESC);
 "#;
 
 pub fn run_migrations(conn: &mut Connection) -> DbResult<()> {

@@ -12,8 +12,8 @@ use wing_photovault_core::metadata::{
     Focal35Source,
 };
 use wing_photovault_core::model::{
-    sidecar_parent_stem, ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, ScanManifestRecord,
-    StorageStatus,
+    sidecar_parent_stem, ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, Presence,
+    ScanManifestRecord, StorageStatus,
 };
 
 use crate::error::DbResult;
@@ -113,6 +113,81 @@ pub struct DerivativeLinkReport {
     pub ambiguous_skipped: u64,
     pub matches: Vec<DerivativeMatchRow>,
     pub ambiguous_samples: Vec<DerivativeAmbiguousRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JournalEntryInput {
+    pub op_group_id: String,
+    pub op_type: String,
+    pub state: String,
+    pub host_id: Option<String>,
+    pub asset_id: Option<i64>,
+    pub file_id: Option<i64>,
+    pub src_storage_id: Option<String>,
+    pub src_rel_path: Option<String>,
+    pub dst_storage_id: Option<String>,
+    pub dst_rel_path: Option<String>,
+    pub expected_algo: Option<String>,
+    pub expected_hash: Option<String>,
+    pub actual_hash: Option<String>,
+    pub byte_size: Option<i64>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalRow {
+    pub id: i64,
+    pub op_group_id: String,
+    pub op_type: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_storage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_rel_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_storage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_rel_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_algo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct JournalFilter {
+    pub op_type: Option<String>,
+    pub state: Option<String>,
+    pub incomplete_only: bool,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifyCandidateRow {
+    pub file_id: i64,
+    pub asset_id: Option<i64>,
+    pub content_id: i64,
+    pub storage_id: String,
+    pub rel_path: String,
+    pub byte_size: u64,
+    pub mtime_ns: i64,
+    pub hash_algo: HashAlgorithm,
+    pub expected_hash: String,
+    pub last_verified_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1666,6 +1741,241 @@ impl Database {
         tx.commit()?;
 
         Ok(report)
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2: Operation Journal & Integrity Verification
+    // -------------------------------------------------------------------------
+
+    pub fn insert_journal_entry(&self, input: &JournalEntryInput) -> DbResult<i64> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO operation_journal (
+                op_group_id, op_type, state, host_id, asset_id, file_id,
+                src_storage_id, src_rel_path, dst_storage_id, dst_rel_path,
+                expected_algo, expected_hash, actual_hash, byte_size, error_message,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+            params![
+                input.op_group_id,
+                input.op_type,
+                input.state,
+                input.host_id,
+                input.asset_id,
+                input.file_id,
+                input.src_storage_id,
+                input.src_rel_path,
+                input.dst_storage_id,
+                input.dst_rel_path,
+                input.expected_algo,
+                input.expected_hash,
+                input.actual_hash,
+                input.byte_size,
+                input.error_message,
+                now,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_journal_state(
+        &self,
+        id: i64,
+        state: &str,
+        actual_hash: Option<&str>,
+        error_message: Option<&str>,
+    ) -> DbResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE operation_journal
+             SET state = ?1,
+                 actual_hash = COALESCE(?2, actual_hash),
+                 error_message = COALESCE(?3, error_message),
+                 updated_at = ?4
+             WHERE id = ?5",
+            params![state, actual_hash, error_message, now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_journal_entries(&self, filter: &JournalFilter) -> DbResult<Vec<JournalRow>> {
+        let mut sql = String::from(
+            "SELECT id, op_group_id, op_type, state, host_id, asset_id, file_id,
+                    src_storage_id, src_rel_path, dst_storage_id, dst_rel_path,
+                    expected_algo, expected_hash, actual_hash, byte_size, error_message,
+                    created_at, updated_at
+             FROM operation_journal
+             WHERE 1=1",
+        );
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(op) = &filter.op_type {
+            sql.push_str(" AND LOWER(op_type) = LOWER(?)");
+            binds.push(op.clone().into());
+        }
+        if let Some(st) = &filter.state {
+            sql.push_str(" AND LOWER(state) = LOWER(?)");
+            binds.push(st.clone().into());
+        }
+        if filter.incomplete_only {
+            sql.push_str(" AND state NOT IN ('committed', 'failed', 'rolled_back')");
+        }
+        sql.push_str(" ORDER BY id DESC");
+        if let Some(limit) = filter.limit {
+            if limit > 0 {
+                sql.push_str(" LIMIT ?");
+                binds.push((limit as i64).into());
+            }
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
+            Ok(JournalRow {
+                id: r.get(0)?,
+                op_group_id: r.get(1)?,
+                op_type: r.get(2)?,
+                state: r.get(3)?,
+                host_id: r.get(4)?,
+                asset_id: r.get(5)?,
+                file_id: r.get(6)?,
+                src_storage_id: r.get(7)?,
+                src_rel_path: r.get(8)?,
+                dst_storage_id: r.get(9)?,
+                dst_rel_path: r.get(10)?,
+                expected_algo: r.get(11)?,
+                expected_hash: r.get(12)?,
+                actual_hash: r.get(13)?,
+                byte_size: r.get(14)?,
+                error_message: r.get(15)?,
+                created_at: r.get(16)?,
+                updated_at: r.get(17)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Select present files with recorded hashes on a storage for integrity verification,
+    /// prioritized by never-verified first, then oldest `last_verified_at`.
+    pub fn select_verify_candidates(
+        &self,
+        storage_id: &str,
+        older_than_iso: Option<&str>,
+        limit: Option<usize>,
+    ) -> DbResult<Vec<VerifyCandidateRow>> {
+        let mut sql = String::from(
+            "SELECT f.id, f.asset_id, f.content_id, f.storage_id, f.rel_path,
+                    f.byte_size, f.mtime_ns, c.hash_algo, c.hash_hex, f.last_verified_at
+             FROM files f
+             JOIN contents c ON c.id = f.content_id
+             WHERE f.storage_id = ?
+               AND f.presence = 'present'
+               AND f.content_id IS NOT NULL",
+        );
+        let mut binds: Vec<rusqlite::types::Value> = vec![storage_id.to_string().into()];
+        if let Some(cutoff) = older_than_iso {
+            sql.push_str(" AND (f.last_verified_at IS NULL OR f.last_verified_at < ?)");
+            binds.push(cutoff.to_string().into());
+        }
+        sql.push_str(
+            " ORDER BY CASE WHEN f.last_verified_at IS NULL THEN 0 ELSE 1 END,
+                       f.last_verified_at ASC, f.id ASC",
+        );
+        if let Some(lim) = limit {
+            if lim > 0 {
+                sql.push_str(" LIMIT ?");
+                binds.push((lim as i64).into());
+            }
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
+            let algo_str: String = r.get(7)?;
+            let hash_algo = match algo_str.as_str() {
+                "sha256" => HashAlgorithm::Sha256,
+                _ => HashAlgorithm::Blake3,
+            };
+            Ok(VerifyCandidateRow {
+                file_id: r.get(0)?,
+                asset_id: r.get(1)?,
+                content_id: r.get(2)?,
+                storage_id: r.get(3)?,
+                rel_path: r.get(4)?,
+                byte_size: r.get::<_, i64>(5)?.max(0) as u64,
+                mtime_ns: r.get(6)?,
+                hash_algo,
+                expected_hash: r.get(8)?,
+                last_verified_at: r.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Batch-update `last_verified_at` and `last_seen_at` for verified-healthy files.
+    pub fn record_verify_ok_batch(&mut self, file_ids: &[i64]) -> DbResult<u64> {
+        if file_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        let mut updated = 0u64;
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE files
+                 SET last_verified_at = ?1, last_seen_at = ?1, updated_at = ?1
+                 WHERE id = ?2",
+            )?;
+            for &fid in file_ids {
+                updated += stmt.execute(params![now, fid])? as u64;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Update a file's presence state (e.g. `Corrupted` or `Missing` detected during `verify`).
+    pub fn mark_file_presence(&self, file_id: i64, presence: Presence) -> DbResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE files SET presence = ?1, updated_at = ?2 WHERE id = ?3",
+            params![presence.as_str(), now, file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Find other present copies of the same `content_id` on other files/storages
+    /// so `verify` can immediately tell the user whether a healthy backup copy exists.
+    pub fn find_healthy_copies_elsewhere(
+        &self,
+        content_id: i64,
+        exclude_file_id: i64,
+    ) -> DbResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT storage_id, rel_path
+             FROM files
+             WHERE content_id = ?1
+               AND id != ?2
+               AND presence = 'present'
+             ORDER BY storage_id ASC, rel_path ASC",
+        )?;
+        let rows = stmt.query_map(params![content_id, exclude_file_id], |r| {
+            Ok(format!(
+                "{}:{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Stream all present files of a storage (with hash + metadata) to a callback as `ScanManifestRecord`s.
@@ -5661,5 +5971,163 @@ mod tests {
             .link_derivative_jpegs(&DerivativeLinkOptions::default())
             .unwrap();
         assert_eq!(second.linked_assets, 0);
+    }
+
+    #[test]
+    fn operation_journal_lifecycle_and_verify_candidates_work() {
+        let mut db = Database::open_in_memory().unwrap();
+        assert_eq!(db.status().unwrap().schema_version, 4);
+
+        db.upsert_host("h1", "Host", "windows").unwrap();
+        let hot = StorageConfig {
+            id: "ssd_hot".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Ssd,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        let nas = StorageConfig {
+            id: "nas_bak".into(),
+            root: PathBuf::from(r"\\eagle\photos"),
+            media: MediaType::Nas,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: Some("eagle".into()),
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&hot, "h1", StorageStatus::Online).unwrap();
+        db.upsert_storage(&nas, "h1", StorageStatus::Online).unwrap();
+        let run_h = db.start_scan_run("ssd_hot", "full").unwrap();
+        let run_n = db.start_scan_run("nas_bak", "full").unwrap();
+
+        let mk = |sid: &str, rel: &str, hash: &str, role: FileRole| UpsertFileInput {
+            storage_id: sid.into(),
+            rel_path: rel.into(),
+            file_name: rel.rsplit('/').next().unwrap().into(),
+            file_stem: "IMG_1".into(),
+            ext: ".jpg".into(),
+            byte_size: 1024,
+            mtime_ns: 100,
+            ctime_ns: None,
+            media_kind: MediaKind::Image,
+            format: "jpeg".into(),
+            role,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: None,
+        };
+        db.upsert_scanned_batch(
+            &[
+                mk("ssd_hot", "2026/IMG_1.JPG", "hash_ok", FileRole::Original),
+                mk("ssd_hot", "2026/IMG_2.JPG", "hash_rot", FileRole::Original),
+            ],
+            run_h,
+        )
+        .unwrap();
+        db.upsert_scanned_batch(
+            &[mk("nas_bak", "2026/IMG_2.JPG", "hash_rot", FileRole::Backup)],
+            run_n,
+        )
+        .unwrap();
+
+        // Candidates return both files on ssd_hot
+        let cands = db.select_verify_candidates("ssd_hot", None, None).unwrap();
+        assert_eq!(cands.len(), 2);
+
+        // Mark IMG_1 verified OK -> older_than future cutoff excludes it, keeping IMG_2 if unverified
+        db.record_verify_ok_batch(&[cands[0].file_id]).unwrap();
+        let remaining = db
+            .select_verify_candidates("ssd_hot", Some("2000-01-01T00:00:00Z"), None)
+            .unwrap();
+        assert_eq!(remaining.len(), 0); // both have last_verified_at set on scan or verify
+
+        // Mark IMG_2 corrupted & check healthy backup copy on nas_bak
+        let rot = cands.iter().find(|c| c.rel_path == "2026/IMG_2.JPG").unwrap();
+        db.mark_file_presence(rot.file_id, Presence::Corrupted)
+            .unwrap();
+        let copies = db
+            .find_healthy_copies_elsewhere(rot.content_id, rot.file_id)
+            .unwrap();
+        assert_eq!(copies, vec!["nas_bak:2026/IMG_2.JPG".to_string()]);
+
+        // Journal lifecycle: insert planned -> transition to committed; insert incomplete & failed
+        let j1 = db
+            .insert_journal_entry(&JournalEntryInput {
+                op_group_id: "grp-1".into(),
+                op_type: "copy".into(),
+                state: "planned".into(),
+                host_id: Some("h1".into()),
+                asset_id: rot.asset_id,
+                file_id: Some(rot.file_id),
+                src_storage_id: Some("ssd_hot".into()),
+                src_rel_path: Some("2026/IMG_2.JPG".into()),
+                dst_storage_id: None,
+                dst_rel_path: Some("out/IMG_2.JPG".into()),
+                expected_algo: Some("blake3".into()),
+                expected_hash: Some("hash_rot".into()),
+                actual_hash: None,
+                byte_size: Some(1024),
+                error_message: None,
+            })
+            .unwrap();
+        db.update_journal_state(j1, "committed", Some("hash_rot"), None)
+            .unwrap();
+
+        let _j2 = db
+            .insert_journal_entry(&JournalEntryInput {
+                op_group_id: "grp-2".into(),
+                op_type: "verify".into(),
+                state: "failed".into(),
+                host_id: Some("h1".into()),
+                asset_id: rot.asset_id,
+                file_id: Some(rot.file_id),
+                src_storage_id: Some("ssd_hot".into()),
+                src_rel_path: Some("2026/IMG_2.JPG".into()),
+                dst_storage_id: None,
+                dst_rel_path: None,
+                expected_algo: Some("blake3".into()),
+                expected_hash: Some("hash_rot".into()),
+                actual_hash: Some("hash_corrupted".into()),
+                byte_size: Some(1024),
+                error_message: Some("silent bit-rot detected".into()),
+            })
+            .unwrap();
+
+        let _j3 = db
+            .insert_journal_entry(&JournalEntryInput {
+                op_group_id: "grp-3".into(),
+                op_type: "quarantine".into(),
+                state: "copied".into(),
+                host_id: Some("h1".into()),
+                asset_id: None,
+                file_id: None,
+                src_storage_id: Some("ssd_hot".into()),
+                src_rel_path: Some("2026/IMG_1.JPG".into()),
+                dst_storage_id: None,
+                dst_rel_path: Some("quarantine/IMG_1.JPG".into()),
+                expected_algo: Some("blake3".into()),
+                expected_hash: Some("hash_ok".into()),
+                actual_hash: None,
+                byte_size: Some(1024),
+                error_message: None,
+            })
+            .unwrap();
+
+        let all = db.list_journal_entries(&JournalFilter::default()).unwrap();
+        assert_eq!(all.len(), 3);
+        let inc = db
+            .list_journal_entries(&JournalFilter {
+                incomplete_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].op_type, "quarantine");
+        assert_eq!(inc[0].state, "copied");
     }
 }

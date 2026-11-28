@@ -26,7 +26,7 @@ use wing_photovault_core::metadata::{
 };
 use wing_photovault_core::model::{
     current_host_os, is_sidecar_extension, AccessMode, BackupMode, FileRole, HashAlgorithm,
-    MediaType, ScanManifestRecord, StorageStatus, StorageTier,
+    MediaType, Presence, ScanManifestRecord, StorageStatus, StorageTier,
 };
 use wing_photovault_core::scanner::{discover_storage_files, walk_storage_files, DiscoveredFile};
 use wing_photovault_core::timeline_svg::{
@@ -34,7 +34,8 @@ use wing_photovault_core::timeline_svg::{
 };
 use wing_photovault_db::{
     Database, DerivativeLinkOptions, DuplicateFilter, FindCursor, FindFilter,
-    FocalDistributionReport, ScanRunSummary, StatsFilter, UpsertFileInput,
+    FocalDistributionReport, JournalEntryInput, JournalFilter, ScanRunSummary, StatsFilter,
+    UpsertFileInput,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -185,6 +186,52 @@ enum Commands {
 
     /// Search indexed files (and optionally perform verified safe copy to a working directory)
     Find(Box<FindArgs>),
+
+    /// Verify on-disk file hashes against DB records to detect silent bit-rot or missing files (read-only on disk)
+    Verify {
+        /// Restrict verification to a single storage ID (default: all online configured storages)
+        #[arg(long)]
+        storage: Option<String>,
+
+        /// Only verify files never verified or last verified more than N days ago
+        #[arg(long)]
+        older_than_days: Option<u64>,
+
+        /// Maximum number of files to verify per storage (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+
+        /// Pause for `--cooldown-secs` after every N verified files (HDD thermal protection)
+        #[arg(long, default_value_t = 0)]
+        cooldown_every: usize,
+
+        /// Cooldown pause duration in seconds when `--cooldown-every` is enabled
+        #[arg(long, default_value_t = 0)]
+        cooldown_secs: u64,
+
+        /// Compute and check hashes without updating DB timestamps, presence, or operation journal
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Inspect the Phase 2 operation journal (audit log and crash-recovery state)
+    Journal {
+        /// Filter by operation type (copy, ingest, move, quarantine, restore, verify)
+        #[arg(long)]
+        op_type: Option<String>,
+
+        /// Filter by state (planned, copied, verified, committed, failed, rolled_back)
+        #[arg(long)]
+        state: Option<String>,
+
+        /// Show only incomplete entries (not committed, failed, or rolled_back)
+        #[arg(long)]
+        incomplete: bool,
+
+        /// Maximum number of entries to display (0 = unlimited)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 
     /// Benchmark scanning/hashing/EXIF on a directory, or SQLite query/aggregation scale via `--db-scale <N>`
     Benchmark {
@@ -496,6 +543,41 @@ fn main() -> Result<()> {
                 cli.format,
             )
         }
+        Commands::Verify {
+            storage,
+            older_than_days,
+            limit,
+            cooldown_every,
+            cooldown_secs,
+            dry_run,
+        } => cmd_verify(
+            &cli.config,
+            VerifyOpts {
+                storage_filter: storage.as_deref(),
+                older_than_days,
+                limit: (limit > 0).then_some(limit),
+                cooldown_every,
+                cooldown_secs,
+                dry_run,
+                quiet: cli.quiet,
+            },
+            cli.format,
+        ),
+        Commands::Journal {
+            op_type,
+            state,
+            incomplete,
+            limit,
+        } => cmd_journal(
+            &cli.config,
+            JournalFilter {
+                op_type,
+                state,
+                incomplete_only: incomplete,
+                limit: (limit > 0).then_some(limit),
+            },
+            cli.format,
+        ),
         Commands::Benchmark {
             path,
             limit,
@@ -2495,6 +2577,450 @@ fn cmd_find(
                 eprintln!("Found {} file(s). Next page: --cursor {next}", page.items.len());
             } else {
                 eprintln!("Found {} file(s).", page.items.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+struct VerifyOpts<'a> {
+    storage_filter: Option<&'a str>,
+    older_than_days: Option<u64>,
+    limit: Option<usize>,
+    cooldown_every: usize,
+    cooldown_secs: u64,
+    dry_run: bool,
+    quiet: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifyAnomalyRow {
+    file_id: i64,
+    storage_id: String,
+    rel_path: String,
+    kind: String, // "corrupted" | "modified" | "missing" | "io_error"
+    expected_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_hash: Option<String>,
+    message: String,
+    healthy_copies_elsewhere: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifyStorageReport {
+    storage_id: String,
+    skipped_offline: bool,
+    dry_run: bool,
+    checked: u64,
+    ok: u64,
+    corrupted: u64,
+    modified: u64,
+    missing: u64,
+    io_errors: u64,
+    bytes_read: u64,
+    elapsed_ms: u128,
+    anomalies: Vec<VerifyAnomalyRow>,
+}
+
+fn system_time_to_unix_ns(st: std::time::SystemTime) -> i64 {
+    match st.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos().min(i64::MAX as u128) as i64,
+        Err(e) => -(e.duration().as_nanos().min(i64::MAX as u128) as i64),
+    }
+}
+
+fn cmd_verify(config_path: &Path, opts: VerifyOpts<'_>, format: OutputFormat) -> Result<()> {
+    let cfg = Config::load(config_path)
+        .with_context(|| format!("failed to load config: {}", config_path.display()))?;
+    if !cfg.general.db_path.exists() {
+        anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+    }
+
+    let targets: Vec<&StorageConfig> = match opts.storage_filter {
+        Some(id) => cfg.storages.iter().filter(|s| s.id == id).collect(),
+        None => cfg.storages.iter().collect(),
+    };
+    if targets.is_empty() {
+        anyhow::bail!("no matching storages configured in {}", config_path.display());
+    }
+
+    let cutoff_iso = opts.older_than_days.map(|days| {
+        (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339()
+    });
+    let op_group_id = format!("verify-{}", chrono::Utc::now().timestamp_millis());
+
+    let mut db = if opts.dry_run {
+        Database::open_read_only(&cfg.general.db_path)?
+    } else {
+        let db = Database::open(&cfg.general.db_path)?;
+        db.upsert_host(&cfg.host.id, &cfg.host.name, current_host_os())?;
+        db
+    };
+
+    let mut reports: Vec<VerifyStorageReport> = Vec::new();
+
+    for storage in targets {
+        let started = Instant::now();
+        // Offline != Missing invariant: never mark files missing if storage root is unreachable.
+        if !storage.root.is_dir() {
+            if !opts.dry_run {
+                db.upsert_storage(storage, &cfg.host.id, StorageStatus::Offline)?;
+            }
+            warn!(storage_id = %storage.id, root = %storage.root.display(), "storage offline; skipping verify");
+            reports.push(VerifyStorageReport {
+                storage_id: storage.id.clone(),
+                skipped_offline: true,
+                dry_run: opts.dry_run,
+                checked: 0,
+                ok: 0,
+                corrupted: 0,
+                modified: 0,
+                missing: 0,
+                io_errors: 0,
+                bytes_read: 0,
+                elapsed_ms: started.elapsed().as_millis(),
+                anomalies: Vec::new(),
+            });
+            continue;
+        }
+
+        if !opts.dry_run {
+            db.upsert_storage(storage, &cfg.host.id, StorageStatus::Online)?;
+        }
+
+        let candidates =
+            db.select_verify_candidates(&storage.id, cutoff_iso.as_deref(), opts.limit)?;
+        let total = candidates.len() as u64;
+        let workers = cfg.performance.workers_for(storage.media).max(1);
+
+        let pb = if opts.quiet || total == 0 {
+            ProgressBar::hidden()
+        } else {
+            let p = ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr());
+            p.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] verify {prefix} {pos}/{len} ({percent}%) {msg}",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+            );
+            p.set_prefix(storage.id.clone());
+            p
+        };
+
+        struct CheckAnomaly {
+            cand: wing_photovault_db::VerifyCandidateRow,
+            kind: &'static str,
+            actual_hash: Option<String>,
+            message: String,
+            bytes_read: u64,
+        }
+        enum CheckResult {
+            Ok {
+                file_id: i64,
+                bytes_read: u64,
+            },
+            Anomaly(Box<CheckAnomaly>),
+        }
+
+        let check_one = |cand: wing_photovault_db::VerifyCandidateRow| -> CheckResult {
+            let abs_path = match safe_join_rel_path(&storage.root, &cand.rel_path, false) {
+                Ok(p) => p,
+                Err(err) => {
+                    return CheckResult::Anomaly(Box::new(CheckAnomaly {
+                        cand,
+                        kind: "io_error",
+                        actual_hash: None,
+                        message: format!("invalid rel_path: {err}"),
+                        bytes_read: 0,
+                    }));
+                }
+            };
+            let meta = match std::fs::metadata(&abs_path) {
+                Ok(m) => m,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    return CheckResult::Anomaly(Box::new(CheckAnomaly {
+                        cand,
+                        kind: "missing",
+                        actual_hash: None,
+                        message: "file missing on online storage".to_string(),
+                        bytes_read: 0,
+                    }));
+                }
+                Err(err) => {
+                    return CheckResult::Anomaly(Box::new(CheckAnomaly {
+                        cand,
+                        kind: "io_error",
+                        actual_hash: None,
+                        message: format!("metadata error: {err}"),
+                        bytes_read: 0,
+                    }));
+                }
+            };
+            let disk_size = meta.len();
+            let disk_mtime = meta.modified().map(system_time_to_unix_ns).unwrap_or(0);
+
+            match hash_file(&abs_path, cand.hash_algo, false) {
+                Ok(h) => {
+                    if h.hash_hex == cand.expected_hash {
+                        CheckResult::Ok {
+                            file_id: cand.file_id,
+                            bytes_read: h.bytes_read,
+                        }
+                    } else if disk_size == cand.byte_size && disk_mtime == cand.mtime_ns {
+                        CheckResult::Anomaly(Box::new(CheckAnomaly {
+                            cand,
+                            kind: "corrupted",
+                            actual_hash: Some(h.hash_hex),
+                            message: "silent bit-rot: hash mismatch with unchanged size and mtime"
+                                .to_string(),
+                            bytes_read: h.bytes_read,
+                        }))
+                    } else {
+                        let message = format!(
+                            "file modified outside WING (size {} -> {}, mtime {} -> {})",
+                            cand.byte_size, disk_size, cand.mtime_ns, disk_mtime
+                        );
+                        CheckResult::Anomaly(Box::new(CheckAnomaly {
+                            cand,
+                            kind: "modified",
+                            actual_hash: Some(h.hash_hex),
+                            message,
+                            bytes_read: h.bytes_read,
+                        }))
+                    }
+                }
+                Err(err) => CheckResult::Anomaly(Box::new(CheckAnomaly {
+                    cand,
+                    kind: "io_error",
+                    actual_hash: None,
+                    message: format!("read/hash error: {err}"),
+                    bytes_read: 0,
+                })),
+            }
+        };
+
+        let mut ok_ids: Vec<i64> = Vec::new();
+        let mut ok_count = 0u64;
+        let mut corrupted_count = 0u64;
+        let mut modified_count = 0u64;
+        let mut missing_count = 0u64;
+        let mut io_error_count = 0u64;
+        let mut bytes_read_total = 0u64;
+        let mut anomalies: Vec<VerifyAnomalyRow> = Vec::new();
+
+        let chunk_size = if opts.cooldown_every > 0 && opts.cooldown_secs > 0 {
+            opts.cooldown_every
+        } else {
+            cfg.performance.db_batch_size.max(256)
+        };
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .context("failed to build verify thread pool")?;
+
+        let mut cand_iter = candidates.into_iter();
+        loop {
+            let chunk: Vec<_> = cand_iter.by_ref().take(chunk_size).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let results: Vec<CheckResult> =
+                pool.install(|| chunk.into_par_iter().map(check_one).collect());
+
+            for res in results {
+                pb.inc(1);
+                match res {
+                    CheckResult::Ok {
+                        file_id,
+                        bytes_read,
+                    } => {
+                        ok_count += 1;
+                        bytes_read_total += bytes_read;
+                        ok_ids.push(file_id);
+                    }
+                    CheckResult::Anomaly(anom) => {
+                        let CheckAnomaly {
+                            cand,
+                            kind,
+                            actual_hash,
+                            message,
+                            bytes_read,
+                        } = *anom;
+                        bytes_read_total += bytes_read;
+                        match kind {
+                            "corrupted" => {
+                                corrupted_count += 1;
+                                if !opts.dry_run {
+                                    db.mark_file_presence(cand.file_id, Presence::Corrupted)?;
+                                }
+                            }
+                            "missing" => {
+                                missing_count += 1;
+                                if !opts.dry_run {
+                                    db.mark_file_presence(cand.file_id, Presence::Missing)?;
+                                }
+                            }
+                            "modified" => modified_count += 1,
+                            _ => io_error_count += 1,
+                        }
+                        if !opts.dry_run {
+                            db.insert_journal_entry(&JournalEntryInput {
+                                op_group_id: op_group_id.clone(),
+                                op_type: "verify".to_string(),
+                                state: "failed".to_string(),
+                                host_id: Some(cfg.host.id.clone()),
+                                asset_id: cand.asset_id,
+                                file_id: Some(cand.file_id),
+                                src_storage_id: Some(cand.storage_id.clone()),
+                                src_rel_path: Some(cand.rel_path.clone()),
+                                dst_storage_id: None,
+                                dst_rel_path: None,
+                                expected_algo: Some(cand.hash_algo.as_str().to_string()),
+                                expected_hash: Some(cand.expected_hash.clone()),
+                                actual_hash: actual_hash.clone(),
+                                byte_size: Some(cand.byte_size as i64),
+                                error_message: Some(format!("[{kind}] {message}")),
+                            })?;
+                        }
+                        let healthy_copies =
+                            db.find_healthy_copies_elsewhere(cand.content_id, cand.file_id)?;
+                        anomalies.push(VerifyAnomalyRow {
+                            file_id: cand.file_id,
+                            storage_id: cand.storage_id,
+                            rel_path: cand.rel_path,
+                            kind: kind.to_string(),
+                            expected_hash: cand.expected_hash,
+                            actual_hash,
+                            message,
+                            healthy_copies_elsewhere: healthy_copies,
+                        });
+                    }
+                }
+            }
+
+            if !opts.dry_run && !ok_ids.is_empty() {
+                db.record_verify_ok_batch(&ok_ids)?;
+                ok_ids.clear();
+            }
+
+            let secs = started.elapsed().as_secs_f64().max(0.001);
+            let mb_s = (bytes_read_total as f64 / 1_000_000.0) / secs;
+            pb.set_message(format!("{}, {:.1} MB/s", human_bytes(bytes_read_total), mb_s));
+
+            if opts.cooldown_every > 0 && opts.cooldown_secs > 0 && cand_iter.len() > 0 {
+                pb.set_message(format!("cooling down {}s", opts.cooldown_secs));
+                thread::sleep(Duration::from_secs(opts.cooldown_secs));
+            }
+        }
+
+        pb.finish_and_clear();
+
+        reports.push(VerifyStorageReport {
+            storage_id: storage.id.clone(),
+            skipped_offline: false,
+            dry_run: opts.dry_run,
+            checked: total,
+            ok: ok_count,
+            corrupted: corrupted_count,
+            modified: modified_count,
+            missing: missing_count,
+            io_errors: io_error_count,
+            bytes_read: bytes_read_total,
+            elapsed_ms: started.elapsed().as_millis(),
+            anomalies,
+        });
+    }
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+        }
+        OutputFormat::Jsonl => {
+            for r in &reports {
+                println!("{}", serde_json::to_string(r)?);
+            }
+        }
+        OutputFormat::Text => {
+            for r in &reports {
+                let prefix = if r.dry_run { "[dry-run] " } else { "" };
+                if r.skipped_offline {
+                    println!("{prefix}[{}] OFFLINE (skipped; no files marked missing)", r.storage_id);
+                    continue;
+                }
+                println!(
+                    "{prefix}[{}] checked={} ok={} corrupted={} modified={} missing={} io_errors={} read={} ({:.2}s)",
+                    r.storage_id,
+                    r.checked,
+                    r.ok,
+                    r.corrupted,
+                    r.modified,
+                    r.missing,
+                    r.io_errors,
+                    human_bytes(r.bytes_read),
+                    r.elapsed_ms as f64 / 1000.0
+                );
+                for a in &r.anomalies {
+                    let backup_note = if a.healthy_copies_elsewhere.is_empty() {
+                        "NO other healthy copy in catalog!".to_string()
+                    } else {
+                        format!("healthy copy: {}", a.healthy_copies_elsewhere.join(", "))
+                    };
+                    println!(
+                        "  - [{}] {} — {} ({})",
+                        a.kind, a.rel_path, a.message, backup_note
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_journal(config_path: &Path, filter: JournalFilter, format: OutputFormat) -> Result<()> {
+    let cfg = load_config_or_default(config_path)?;
+    if !cfg.general.db_path.exists() {
+        anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+    }
+    let db = Database::open_read_only(&cfg.general.db_path)?;
+    let rows = db.list_journal_entries(&filter)?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        OutputFormat::Jsonl => {
+            for r in &rows {
+                println!("{}", serde_json::to_string(r)?);
+            }
+        }
+        OutputFormat::Text => {
+            if rows.is_empty() {
+                println!("No operation journal entries found.");
+            } else {
+                println!("Operation Journal ({} entries):", rows.len());
+                for r in &rows {
+                    let src = match (&r.src_storage_id, &r.src_rel_path) {
+                        (Some(s), Some(p)) => format!("{s}:{p}"),
+                        (None, Some(p)) => p.clone(),
+                        _ => "-".to_string(),
+                    };
+                    let dst = match (&r.dst_storage_id, &r.dst_rel_path) {
+                        (Some(s), Some(p)) => format!(" -> {s}:{p}"),
+                        (None, Some(p)) => format!(" -> {p}"),
+                        _ => String::new(),
+                    };
+                    let err = r
+                        .error_message
+                        .as_deref()
+                        .map(|e| format!("  err={e}"))
+                        .unwrap_or_default();
+                    println!(
+                        "  - #{} [{} | {:<10}] {}  {}{}{}",
+                        r.id, r.op_type, r.state, r.updated_at, src, dst, err
+                    );
+                }
             }
         }
     }

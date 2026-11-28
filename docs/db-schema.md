@@ -249,10 +249,41 @@ CREATE INDEX IF NOT EXISTS idx_assets_rating_pick ON assets(rating, pick_status)
 -- (v2) キーセットページング・検証タスク用
 CREATE INDEX IF NOT EXISTS idx_assets_captured_id ON assets(captured_at DESC, id ASC);
 CREATE INDEX IF NOT EXISTS idx_files_last_verified ON files(storage_id, last_verified_at);
+-- (v3) サイドカー親検索・RAW+JPEG 統合用複合インデックス
+CREATE INDEX IF NOT EXISTS idx_files_storage_presence_stem ON files(storage_id, presence, file_stem);
 ```
 
-## 5. Phase 2 以降で追加予定のテーブル
-- `operation_journal`（Phase 2: 移動・コピー・隔離の状態遷移ジャーナル）
+### 3.10 `operation_journal` (v4 / Phase 2)
+コピー・取り込み・移動・隔離・復元・整合性検証の監査ログ兼クラッシュリカバリ用状態遷移テーブル。
+
+```sql
+CREATE TABLE IF NOT EXISTS operation_journal (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_group_id     TEXT NOT NULL,
+    op_type         TEXT NOT NULL,     -- 'copy' | 'ingest' | 'move' | 'quarantine' | 'restore' | 'verify'
+    state           TEXT NOT NULL,     -- 'planned' | 'copied' | 'verified' | 'committed' | 'failed' | 'rolled_back'
+    host_id         TEXT REFERENCES hosts(id),
+    asset_id        INTEGER REFERENCES assets(id),
+    file_id         INTEGER REFERENCES files(id),
+    src_storage_id  TEXT REFERENCES storages(id),
+    src_rel_path    TEXT,
+    dst_storage_id  TEXT REFERENCES storages(id),
+    dst_rel_path    TEXT,
+    expected_algo   TEXT,
+    expected_hash   TEXT,
+    actual_hash     TEXT,
+    byte_size       INTEGER,
+    error_message   TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_op_journal_group ON operation_journal(op_group_id);
+CREATE INDEX IF NOT EXISTS idx_op_journal_state ON operation_journal(state, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_op_journal_type_created ON operation_journal(op_type, created_at DESC);
+```
+
+## 5. 今後のフェーズで追加予定のテーブル
 - `file_move_history`（Phase 2: 物理パス移動履歴 — Lightroom 等の外部アプリ参照復旧支援）
 - `quarantine_records`（Phase 2: 隔離元パス・理由・復元用メタデータ）
 - `folder_pins`（Phase 2/4: フォルダ単位の自動移動除外 Pin）

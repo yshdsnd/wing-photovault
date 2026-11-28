@@ -1,8 +1,8 @@
 # WING PhotoVault — 開発ステータス・引き継ぎメモ
 
 - Last Updated: 2026-11-28
-- Current Phase: **Phase 1（読み取り専用インデックス・検索・統計・ベンチマーク・NAS マニフェスト連携）**
-- Branch: `main`（全 37 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
+- Current Phase: **Phase 2（操作ジャーナル・整合性検証・リムーバブル取り込み・安全隔離）進行中**
+- Branch: `main`（全 38 テスト合格 / `cargo clippy --workspace --all-targets -- -D warnings` 警告 0）
 
 > 別マシン（bhyve ゲスト等）で作業を引き継ぐ際は、`git pull` のあと [GEMINI.md](../GEMINI.md) と本書を読んでから進めてください。
 
@@ -21,10 +21,11 @@
 - マニフェスト入力検証（`ScanManifestRecord::validate`: `..` パストラバーサル・不正ハッシュ拒否）
 
 ### DB (`crates/wing-photovault-db`)
-- SQLite WAL（`rusqlite` bundled）＋前方マイグレーション（**Schema v3** 適用済み）
+- SQLite WAL（`rusqlite` bundled）＋前方マイグレーション（**Schema v4** 適用済み）
   - v1: `storages`, `assets`, `contents`, `content_metadata`, `scan_runs`, `files`
   - v2: `hosts`, `storage_mounts`, `storages` 権限/状態/障害ドメイン、`assets.public_id`（UUIDv7）、`files.last_seen_at` / `last_verified_at`、ストレージ状態（`online`/`offline`/`failed`/`retired`）とファイル存在状態（`present`/`missing`/`corrupted`）の完全分離
   - v3: `idx_files_storage_presence_stem(storage_id, presence, file_stem)` 複合インデックス（大規模ストレージでのサイドカー親 Asset 検索・RAW+JPEG 統合を O(log N) 化）
+  - v4: `operation_journal` テーブル（コピー・取り込み・移動・隔離・復元・整合性検証の監査ログ兼クラッシュリカバリ用状態遷移テーブル）
 - 差分スキャン（未変更ファイルは `last_seen_at` のみ更新し `last_verified_at` を保持）
 - RAW + JPEG 論理 Asset 統合（同一フォルダ＋兄弟 `RAW/`・`JPEG/` フォルダ対応、曖昧時は非統合）
   - O(1) バッチ内ペアリング（途中中断してもコミット済み分は統合済み）＋スキャン末尾の冪等スイープ
@@ -36,6 +37,7 @@
 - `export-manifest` / `import-manifest`（FreeBSD NAS ローカルスキャン → Windows DB 取り込み、`[exif.lens_aliases]` 自動適用）
 - `normalize-lenses`（再スキャン不要で既存 DB の `lens_model_raw` から `[exif.lens_aliases]` を再適用、`--dry-run` 読み取り専用プレビュー対応）
 - `link-derivatives`（Lightroom Classic 等のレタッチ済み／リサイズ書き出し JPEG を撮影日時 `captured_at`＋`subsec`/ファイル名/カメラ・シリアル互換ガードで元の論理 Asset に関連付け、`role = 'exported'` 付与・元 Asset ID 維持・曖昧時 Fail Closed・`--dry-run` 読み取り専用プレビュー対応）
+- `verify` / `journal`（Phase 2-1: 実体ファイルのハッシュ再計算によるサイレントビットロット・欠損・外部変更検知、他ストレージ上の健全コピー有無の即時表示、`--older-than-days` / `--limit` / `--cooldown-*` / `--dry-run` 対応、異常の `operation_journal` 記録と `journal [--incomplete]` 閲覧）
 - `status` / `stats`（`--percent`, `--by-year`, `--gear-history` 使用機材年表、`--cost-per-shot` 1ショット単価、`--split-extenders` テレコン分解集計、`--focal-dist` / `--focal-35mm` 焦点距離＆35mm換算分布ヒストグラム＋`[stats.camera_crop_factors]`、`--year`/`--camera`/`--lens` 絞り込み、`--export-timeline-svg` スタンドアロン SVG 年表出力、未バックアップ件数＆切り捨て%表示対応）/ `duplicates`（読み取り専用重複検出、`read_only`/`external` バックアップ保護、`--include-backups`/`--include-sidecars`/`--min-bytes`/`--limit` 対応）/ `find`（キーセットページング `--cursor`, `--page-info`、焦点距離/ISO/F値/パス/`--asset-id`/`--unbacked` フィルタ、ハッシュ検証付き安全コピー `--copy-to` + `--with-companions` + `--flat` + `--dry-run` 対応）/ `benchmark`（ディレクトリ実測＋`--db-scale <N>` 大規模ダミー DB ベンチマーク、`--format text|json|jsonl`、`stderr` リアルタイム進捗バー＋ETA）
 
 ### テスト用ミニ UI (`tools/wingpv-mini-ui` / バイナリ名 `wingpv-mini-ui`)

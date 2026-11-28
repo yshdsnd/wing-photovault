@@ -126,6 +126,23 @@ pub fn build_link_derivatives_args(config_path: &Path, json: bool, dry_run: bool
     args
 }
 
+pub fn build_verify_args(
+    config_path: &Path,
+    json: bool,
+    dry_run: bool,
+    limit: usize,
+) -> Vec<String> {
+    let mut args = build_simple_args(config_path, json, "verify");
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    if limit > 0 {
+        args.push("--limit".to_string());
+        args.push(limit.to_string());
+    }
+    args
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_stats_args(
     config_path: &Path,
@@ -566,6 +583,19 @@ mod tests {
                 r"C:\test\wing-photovault.toml",
                 "link-derivatives",
                 "--dry-run",
+            ]
+        );
+
+        let verify_args = build_verify_args(cfg, false, true, 100);
+        assert_eq!(
+            verify_args,
+            vec![
+                "--config",
+                r"C:\test\wing-photovault.toml",
+                "verify",
+                "--dry-run",
+                "--limit",
+                "100",
             ]
         );
 
