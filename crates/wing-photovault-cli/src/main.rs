@@ -33,8 +33,8 @@ use wing_photovault_core::timeline_svg::{
     render_timeline_svg, AnnualBar, TimelineBar, TimelineSvgInput,
 };
 use wing_photovault_db::{
-    Database, DuplicateFilter, FindCursor, FindFilter, FocalDistributionReport, ScanRunSummary,
-    StatsFilter, UpsertFileInput,
+    Database, DerivativeLinkOptions, DuplicateFilter, FindCursor, FindFilter,
+    FocalDistributionReport, ScanRunSummary, StatsFilter, UpsertFileInput,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -133,6 +133,25 @@ enum Commands {
         /// Preview changes without modifying the database
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Link retouched/exported JPEG files to their original logical Asset using capture timestamp (+ subsec/stem/EXIF guards)
+    LinkDerivatives {
+        /// Preview derivative links without modifying the database
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Restrict candidate derivative JPEGs to a single storage ID (targets still searched across all storages)
+        #[arg(long)]
+        storage: Option<String>,
+
+        /// Only link to RAW-backed original Assets (skip JPEG-only -> JPEG-only derivatives)
+        #[arg(long)]
+        raw_only: bool,
+
+        /// Maximum number of sample match rows to print in text output (0 = all)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
     },
 
     /// Show database and storage status
@@ -280,6 +299,9 @@ struct FindArgs {
     /// Exact logical asset_id filter
     #[arg(long)]
     asset_id: Option<i64>,
+    /// Filter by file role (original, backup, exported, sidecar)
+    #[arg(long)]
+    role: Option<String>,
     /// Only show files whose content is NOT backed up on any backup-tier storage
     #[arg(long)]
     unbacked: bool,
@@ -340,6 +362,21 @@ fn main() -> Result<()> {
         Commands::NormalizeLenses { dry_run } => {
             cmd_normalize_lenses(&cli.config, dry_run, cli.format)
         }
+        Commands::LinkDerivatives {
+            dry_run,
+            storage,
+            raw_only,
+            limit,
+        } => cmd_link_derivatives(
+            &cli.config,
+            DerivativeLinkOptions {
+                dry_run,
+                storage_id: storage,
+                include_jpeg_to_jpeg: !raw_only,
+            },
+            limit,
+            cli.format,
+        ),
         Commands::Status => cmd_status(&cli.config, cli.format),
         Commands::Stats(args) => {
             let StatsArgs {
@@ -410,6 +447,7 @@ fn main() -> Result<()> {
                 max_f,
                 path,
                 asset_id,
+                role,
                 unbacked,
                 limit,
                 cursor,
@@ -443,6 +481,7 @@ fn main() -> Result<()> {
                     max_f_number: max_f,
                     path_contains: path,
                     asset_id,
+                    role,
                     unbacked_only: unbacked,
                     limit: Some(limit),
                     cursor: decoded_cursor,
@@ -1339,6 +1378,92 @@ fn cmd_normalize_lenses(config_path: &Path, dry_run: bool, format: OutputFormat)
                     ch.assets_affected,
                     ch.contents_affected
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_link_derivatives(
+    config_path: &Path,
+    opts: DerivativeLinkOptions,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let cfg = load_config_or_default(config_path)?;
+    if !cfg.general.db_path.exists() {
+        anyhow::bail!("database does not exist: {}", cfg.general.db_path.display());
+    }
+
+    let report = if opts.dry_run {
+        let db = Database::open_read_only(&cfg.general.db_path)?;
+        db.plan_derivative_jpegs(&opts)?
+    } else {
+        let mut db = Database::open(&cfg.general.db_path)?;
+        db.link_derivative_jpegs(&opts)?
+    };
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Jsonl => {
+            for m in &report.matches {
+                println!("{}", serde_json::to_string(m)?);
+            }
+        }
+        OutputFormat::Text => {
+            let prefix = if report.dry_run { "[dry-run] " } else { "" };
+            let verb = if report.dry_run {
+                "would link"
+            } else {
+                "linked"
+            };
+            println!(
+                "{prefix}Derivative JPEG linking: scanned_jpeg_assets={}  {verb}={} assets ({} files)  ambiguous_skipped={}",
+                report.scanned_jpeg_assets,
+                report.linked_assets,
+                report.linked_files,
+                report.ambiguous_skipped
+            );
+            if !report.by_reason.is_empty() {
+                println!("\nBy Match Reason:");
+                for (reason, cnt) in &report.by_reason {
+                    println!("  - {:<28} {:>8}", reason, cnt);
+                }
+            }
+            if !report.matches.is_empty() {
+                let show_n = if limit == 0 {
+                    report.matches.len()
+                } else {
+                    limit.min(report.matches.len())
+                };
+                println!(
+                    "\nMatched Derivatives (showing {} of {}):",
+                    show_n,
+                    report.matches.len()
+                );
+                for m in report.matches.iter().take(show_n) {
+                    println!(
+                        "  - [{}] {}  ->  {}  (asset #{}, {})",
+                        m.match_reason, m.derivative_path, m.target_path, m.target_asset_id, m.captured_at
+                    );
+                }
+            }
+            if !report.ambiguous_samples.is_empty() {
+                println!(
+                    "\nAmbiguous Skipped (Fail Closed, showing {} of {}):",
+                    report.ambiguous_samples.len(),
+                    report.ambiguous_skipped
+                );
+                for a in &report.ambiguous_samples {
+                    println!(
+                        "  - {} ({})  candidates=[{}]",
+                        a.derivative_path,
+                        a.captured_at,
+                        a.candidate_paths.join(", ")
+                    );
+                }
             }
         }
     }
@@ -2350,14 +2475,20 @@ fn cmd_find(
                 } else {
                     "-".to_string()
                 };
+                let role_tag = match r.role.as_str() {
+                    "exported" => " [exported]",
+                    "sidecar" => " [sidecar]",
+                    _ => "",
+                };
                 println!(
-                    "{} | {:<16} | {:<6} | {:<19} | {:<18} | {}",
+                    "{} | {:<16} | {:<6} | {:<19} | {:<18} | {}{}",
                     r.storage_id,
                     r.format,
                     metric,
                     r.captured_at.as_deref().unwrap_or("-"),
                     r.camera_model.as_deref().unwrap_or("-"),
-                    r.rel_path
+                    r.rel_path,
+                    role_tag
                 );
             }
             if let Some(next) = &page.next_cursor {

@@ -63,6 +63,58 @@ pub struct SidecarLinkReport {
     pub unmatched_or_ambiguous: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DerivativeLinkOptions {
+    /// Preview matches without modifying the database.
+    pub dry_run: bool,
+    /// Optional filter restricting candidate derivative JPEGs to a single storage ID
+    /// (original RAW/JPEG targets are still searched across all storages).
+    pub storage_id: Option<String>,
+    /// Also link retouched/resized JPEG derivatives to original JPEG-only assets (when no RAW exists).
+    pub include_jpeg_to_jpeg: bool,
+}
+
+impl Default for DerivativeLinkOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            storage_id: None,
+            include_jpeg_to_jpeg: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DerivativeMatchRow {
+    pub derivative_asset_id: i64,
+    pub target_asset_id: i64,
+    pub derivative_file_ids: Vec<i64>,
+    pub derivative_path: String,
+    pub target_path: String,
+    pub captured_at: String,
+    pub match_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DerivativeAmbiguousRow {
+    pub derivative_asset_id: i64,
+    pub derivative_path: String,
+    pub captured_at: String,
+    pub candidate_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DerivativeLinkReport {
+    pub dry_run: bool,
+    pub scanned_jpeg_assets: u64,
+    pub linked_assets: u64,
+    pub linked_files: u64,
+    pub by_reason: BTreeMap<String, u64>,
+    pub ambiguous_skipped: u64,
+    pub matches: Vec<DerivativeMatchRow>,
+    pub ambiguous_samples: Vec<DerivativeAmbiguousRow>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScanRunSummary {
     pub scan_run_id: i64,
@@ -328,6 +380,7 @@ pub struct FindFilter {
     pub max_f_number: Option<f64>,
     pub path_contains: Option<String>,
     pub asset_id: Option<i64>,
+    pub role: Option<String>,
     pub unbacked_only: bool,
     pub limit: Option<i64>,
     pub cursor: Option<FindCursor>,
@@ -362,6 +415,7 @@ pub struct FindRow {
     pub asset_public_id: Option<String>,
     pub storage_id: String,
     pub rel_path: String,
+    pub role: String,
     pub format: String,
     pub byte_size: i64,
     pub captured_at: Option<String>,
@@ -1011,9 +1065,9 @@ impl Database {
             }
 
             // If both sides have camera_model / camera_serial / captured_subsec, they must match
-            if !opt_eq_if_both(&r.camera_model, &i.camera_model)
-                || !opt_eq_if_both(&r.camera_serial, &i.camera_serial)
-                || !opt_eq_if_both(&r.captured_subsec, &i.captured_subsec)
+            if !opt_eq_ci_if_both(&r.camera_model, &i.camera_model)
+                || !opt_serial_eq_if_both(&r.camera_serial, &i.camera_serial)
+                || !opt_subsec_eq_if_both(&r.captured_subsec, &i.captured_subsec)
             {
                 report.ambiguous_skipped += 1;
                 continue;
@@ -1177,6 +1231,437 @@ impl Database {
                 let n = stmt.execute(params![parent_aid, now, file_id])?;
                 report.linked += n as u64;
             }
+        }
+        tx.commit()?;
+
+        Ok(report)
+    }
+
+    /// Read-only planner for linking retouched/exported JPEG derivatives to their original
+    /// logical Asset (cross-storage, preserving original Asset ID, Fail Closed on ambiguity).
+    ///
+    /// Rules:
+    /// - Hard compatibility filters (any conflict disqualifies a candidate):
+    ///   - Exact identical non-empty `captured_at` (year 1970..=2999).
+    ///   - If both sides have `camera_model`, they must match (case-insensitive).
+    ///     If the exported JPEG stripped EXIF camera info (`None`), it stays eligible.
+    ///   - If both sides have `camera_serial`, they must match ignoring leading `'0'`s.
+    ///   - If both sides have `captured_subsec`, they must match ignoring trailing `'0'`s.
+    /// - Phase 1 (JPEG-only -> RAW-backed Original Asset), deterministic cascade:
+    ///   1. `timestamp+stem`: exactly 1 compatible RAW whose stem matches/is contained cleanly in JPEG stem.
+    ///   2. `timestamp+subsec`: JPEG has `captured_subsec` and exactly 1 compatible RAW matches it.
+    ///   3. `timestamp_unique`: exactly 1 compatible RAW exists in the entire catalog at that second.
+    ///   4. `timestamp+exposure`: burst tie-breaker requiring exact match on focal/f-number/shutter/ISO.
+    ///   5. Otherwise skipped as `ambiguous_skipped` (never guesses).
+    /// - Phase 2 (optional, `include_jpeg_to_jpeg`): remaining JPEG-only -> JPEG-only Asset at the same
+    ///   `captured_at` when compatible AND stem-related, preferring curated / non-derivative / higher-res anchor.
+    pub fn plan_derivative_jpegs(
+        &self,
+        opts: &DerivativeLinkOptions,
+    ) -> DbResult<DerivativeLinkReport> {
+        #[derive(Debug, Clone)]
+        struct FileBrief {
+            file_id: i64,
+            storage_id: String,
+            rel_path: String,
+            file_stem: String,
+            format: String,
+            media_kind: String,
+            byte_size: i64,
+        }
+
+        #[derive(Debug, Clone)]
+        struct AssetBrief {
+            asset_id: i64,
+            captured_at: String,
+            captured_subsec: Option<String>,
+            camera_model: Option<String>,
+            camera_serial: Option<String>,
+            focal_length_mm: Option<f64>,
+            f_number: Option<f64>,
+            shutter_speed_str: Option<String>,
+            iso: Option<i64>,
+            pixel_area: i64,
+            has_curation: bool,
+            has_raw: bool,
+            has_jpeg: bool,
+            has_video: bool,
+            files: Vec<FileBrief>,
+        }
+
+        let mut files_by_asset: HashMap<i64, Vec<FileBrief>> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.id, f.asset_id, f.storage_id, f.rel_path, f.file_stem,
+                        COALESCE(c.format, ''), COALESCE(c.media_kind, ''), f.byte_size
+                 FROM files f
+                 LEFT JOIN contents c ON c.id = f.content_id
+                 WHERE f.presence = 'present'
+                   AND f.asset_id IS NOT NULL
+                   AND f.role != 'sidecar'",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(1)?,
+                    FileBrief {
+                        file_id: r.get(0)?,
+                        storage_id: r.get(2)?,
+                        rel_path: r.get(3)?,
+                        file_stem: r.get(4)?,
+                        format: r.get(5)?,
+                        media_kind: r.get(6)?,
+                        byte_size: r.get(7)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (aid, fb) = row?;
+                files_by_asset.entry(aid).or_default().push(fb);
+            }
+        }
+
+        let mut raw_by_ts: HashMap<String, Vec<AssetBrief>> = HashMap::new();
+        let mut jpg_only: Vec<AssetBrief> = Vec::new();
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, captured_at, captured_subsec, camera_model, camera_serial,
+                        focal_length_mm, f_number, shutter_speed_str, iso, width, height,
+                        (CASE WHEN rating > 0 OR pick_status != 'unreviewed' OR is_favorite != 0 OR hot_pinned != 0 THEN 1 ELSE 0 END)
+                 FROM assets
+                 WHERE captured_at IS NOT NULL
+                   AND length(captured_at) >= 19
+                   AND substr(captured_at, 1, 4) >= '1970'
+                   AND substr(captured_at, 1, 4) <= '2999'",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<f64>>(5)?,
+                    r.get::<_, Option<f64>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, Option<i64>>(10)?,
+                    r.get::<_, i64>(11)? != 0,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    asset_id,
+                    captured_at,
+                    captured_subsec,
+                    camera_model,
+                    camera_serial,
+                    focal_length_mm,
+                    f_number,
+                    shutter_speed_str,
+                    iso,
+                    width,
+                    height,
+                    has_curation,
+                ) = row?;
+                let Some(mut files) = files_by_asset.remove(&asset_id) else {
+                    continue;
+                };
+                files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path).then_with(|| a.file_id.cmp(&b.file_id)));
+                let has_raw = files.iter().any(|f| f.media_kind == "raw");
+                let has_jpeg = files.iter().any(|f| f.format == "jpeg");
+                let has_video = files.iter().any(|f| f.media_kind == "video");
+                let pixel_area = width.unwrap_or(0).saturating_mul(height.unwrap_or(0));
+                let brief = AssetBrief {
+                    asset_id,
+                    captured_at: captured_at.clone(),
+                    captured_subsec,
+                    camera_model,
+                    camera_serial,
+                    focal_length_mm,
+                    f_number,
+                    shutter_speed_str,
+                    iso,
+                    pixel_area,
+                    has_curation,
+                    has_raw,
+                    has_jpeg,
+                    has_video,
+                    files,
+                };
+                if brief.has_raw {
+                    raw_by_ts.entry(captured_at).or_default().push(brief);
+                } else if brief.has_jpeg && !brief.has_video {
+                    jpg_only.push(brief);
+                }
+            }
+        }
+
+        // Sort deterministically by asset_id
+        jpg_only.sort_by_key(|a| a.asset_id);
+        for v in raw_by_ts.values_mut() {
+            v.sort_by_key(|a| a.asset_id);
+        }
+
+        let is_compatible = |j: &AssetBrief, r: &AssetBrief| -> bool {
+            opt_eq_ci_if_both(&j.camera_model, &r.camera_model)
+                && opt_serial_eq_if_both(&j.camera_serial, &r.camera_serial)
+                && opt_subsec_eq_if_both(&j.captured_subsec, &r.captured_subsec)
+        };
+
+        let in_storage_scope = |j: &AssetBrief| -> bool {
+            match &opts.storage_id {
+                Some(sid) => j.files.iter().any(|f| f.storage_id == *sid),
+                None => true,
+            }
+        };
+
+        let primary_path = |a: &AssetBrief| -> String {
+            a.files
+                .iter()
+                .find(|f| f.media_kind == "raw")
+                .or_else(|| a.files.first())
+                .map(|f| f.rel_path.clone())
+                .unwrap_or_default()
+        };
+
+        let mut report = DerivativeLinkReport {
+            dry_run: opts.dry_run,
+            scanned_jpeg_assets: jpg_only.iter().filter(|j| in_storage_scope(j)).count() as u64,
+            ..Default::default()
+        };
+        let mut linked_ids: HashSet<i64> = HashSet::new();
+
+        // Phase 1: JPEG-only -> RAW-backed Original Asset
+        for j in &jpg_only {
+            if !in_storage_scope(j) {
+                continue;
+            }
+            let Some(raw_cands) = raw_by_ts.get(&j.captured_at) else {
+                continue;
+            };
+            let compat: Vec<&AssetBrief> = raw_cands
+                .iter()
+                .filter(|r| r.asset_id != j.asset_id && is_compatible(j, r))
+                .collect();
+            if compat.is_empty() {
+                continue;
+            }
+
+            let stem_hits: Vec<&AssetBrief> = compat
+                .iter()
+                .copied()
+                .filter(|r| {
+                    j.files.iter().any(|jf| {
+                        r.files
+                            .iter()
+                            .any(|rf| derivative_stem_matches(&jf.file_stem, &rf.file_stem))
+                    })
+                })
+                .collect();
+
+            let j_sub_norm = normalize_subsec(j.captured_subsec.as_deref());
+            let subsec_hits: Vec<&AssetBrief> = if let Some(js) = j_sub_norm.as_deref() {
+                compat
+                    .iter()
+                    .copied()
+                    .filter(|r| normalize_subsec(r.captured_subsec.as_deref()).as_deref() == Some(js))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let chosen: Option<(&AssetBrief, &'static str)> = if stem_hits.len() == 1 {
+                Some((stem_hits[0], "timestamp+stem"))
+            } else if subsec_hits.len() == 1 {
+                Some((subsec_hits[0], "timestamp+subsec"))
+            } else if compat.len() == 1 {
+                Some((compat[0], "timestamp_unique"))
+            } else {
+                let exp_hits: Vec<&AssetBrief> = compat
+                    .iter()
+                    .copied()
+                    .filter(|r| {
+                        j.focal_length_mm.is_some()
+                            && r.focal_length_mm == j.focal_length_mm
+                            && j.f_number.is_some()
+                            && r.f_number == j.f_number
+                            && j.shutter_speed_str.is_some()
+                            && r.shutter_speed_str == j.shutter_speed_str
+                            && j.iso.is_some()
+                            && r.iso == j.iso
+                    })
+                    .collect();
+                if exp_hits.len() == 1 {
+                    Some((exp_hits[0], "timestamp+exposure"))
+                } else {
+                    None
+                }
+            };
+
+            match chosen {
+                Some((target, reason)) => {
+                    linked_ids.insert(j.asset_id);
+                    report.linked_assets += 1;
+                    report.linked_files += j.files.len() as u64;
+                    *report.by_reason.entry(reason.to_string()).or_insert(0) += 1;
+                    report.matches.push(DerivativeMatchRow {
+                        derivative_asset_id: j.asset_id,
+                        target_asset_id: target.asset_id,
+                        derivative_file_ids: j.files.iter().map(|f| f.file_id).collect(),
+                        derivative_path: primary_path(j),
+                        target_path: primary_path(target),
+                        captured_at: j.captured_at.clone(),
+                        match_reason: reason.to_string(),
+                    });
+                }
+                None => {
+                    report.ambiguous_skipped += 1;
+                    if report.ambiguous_samples.len() < 20 {
+                        report.ambiguous_samples.push(DerivativeAmbiguousRow {
+                            derivative_asset_id: j.asset_id,
+                            derivative_path: primary_path(j),
+                            captured_at: j.captured_at.clone(),
+                            candidate_paths: compat.iter().take(4).map(|c| primary_path(c)).collect(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Remaining JPEG-only -> JPEG-only (same captured_at + compatible + stem-related)
+        if opts.include_jpeg_to_jpeg {
+            let mut rem_by_ts: HashMap<String, Vec<&AssetBrief>> = HashMap::new();
+            for j in &jpg_only {
+                if !linked_ids.contains(&j.asset_id) {
+                    rem_by_ts.entry(j.captured_at.clone()).or_default().push(j);
+                }
+            }
+            let mut ts_keys: Vec<String> = rem_by_ts.keys().cloned().collect();
+            ts_keys.sort();
+
+            for ts in ts_keys {
+                let grp = &rem_by_ts[&ts];
+                if grp.len() < 2 {
+                    continue;
+                }
+                let mut ordered = grp.clone();
+                ordered.sort_by(|a, b| {
+                    let a_deriv = is_derivative_like_path(&primary_path(a));
+                    let b_deriv = is_derivative_like_path(&primary_path(b));
+                    let a_max_sz = a.files.iter().map(|f| f.byte_size).max().unwrap_or(0);
+                    let b_max_sz = b.files.iter().map(|f| f.byte_size).max().unwrap_or(0);
+                    b.has_curation
+                        .cmp(&a.has_curation)
+                        .then_with(|| a_deriv.cmp(&b_deriv))
+                        .then_with(|| b.pixel_area.cmp(&a.pixel_area))
+                        .then_with(|| b_max_sz.cmp(&a_max_sz))
+                        .then_with(|| a.asset_id.cmp(&b.asset_id))
+                });
+
+                // Each remaining asset looks for an unambiguous higher-ranked stem-related anchor
+                let mut absorbed: HashSet<i64> = HashSet::new();
+                for idx in 1..ordered.len() {
+                    let cand = ordered[idx];
+                    if !in_storage_scope(cand) {
+                        continue;
+                    }
+                    let anchors: Vec<&AssetBrief> = ordered[..idx]
+                        .iter()
+                        .copied()
+                        .filter(|anc| !absorbed.contains(&anc.asset_id))
+                        .filter(|anc| is_compatible(cand, anc))
+                        .filter(|anc| {
+                            cand.files.iter().any(|cf| {
+                                anc.files.iter().any(|af| {
+                                    derivative_stem_matches(&cf.file_stem, &af.file_stem)
+                                        || derivative_stem_matches(&af.file_stem, &cf.file_stem)
+                                })
+                            })
+                        })
+                        .collect();
+                    if anchors.len() == 1 {
+                        let target = anchors[0];
+                        absorbed.insert(cand.asset_id);
+                        report.linked_assets += 1;
+                        report.linked_files += cand.files.len() as u64;
+                        let reason = "jpeg_to_jpeg:timestamp+stem";
+                        *report.by_reason.entry(reason.to_string()).or_insert(0) += 1;
+                        report.matches.push(DerivativeMatchRow {
+                            derivative_asset_id: cand.asset_id,
+                            target_asset_id: target.asset_id,
+                            derivative_file_ids: cand.files.iter().map(|f| f.file_id).collect(),
+                            derivative_path: primary_path(cand),
+                            target_path: primary_path(target),
+                            captured_at: cand.captured_at.clone(),
+                            match_reason: reason.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Link retouched/exported JPEG derivatives to their parent original Assets in the DB.
+    /// When `opts.dry_run` is `true`, no database writes are performed.
+    /// Never modifies any file on disk; only updates logical `asset_id` and `files.role = 'exported'` in SQLite.
+    pub fn link_derivative_jpegs(
+        &mut self,
+        opts: &DerivativeLinkOptions,
+    ) -> DbResult<DerivativeLinkReport> {
+        let report = self.plan_derivative_jpegs(opts)?;
+        if opts.dry_run || report.matches.is_empty() {
+            return Ok(report);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        for m in &report.matches {
+            // Preserve original Asset metadata; only backfill NULL columns from the absorbed asset
+            tx.execute(
+                "UPDATE assets SET
+                    captured_at = COALESCE(captured_at, (SELECT captured_at FROM assets WHERE id = ?2)),
+                    captured_subsec = COALESCE(captured_subsec, (SELECT captured_subsec FROM assets WHERE id = ?2)),
+                    camera_make = COALESCE(camera_make, (SELECT camera_make FROM assets WHERE id = ?2)),
+                    camera_model = COALESCE(camera_model, (SELECT camera_model FROM assets WHERE id = ?2)),
+                    camera_serial = COALESCE(camera_serial, (SELECT camera_serial FROM assets WHERE id = ?2)),
+                    lens_model_raw = COALESCE(lens_model_raw, (SELECT lens_model_raw FROM assets WHERE id = ?2)),
+                    lens_model = COALESCE(lens_model, (SELECT lens_model FROM assets WHERE id = ?2)),
+                    focal_length_mm = COALESCE(focal_length_mm, (SELECT focal_length_mm FROM assets WHERE id = ?2)),
+                    focal_length_35mm = COALESCE(focal_length_35mm, (SELECT focal_length_35mm FROM assets WHERE id = ?2)),
+                    f_number = COALESCE(f_number, (SELECT f_number FROM assets WHERE id = ?2)),
+                    shutter_speed_s = COALESCE(shutter_speed_s, (SELECT shutter_speed_s FROM assets WHERE id = ?2)),
+                    shutter_speed_str = COALESCE(shutter_speed_str, (SELECT shutter_speed_str FROM assets WHERE id = ?2)),
+                    iso = COALESCE(iso, (SELECT iso FROM assets WHERE id = ?2)),
+                    exposure_bias = COALESCE(exposure_bias, (SELECT exposure_bias FROM assets WHERE id = ?2)),
+                    width = COALESCE(width, (SELECT width FROM assets WHERE id = ?2)),
+                    height = COALESCE(height, (SELECT height FROM assets WHERE id = ?2)),
+                    orientation = COALESCE(orientation, (SELECT orientation FROM assets WHERE id = ?2)),
+                    gps_lat = COALESCE(gps_lat, (SELECT gps_lat FROM assets WHERE id = ?2)),
+                    gps_lon = COALESCE(gps_lon, (SELECT gps_lon FROM assets WHERE id = ?2)),
+                    updated_at = ?3
+                 WHERE id = ?1",
+                params![m.target_asset_id, m.derivative_asset_id, now],
+            )?;
+
+            // Re-point non-sidecar derivative files to target asset and mark role = 'exported'
+            tx.execute(
+                "UPDATE files
+                 SET asset_id = ?1,
+                     role = CASE WHEN role = 'sidecar' THEN 'sidecar' ELSE 'exported' END,
+                     updated_at = ?3
+                 WHERE asset_id = ?2",
+                params![m.target_asset_id, m.derivative_asset_id, now],
+            )?;
+
+            // Clean up now-unreferenced absorbed asset row safely
+            tx.execute(
+                "DELETE FROM assets WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM files WHERE asset_id = ?1)",
+                params![m.derivative_asset_id],
+            )?;
         }
         tx.commit()?;
 
@@ -2357,7 +2842,7 @@ impl Database {
     /// Uses `LIMIT + 1` probing to determine `has_more` and `next_cursor` without `OFFSET`.
     pub fn find_page(&self, filter: &FindFilter) -> DbResult<FindPage> {
         let mut sql = String::from(
-            "SELECT f.id, f.asset_id, a.public_id, f.storage_id, f.rel_path,
+            "SELECT f.id, f.asset_id, a.public_id, f.storage_id, f.rel_path, f.role,
                     COALESCE(c.format, f.ext), f.byte_size,
                     a.captured_at, a.camera_model, a.lens_model,
                     a.focal_length_mm, a.focal_length_35mm, a.f_number, a.shutter_speed_str, a.iso,
@@ -2425,6 +2910,10 @@ impl Database {
             sql.push_str(" AND f.asset_id = ?");
             bind_values.push(aid.into());
         }
+        if let Some(role) = &filter.role {
+            sql.push_str(" AND LOWER(f.role) = LOWER(?)");
+            bind_values.push(role.clone().into());
+        }
         if filter.unbacked_only {
             sql.push_str(
                 " AND f.content_id IS NOT NULL
@@ -2462,18 +2951,19 @@ impl Database {
                 asset_public_id: r.get(2)?,
                 storage_id: r.get(3)?,
                 rel_path: r.get(4)?,
-                format: r.get(5)?,
-                byte_size: r.get(6)?,
-                captured_at: r.get(7)?,
-                camera_model: r.get(8)?,
-                lens_model: r.get(9)?,
-                focal_length_mm: r.get(10)?,
-                focal_length_35mm: r.get(11)?,
-                f_number: r.get(12)?,
-                shutter_speed_str: r.get(13)?,
-                iso: r.get(14)?,
-                duration_ms: r.get(15)?,
-                fps: r.get(16)?,
+                role: r.get(5)?,
+                format: r.get(6)?,
+                byte_size: r.get(7)?,
+                captured_at: r.get(8)?,
+                camera_model: r.get(9)?,
+                lens_model: r.get(10)?,
+                focal_length_mm: r.get(11)?,
+                focal_length_35mm: r.get(12)?,
+                f_number: r.get(13)?,
+                shutter_speed_str: r.get(14)?,
+                iso: r.get(15)?,
+                duration_ms: r.get(16)?,
+                fps: r.get(17)?,
             })
         })?;
 
@@ -3212,6 +3702,95 @@ fn pairing_folder_key(rel_path: &str, media_kind: &str) -> String {
     } else {
         chosen.to_string()
     }
+}
+
+fn opt_eq_ci_if_both(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.trim().eq_ignore_ascii_case(y.trim()),
+        _ => true,
+    }
+}
+
+/// Normalize camera serial numbers by stripping leading `'0'`s so e.g. `"0310112080"` (CR2)
+/// and `"310112080"` (Lightroom/DPP exported JPEG) match cleanly.
+fn opt_serial_eq_if_both(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let nx = x.trim().trim_start_matches('0');
+            let ny = y.trim().trim_start_matches('0');
+            nx == ny
+        }
+        _ => true,
+    }
+}
+
+fn normalize_subsec(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let stripped = s.trim_end_matches('0');
+    if stripped.is_empty() {
+        Some("0".to_string())
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+fn opt_subsec_eq_if_both(a: &Option<String>, b: &Option<String>) -> bool {
+    match (normalize_subsec(a.as_deref()), normalize_subsec(b.as_deref())) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+/// Check if a derivative JPEG stem matches or cleanly contains an original file stem
+/// (e.g. `IMG_1364_1920x1200`, `_05A6547_1`, `1M5A1060-Edit`, `F-15_MG_8001`).
+fn derivative_stem_matches(deriv_stem: &str, orig_stem: &str) -> bool {
+    let ds = deriv_stem.trim().to_ascii_lowercase();
+    let os = orig_stem.trim().to_ascii_lowercase();
+    if ds.is_empty() || os.is_empty() {
+        return false;
+    }
+    if ds == os {
+        return true;
+    }
+    if os.len() < 4 {
+        return false;
+    }
+    let Some(idx) = ds.find(&os) else {
+        return false;
+    };
+    let os_bytes = os.as_bytes();
+    let ds_bytes = ds.as_bytes();
+    let before_ok = idx == 0
+        || !ds_bytes[idx - 1].is_ascii_alphanumeric()
+        || !os_bytes[0].is_ascii_alphanumeric();
+    let after = idx + os.len();
+    let after_ok = after == ds.len() || !ds_bytes[after].is_ascii_alphanumeric();
+    before_ok && after_ok
+}
+
+fn is_derivative_like_path(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "/retouch",
+        "retouched/",
+        "/edit/",
+        "/edited/",
+        "/export/",
+        "/exported/",
+        "/work/",
+        "/small/",
+        "/web/",
+        "/sns/",
+        "/wallpaper/",
+        "/for_print/",
+        "/photoshop/",
+        "/lightroom/",
+        "/resize",
+    ];
+    KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
 fn configure_connection(conn: &Connection) -> DbResult<()> {
@@ -4729,5 +5308,358 @@ mod tests {
         assert_eq!(eq2.resolved_count, 5);
         assert_eq!(eq2.unresolved_count, 0);
         assert_eq!(eq2.min_mm, Some(35.0));
+    }
+
+    #[test]
+    fn links_retouched_jpegs_safely_with_fail_closed_guards() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("h1", "Host", "windows").unwrap();
+        let hot = StorageConfig {
+            id: "ssd_hot".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Ssd,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        let nas = StorageConfig {
+            id: "nas_bak".into(),
+            root: PathBuf::from(r"\\eagle\photos"),
+            media: MediaType::Nas,
+            tier: StorageTier::Backup,
+            access_mode: AccessMode::ReadOnly,
+            backup_mode: BackupMode::External,
+            failure_domain: Some("eagle".into()),
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&hot, "h1", StorageStatus::Online).unwrap();
+        db.upsert_storage(&nas, "h1", StorageStatus::Offline).unwrap();
+        let run_h = db.start_scan_run("ssd_hot", "full").unwrap();
+        let run_n = db.start_scan_run("nas_bak", "full").unwrap();
+
+        #[allow(clippy::too_many_arguments)]
+        let mk = |sid: &str,
+                  rel: &str,
+                  ext: &str,
+                  mk_kind: MediaKind,
+                  fmt: &str,
+                  role: FileRole,
+                  hash: &str,
+                  ts: &str,
+                  subsec: Option<&str>,
+                  cam: Option<&str>,
+                  serial: Option<&str>,
+                  w: Option<i64>,
+                  h: Option<i64>| UpsertFileInput {
+            storage_id: sid.into(),
+            rel_path: rel.into(),
+            file_name: rel.rsplit('/').next().unwrap().into(),
+            file_stem: rel
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .rsplit_once('.')
+                .unwrap()
+                .0
+                .into(),
+            ext: ext.into(),
+            byte_size: 2000,
+            mtime_ns: 1,
+            ctime_ns: None,
+            media_kind: mk_kind,
+            format: fmt.into(),
+            role,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: Some(ExtractedMetadata {
+                extractor: "native".into(),
+                captured_at: Some(ts.into()),
+                captured_subsec: subsec.map(String::from),
+                camera_model: cam.map(String::from),
+                camera_serial: serial.map(String::from),
+                width: w,
+                height: h,
+                ..Default::default()
+            }),
+        };
+
+        // Originals on NAS (offline backup!)
+        db.upsert_scanned_batch(
+            &[
+                // 1. Single RAW shot with leading-zero serial
+                mk(
+                    "nas_bak",
+                    "2025/2025_11_03/1M5A1060.CR3",
+                    ".cr3",
+                    MediaKind::Raw,
+                    "cr3",
+                    FileRole::Backup,
+                    "h_raw1",
+                    "2025-11-03T10:00:01",
+                    Some("20"),
+                    Some("Canon EOS R5m2"),
+                    Some("0310112080"),
+                    Some(8192),
+                    Some(5464),
+                ),
+                // 2. Burst of 2 RAWs in the same second (different subsec)
+                mk(
+                    "nas_bak",
+                    "2025/2025_11_03/1M5A1061.CR3",
+                    ".cr3",
+                    MediaKind::Raw,
+                    "cr3",
+                    FileRole::Backup,
+                    "h_raw2a",
+                    "2025-11-03T10:00:05",
+                    Some("10"),
+                    Some("Canon EOS R5m2"),
+                    None,
+                    Some(8192),
+                    Some(5464),
+                ),
+                mk(
+                    "nas_bak",
+                    "2025/2025_11_03/1M5A1062.CR3",
+                    ".cr3",
+                    MediaKind::Raw,
+                    "cr3",
+                    FileRole::Backup,
+                    "h_raw2b",
+                    "2025-11-03T10:00:05",
+                    Some("45"),
+                    Some("Canon EOS R5m2"),
+                    None,
+                    Some(8192),
+                    Some(5464),
+                ),
+                // 3. Old 2003 burst of 2 RAWs without subsec
+                mk(
+                    "nas_bak",
+                    "2003/CRW_6525.CRW",
+                    ".crw",
+                    MediaKind::Raw,
+                    "crw",
+                    FileRole::Backup,
+                    "h_raw3a",
+                    "2003-12-07T14:15:06",
+                    None,
+                    Some("Canon EOS 10D"),
+                    None,
+                    None,
+                    None,
+                ),
+                mk(
+                    "nas_bak",
+                    "2003/CRW_6526.CRW",
+                    ".crw",
+                    MediaKind::Raw,
+                    "crw",
+                    FileRole::Backup,
+                    "h_raw3b",
+                    "2003-12-07T14:15:06",
+                    None,
+                    Some("Canon EOS 10D"),
+                    None,
+                    None,
+                    None,
+                ),
+                // 4. JPEG-only original (no RAW)
+                mk(
+                    "nas_bak",
+                    "2004/IMG_9011.JPG",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Backup,
+                    "h_jpg_orig",
+                    "2004-11-12T21:27:45",
+                    None,
+                    Some("Canon EOS 20D"),
+                    None,
+                    Some(3504),
+                    Some(2336),
+                ),
+            ],
+            run_n,
+        )
+        .unwrap();
+
+        // Retouched JPEGs on Windows SSD Hot
+        db.upsert_scanned_batch(
+            &[
+                // A. Lightroom export of 1M5A1060 with stripped leading zero in serial & suffix -Edit
+                mk(
+                    "ssd_hot",
+                    "export/1M5A1060-Edit.jpg",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_exp1",
+                    "2025-11-03T10:00:01",
+                    Some("2"),
+                    Some("Canon EOS R5m2"),
+                    Some("310112080"),
+                    Some(4096),
+                    Some(2732),
+                ),
+                // B. EXIF-stripped (no camera/subsec) renamed wallpaper of 1M5A1060 -> timestamp_unique!
+                mk(
+                    "ssd_hot",
+                    "wallpaper/blue_impulse_4k.jpg",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_exp1_wp",
+                    "2025-11-03T10:00:01",
+                    None,
+                    None,
+                    None,
+                    Some(3840),
+                    Some(2160),
+                ),
+                // C. Renamed burst export disambiguated by subsec='45' -> links to 1M5A1062!
+                mk(
+                    "ssd_hot",
+                    "export/f15_afterburner.jpg",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_exp2b",
+                    "2025-11-03T10:00:05",
+                    Some("45"),
+                    Some("Canon EOS R5m2"),
+                    None,
+                    Some(2048),
+                    Some(1365),
+                ),
+                // D. Different camera at same second -> MUST NOT link!
+                mk(
+                    "ssd_hot",
+                    "download/other_cam.jpg",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_other_cam",
+                    "2025-11-03T10:00:01",
+                    None,
+                    Some("NIKON D3"),
+                    None,
+                    Some(2000),
+                    Some(1333),
+                ),
+                // E. Different subsec at same second -> MUST NOT link!
+                mk(
+                    "ssd_hot",
+                    "2025/2025_11_03/1M5A1099.JPG",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_diff_sub",
+                    "2025-11-03T10:00:01",
+                    Some("88"),
+                    Some("Canon EOS R5m2"),
+                    None,
+                    Some(8192),
+                    Some(5464),
+                ),
+                // F. Genuinely ambiguous 2003 burst wallpaper (no subsec, renamed) -> ambiguous_skipped!
+                mk(
+                    "ssd_hot",
+                    "wallpaper/BlueImpuls_5.jpg",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_ambig",
+                    "2003-12-07T14:15:06",
+                    None,
+                    Some("Canon EOS 10D"),
+                    None,
+                    Some(1280),
+                    Some(1024),
+                ),
+                // G. JPEG-only retouched small copy -> links to 2004/IMG_9011.JPG!
+                mk(
+                    "ssd_hot",
+                    "2004/retouched/IMG_9011_web.jpg",
+                    ".jpg",
+                    MediaKind::Image,
+                    "jpeg",
+                    FileRole::Original,
+                    "h_j2j",
+                    "2004-11-12T21:27:45",
+                    None,
+                    Some("Canon EOS 20D"),
+                    None,
+                    Some(1200),
+                    Some(800),
+                ),
+            ],
+            run_h,
+        )
+        .unwrap();
+
+        let assets_before = db.status().unwrap().total_assets;
+
+        // Dry-run must NOT mutate DB
+        let dry = db
+            .link_derivative_jpegs(&DerivativeLinkOptions {
+                dry_run: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(dry.linked_assets, 4); // A, B, C, G
+        assert_eq!(dry.ambiguous_skipped, 1); // F
+        assert_eq!(db.status().unwrap().total_assets, assets_before);
+
+        // Apply
+        let applied = db
+            .link_derivative_jpegs(&DerivativeLinkOptions::default())
+            .unwrap();
+        assert_eq!(applied.linked_assets, 4);
+        assert_eq!(applied.ambiguous_skipped, 1);
+        assert_eq!(db.status().unwrap().total_assets, assets_before - 4);
+
+        // Verify role='exported' query returns exactly the 4 linked derivatives
+        let exported = db
+            .find(&FindFilter {
+                role: Some("exported".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(exported.len(), 4);
+
+        // Verify 1M5A1060 Asset now holds CR3 + 1M5A1060-Edit.jpg + blue_impulse_4k.jpg
+        let raw1 = db
+            .find(&FindFilter {
+                path_contains: Some("1M5A1060.CR3".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let raw1_aid = raw1[0].asset_id.unwrap();
+        let asset_files = db
+            .find(&FindFilter {
+                asset_id: Some(raw1_aid),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(asset_files.len(), 3);
+        assert!(asset_files.iter().any(|f| f.rel_path == "export/1M5A1060-Edit.jpg" && f.role == "exported"));
+        assert!(asset_files.iter().any(|f| f.rel_path == "wallpaper/blue_impulse_4k.jpg" && f.role == "exported"));
+
+        // Verify idempotency: running again links 0 new assets
+        let second = db
+            .link_derivative_jpegs(&DerivativeLinkOptions::default())
+            .unwrap();
+        assert_eq!(second.linked_assets, 0);
     }
 }

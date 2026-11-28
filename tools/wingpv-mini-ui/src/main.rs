@@ -14,8 +14,8 @@ use wing_photovault_core::model::{AccessMode, BackupMode, HashAlgorithm, MediaTy
 use crate::config_model::{ConfigDraft, LensAliasRow, StorageDraft};
 use crate::runner::{
     build_duplicates_args, build_export_manifest_args, build_find_args, build_import_manifest_args,
-    build_normalize_lenses_args, build_scan_args, build_simple_args, build_stats_args,
-    detect_wingpv_binary, CommandRunner, FindParams, ScanParams,
+    build_link_derivatives_args, build_normalize_lenses_args, build_scan_args, build_simple_args,
+    build_stats_args, detect_wingpv_binary, CommandRunner, FindParams, ScanParams,
 };
 
 fn main() -> eframe::Result<()> {
@@ -799,6 +799,11 @@ impl MiniUiApp {
                 if ui.button("normalize-lenses --dry-run").clicked() {
                     let args =
                         build_normalize_lenses_args(&self.config_path, self.query_json, true);
+                    self.run_cli(ctx, args);
+                }
+                if ui.button("link-derivatives --dry-run").clicked() {
+                    let args =
+                        build_link_derivatives_args(&self.config_path, self.query_json, true);
                     self.run_cli(ctx, args);
                 }
                 if ui.button("duplicates").clicked() {

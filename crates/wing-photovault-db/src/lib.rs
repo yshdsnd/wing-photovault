@@ -6,8 +6,9 @@ pub mod repo;
 
 pub use error::{DbError, DbResult};
 pub use repo::{
-    CameraCropSummary, CopyCandidateRow, Database, DuplicateFileRow, DuplicateFilter,
-    DuplicateGroup, DuplicateReport, ExistingFileSig, FindCursor, FindFilter, FindPage, FindRow,
+    CameraCropSummary, CopyCandidateRow, Database, DerivativeAmbiguousRow, DerivativeLinkOptions,
+    DerivativeLinkReport, DerivativeMatchRow, DuplicateFileRow, DuplicateFilter, DuplicateGroup,
+    DuplicateReport, ExistingFileSig, FindCursor, FindFilter, FindPage, FindRow,
     Focal35DistributionReport, FocalBucketRow, FocalDistributionReport, FocalExactRow,
     GearHistoryReport, GearTimelineRow, LensAliasChange, NormalizeLensesReport, PairReport,
     ScanRunSummary, SeedBenchmarkReport, SidecarLinkReport, StatsFilter, StatsReport, StatusReport,

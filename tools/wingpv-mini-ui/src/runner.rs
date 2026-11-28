@@ -118,6 +118,14 @@ pub fn build_normalize_lenses_args(config_path: &Path, json: bool, dry_run: bool
     args
 }
 
+pub fn build_link_derivatives_args(config_path: &Path, json: bool, dry_run: bool) -> Vec<String> {
+    let mut args = build_simple_args(config_path, json, "link-derivatives");
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    args
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_stats_args(
     config_path: &Path,
@@ -547,6 +555,17 @@ mod tests {
                 "--include-backups",
                 "--limit",
                 "50",
+            ]
+        );
+
+        let deriv_args = build_link_derivatives_args(cfg, false, true);
+        assert_eq!(
+            deriv_args,
+            vec![
+                "--config",
+                r"C:\test\wing-photovault.toml",
+                "link-derivatives",
+                "--dry-run",
             ]
         );
 
