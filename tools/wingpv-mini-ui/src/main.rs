@@ -97,6 +97,7 @@ struct MiniUiApp {
     stats_by_year: bool,
     stats_gear_history: bool,
     stats_cost_per_shot: bool,
+    stats_split_extenders: bool,
     confirm_normalize_apply: bool,
     find_params: FindParams,
 
@@ -151,6 +152,7 @@ impl MiniUiApp {
             stats_by_year: false,
             stats_gear_history: false,
             stats_cost_per_shot: false,
+            stats_split_extenders: false,
             confirm_normalize_apply: false,
             find_params: FindParams::default(),
             scan_params: ScanParams::default(),
@@ -760,6 +762,7 @@ impl MiniUiApp {
             ui.checkbox(&mut self.stats_by_year, "--by-year");
             ui.checkbox(&mut self.stats_gear_history, "--gear-history");
             ui.checkbox(&mut self.stats_cost_per_shot, "--cost-per-shot");
+            ui.checkbox(&mut self.stats_split_extenders, "--split-extenders");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {
@@ -779,6 +782,7 @@ impl MiniUiApp {
                         self.stats_by_year,
                         self.stats_gear_history,
                         self.stats_cost_per_shot,
+                        self.stats_split_extenders,
                     );
                     self.run_cli(ctx, args);
                 }

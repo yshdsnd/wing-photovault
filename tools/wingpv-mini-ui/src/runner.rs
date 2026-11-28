@@ -109,6 +109,7 @@ pub fn build_stats_args(
     by_year: bool,
     gear_history: bool,
     cost_per_shot: bool,
+    split_extenders: bool,
 ) -> Vec<String> {
     let mut args = build_simple_args(config_path, json, "stats");
     if percent {
@@ -122,6 +123,9 @@ pub fn build_stats_args(
     }
     if cost_per_shot {
         args.push("--cost-per-shot".to_string());
+    }
+    if split_extenders {
+        args.push("--split-extenders".to_string());
     }
     args
 }
@@ -442,6 +446,21 @@ mod tests {
                 "json",
                 "normalize-lenses",
                 "--dry-run",
+            ]
+        );
+
+        let stats_args = build_stats_args(cfg, false, true, true, true, true, true);
+        assert_eq!(
+            stats_args,
+            vec![
+                "--config",
+                r"C:\test\wing-photovault.toml",
+                "stats",
+                "--percent",
+                "--by-year",
+                "--gear-history",
+                "--cost-per-shot",
+                "--split-extenders",
             ]
         );
 

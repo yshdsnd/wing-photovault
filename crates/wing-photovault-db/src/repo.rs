@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
 use wing_photovault_core::config::StorageConfig;
-use wing_photovault_core::metadata::resolve_lens_alias;
+use wing_photovault_core::metadata::{resolve_lens_alias, split_lens_extender};
 use wing_photovault_core::model::{
     sidecar_parent_stem, ExtractedMetadata, FileRole, HashAlgorithm, MediaKind, ScanManifestRecord,
     StorageStatus,
@@ -1166,6 +1166,10 @@ impl Database {
     }
 
     pub fn stats(&self) -> DbResult<StatsReport> {
+        self.stats_with_options(false)
+    }
+
+    pub fn stats_with_options(&self, split_extenders: bool) -> DbResult<StatsReport> {
         let st = self.status()?;
 
         let backed_up_contents: i64 = self.conn.query_row(
@@ -1194,13 +1198,44 @@ impl Database {
              LIMIT 30",
         )?;
 
-        let by_lens = self.query_buckets(
-            "SELECT COALESCE(a.lens_model, '(unknown)'), COUNT(DISTINCT a.id), 0
-             FROM assets a
-             GROUP BY COALESCE(a.lens_model, '(unknown)')
-             ORDER BY COUNT(DISTINCT a.id) DESC
-             LIMIT 30",
-        )?;
+        let by_lens = if !split_extenders {
+            self.query_buckets(
+                "SELECT COALESCE(a.lens_model, '(unknown)'), COUNT(DISTINCT a.id), 0
+                 FROM assets a
+                 GROUP BY COALESCE(a.lens_model, '(unknown)')
+                 ORDER BY COUNT(DISTINCT a.id) DESC
+                 LIMIT 30",
+            )?
+        } else {
+            let raw_buckets = self.query_buckets(
+                "SELECT COALESCE(a.lens_model, '(unknown)'), COUNT(DISTINCT a.id), 0
+                 FROM assets a
+                 GROUP BY COALESCE(a.lens_model, '(unknown)')",
+            )?;
+            let mut merged: HashMap<String, i64> = HashMap::new();
+            for b in raw_buckets {
+                if b.label == "(unknown)" {
+                    *merged.entry(b.label).or_insert(0) += b.count;
+                } else {
+                    let (parent, ext) = split_lens_extender(&b.label);
+                    *merged.entry(parent).or_insert(0) += b.count;
+                    if let Some(ext_name) = ext {
+                        *merged.entry(ext_name).or_insert(0) += b.count;
+                    }
+                }
+            }
+            let mut rows: Vec<BucketCount> = merged
+                .into_iter()
+                .map(|(label, count)| BucketCount {
+                    label,
+                    count,
+                    total_bytes: 0,
+                })
+                .collect();
+            rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+            rows.truncate(30);
+            rows
+        };
 
         Ok(StatsReport {
             total_assets: st.total_assets,
@@ -1218,6 +1253,10 @@ impl Database {
     /// Yearly asset counts, active shooting days, and top camera/lens per year.
     /// Malformed EXIF timestamps (e.g. `0000-...`) or NULL are grouped into `(unknown)`.
     pub fn stats_by_year(&self) -> DbResult<Vec<YearStatsRow>> {
+        self.stats_by_year_with_options(false)
+    }
+
+    pub fn stats_by_year_with_options(&self, split_extenders: bool) -> DbResult<Vec<YearStatsRow>> {
         const YEAR_EXPR: &str = "CASE WHEN captured_at IS NOT NULL AND length(captured_at) >= 10 \
              AND substr(captured_at, 1, 4) >= '1970' AND substr(captured_at, 1, 4) <= '2999' \
              THEN substr(captured_at, 1, 4) ELSE '(unknown)' END";
@@ -1278,16 +1317,36 @@ impl Database {
             let rows = stmt.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             })?;
-            for row in rows {
-                let (yr, lens, cnt) = row?;
-                let replace = match top_lens_by_year.get(&yr) {
-                    None => true,
-                    Some((prev_name, prev_cnt)) => {
-                        cnt > *prev_cnt || (cnt == *prev_cnt && lens < *prev_name)
+            if !split_extenders {
+                for row in rows {
+                    let (yr, lens, cnt) = row?;
+                    let replace = match top_lens_by_year.get(&yr) {
+                        None => true,
+                        Some((prev_name, prev_cnt)) => {
+                            cnt > *prev_cnt || (cnt == *prev_cnt && lens < *prev_name)
+                        }
+                    };
+                    if replace {
+                        top_lens_by_year.insert(yr, (lens, cnt));
                     }
-                };
-                if replace {
-                    top_lens_by_year.insert(yr, (lens, cnt));
+                }
+            } else {
+                let mut counts: HashMap<(String, String), i64> = HashMap::new();
+                for row in rows {
+                    let (yr, lens, cnt) = row?;
+                    let (parent, _) = split_lens_extender(&lens);
+                    *counts.entry((yr, parent)).or_insert(0) += cnt;
+                }
+                for ((yr, lens), cnt) in counts {
+                    let replace = match top_lens_by_year.get(&yr) {
+                        None => true,
+                        Some((prev_name, prev_cnt)) => {
+                            cnt > *prev_cnt || (cnt == *prev_cnt && lens < *prev_name)
+                        }
+                    };
+                    if replace {
+                        top_lens_by_year.insert(yr, (lens, cnt));
+                    }
                 }
             }
         }
@@ -1311,6 +1370,10 @@ impl Database {
     /// Chronological camera and lens usage timeline (`first_captured`..`last_captured`,
     /// total assets, active shooting days, and most frequent partner lens/camera).
     pub fn gear_history(&self) -> DbResult<GearHistoryReport> {
+        self.gear_history_with_options(false)
+    }
+
+    pub fn gear_history_with_options(&self, split_extenders: bool) -> DbResult<GearHistoryReport> {
         const VALID_DAY: &str = "CASE WHEN captured_at IS NOT NULL AND length(captured_at) >= 10 \
              AND substr(captured_at, 1, 4) >= '1970' AND substr(captured_at, 1, 4) <= '2999' \
              THEN substr(captured_at, 1, 10) ELSE NULL END";
@@ -1328,25 +1391,63 @@ impl Database {
             let rows = stmt.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             })?;
-            for row in rows {
-                let (cam, lens, cnt) = row?;
-                let update_cam = match top_lens_for_cam.get(&cam) {
-                    None => true,
-                    Some((prev_name, prev_cnt)) => {
-                        cnt > *prev_cnt || (cnt == *prev_cnt && lens < *prev_name)
+            if !split_extenders {
+                for row in rows {
+                    let (cam, lens, cnt) = row?;
+                    let update_cam = match top_lens_for_cam.get(&cam) {
+                        None => true,
+                        Some((prev_name, prev_cnt)) => {
+                            cnt > *prev_cnt || (cnt == *prev_cnt && lens < *prev_name)
+                        }
+                    };
+                    if update_cam {
+                        top_lens_for_cam.insert(cam.clone(), (lens.clone(), cnt));
                     }
-                };
-                if update_cam {
-                    top_lens_for_cam.insert(cam.clone(), (lens.clone(), cnt));
+                    let update_lens = match top_cam_for_lens.get(&lens) {
+                        None => true,
+                        Some((prev_name, prev_cnt)) => {
+                            cnt > *prev_cnt || (cnt == *prev_cnt && cam < *prev_name)
+                        }
+                    };
+                    if update_lens {
+                        top_cam_for_lens.insert(lens, (cam, cnt));
+                    }
                 }
-                let update_lens = match top_cam_for_lens.get(&lens) {
-                    None => true,
-                    Some((prev_name, prev_cnt)) => {
-                        cnt > *prev_cnt || (cnt == *prev_cnt && cam < *prev_name)
+            } else {
+                let mut cam_parent_counts: HashMap<(String, String), i64> = HashMap::new();
+                let mut lens_cam_counts: HashMap<(String, String), i64> = HashMap::new();
+                for row in rows {
+                    let (cam, lens, cnt) = row?;
+                    let (parent, ext) = split_lens_extender(&lens);
+                    *cam_parent_counts
+                        .entry((cam.clone(), parent.clone()))
+                        .or_insert(0) += cnt;
+                    *lens_cam_counts.entry((parent, cam.clone())).or_insert(0) += cnt;
+                    if let Some(ext_name) = ext {
+                        *lens_cam_counts.entry((ext_name, cam)).or_insert(0) += cnt;
                     }
-                };
-                if update_lens {
-                    top_cam_for_lens.insert(lens, (cam, cnt));
+                }
+                for ((cam, lens), cnt) in cam_parent_counts {
+                    let update_cam = match top_lens_for_cam.get(&cam) {
+                        None => true,
+                        Some((prev_name, prev_cnt)) => {
+                            cnt > *prev_cnt || (cnt == *prev_cnt && lens < *prev_name)
+                        }
+                    };
+                    if update_cam {
+                        top_lens_for_cam.insert(cam, (lens, cnt));
+                    }
+                }
+                for ((lens, cam), cnt) in lens_cam_counts {
+                    let update_lens = match top_cam_for_lens.get(&lens) {
+                        None => true,
+                        Some((prev_name, prev_cnt)) => {
+                            cnt > *prev_cnt || (cnt == *prev_cnt && cam < *prev_name)
+                        }
+                    };
+                    if update_lens {
+                        top_cam_for_lens.insert(lens, (cam, cnt));
+                    }
                 }
             }
         }
@@ -1387,7 +1488,7 @@ impl Database {
         }
 
         let mut lenses = Vec::new();
-        {
+        if !split_extenders {
             let sql = format!(
                 "SELECT lens_model, COUNT(*), COUNT(DISTINCT {VALID_DAY}),
                         MIN({VALID_DAY}), MAX({VALID_DAY})
@@ -1419,6 +1520,74 @@ impl Database {
                     top_partner,
                 });
             }
+        } else {
+            #[derive(Default)]
+            struct SplitLensAgg {
+                assets: i64,
+                days: HashSet<String>,
+                first: Option<String>,
+                last: Option<String>,
+            }
+            impl SplitLensAgg {
+                fn add(&mut self, day: Option<&str>, cnt: i64) {
+                    self.assets += cnt;
+                    if let Some(d) = day {
+                        self.days.insert(d.to_string());
+                        if self.first.as_deref().is_none_or(|f| d < f) {
+                            self.first = Some(d.to_string());
+                        }
+                        if self.last.as_deref().is_none_or(|l| d > l) {
+                            self.last = Some(d.to_string());
+                        }
+                    }
+                }
+            }
+
+            let sql = format!(
+                "SELECT lens_model, {VALID_DAY} AS d, COUNT(*)
+                 FROM assets
+                 WHERE lens_model IS NOT NULL
+                 GROUP BY lens_model, d"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut aggs: HashMap<String, SplitLensAgg> = HashMap::new();
+            for row in rows {
+                let (lens_raw, day_opt, cnt) = row?;
+                let (parent, ext) = split_lens_extender(&lens_raw);
+                aggs.entry(parent).or_default().add(day_opt.as_deref(), cnt);
+                if let Some(ext_name) = ext {
+                    aggs.entry(ext_name)
+                        .or_default()
+                        .add(day_opt.as_deref(), cnt);
+                }
+            }
+
+            for (name, agg) in aggs {
+                let top_partner = top_cam_for_lens.remove(&name).map(|(p, _)| p);
+                lenses.push(GearTimelineRow {
+                    name,
+                    assets: agg.assets,
+                    active_days: agg.days.len() as i64,
+                    first_captured: agg.first,
+                    last_captured: agg.last,
+                    top_partner,
+                });
+            }
+            lenses.sort_by(|a, b| {
+                a.first_captured
+                    .is_none()
+                    .cmp(&b.first_captured.is_none())
+                    .then_with(|| a.first_captured.cmp(&b.first_captured))
+                    .then_with(|| b.assets.cmp(&a.assets))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
         }
 
         Ok(GearHistoryReport { cameras, lenses })
@@ -3050,5 +3219,133 @@ mod tests {
         assert_eq!(videos.len(), 1);
         assert_eq!(videos[0].duration_ms, Some(12_340));
         assert_eq!(videos[0].fps, Some(59.94));
+    }
+
+    #[test]
+    fn stats_and_gear_history_split_extenders_counts_parent_and_extender() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_host("pc", "PC", "windows").unwrap();
+        let st = StorageConfig {
+            id: "ssd_hot".into(),
+            root: PathBuf::from(r"G:\Photos"),
+            media: MediaType::Nvme,
+            tier: StorageTier::Hot,
+            access_mode: AccessMode::Managed,
+            backup_mode: BackupMode::None,
+            failure_domain: None,
+            exclude_paths: vec![],
+        };
+        db.upsert_storage(&st, "pc", StorageStatus::Online).unwrap();
+        let run1 = db.start_scan_run(&st.id, "incremental").unwrap();
+
+        let make = |name: &str, hash: &str, captured: &str, cam: &str, lens: &str| UpsertFileInput {
+            storage_id: st.id.clone(),
+            rel_path: format!("2025/{name}"),
+            file_name: name.into(),
+            file_stem: name.trim_end_matches(".CR3").into(),
+            ext: ".cr3".into(),
+            byte_size: 1000,
+            mtime_ns: 100,
+            ctime_ns: None,
+            media_kind: MediaKind::Raw,
+            format: "cr3".into(),
+            role: FileRole::Original,
+            hash_algo: HashAlgorithm::Blake3,
+            hash_hex: hash.into(),
+            partial_hash: None,
+            metadata: Some(ExtractedMetadata {
+                extractor: "native-cr3".into(),
+                captured_at: Some(captured.into()),
+                camera_model: Some(cam.into()),
+                lens_model_raw: Some(lens.into()),
+                lens_model: Some(lens.into()),
+                ..Default::default()
+            }),
+        };
+
+        let items = vec![
+            // Same day (2025-05-01): bare RF100-500 + RF100-500 with RF1.4x (active_days should deduplicate to 1!)
+            make(
+                "IMG_1.CR3",
+                "h1",
+                "2025-05-01T10:00:00",
+                "Canon EOS R5m2",
+                "RF100-500mm F4.5-7.1 L IS USM",
+            ),
+            make(
+                "IMG_2.CR3",
+                "h2",
+                "2025-05-01T11:00:00",
+                "Canon EOS R5m2",
+                "RF100-500mm F4.5-7.1 L IS USM + EXTENDER RF1.4x",
+            ),
+            // Next day: RF200-800 with RF1.4x
+            make(
+                "IMG_3.CR3",
+                "h3",
+                "2025-05-02T09:00:00",
+                "Canon EOS R5",
+                "RF200-800mm F6.3-9 IS USM + EXTENDER RF1.4x",
+            ),
+            // EF lens with shorthand +1.4x III
+            make(
+                "IMG_4.CR3",
+                "h4",
+                "2025-05-03T09:00:00",
+                "Canon EOS 7D Mark II",
+                "EF100-400mm f/4.5-5.6L IS II USM +1.4x III",
+            ),
+        ];
+        db.upsert_scanned_batch(&items, run1).unwrap();
+
+        // Default (non-split) keeps combined lens names distinct
+        let plain = db.stats().unwrap();
+        assert_eq!(plain.by_lens.len(), 4);
+
+        // Split mode credits both parent lens and extender
+        let split = db.stats_with_options(true).unwrap();
+        let count_of = |label: &str| {
+            split
+                .by_lens
+                .iter()
+                .find(|b| b.label == label)
+                .map(|b| b.count)
+                .unwrap_or(0)
+        };
+        assert_eq!(count_of("RF100-500mm F4.5-7.1 L IS USM"), 2);
+        assert_eq!(count_of("EXTENDER RF1.4x"), 2);
+        assert_eq!(count_of("RF200-800mm F6.3-9 IS USM"), 1);
+        assert_eq!(count_of("EF100-400mm f/4.5-5.6L IS II USM"), 1);
+        assert_eq!(count_of("EXTENDER EF1.4x III"), 1);
+
+        // Year stats picks merged parent lens as top_lens for 2025
+        let yearly = db.stats_by_year_with_options(true).unwrap();
+        assert_eq!(yearly.len(), 1);
+        assert_eq!(
+            yearly[0].top_lens.as_deref(),
+            Some("RF100-500mm F4.5-7.1 L IS USM")
+        );
+
+        // Gear history deduplicates active_days for RF100-500 (still 1 day, not 2!)
+        // and spans EXTENDER RF1.4x across both days (2025-05-01..2025-05-02, 2 days)
+        let gh = db.gear_history_with_options(true).unwrap();
+        let rf100 = gh
+            .lenses
+            .iter()
+            .find(|l| l.name == "RF100-500mm F4.5-7.1 L IS USM")
+            .unwrap();
+        assert_eq!(rf100.assets, 2);
+        assert_eq!(rf100.active_days, 1);
+        assert_eq!(rf100.top_partner.as_deref(), Some("Canon EOS R5m2"));
+
+        let ext14 = gh
+            .lenses
+            .iter()
+            .find(|l| l.name == "EXTENDER RF1.4x")
+            .unwrap();
+        assert_eq!(ext14.assets, 2);
+        assert_eq!(ext14.active_days, 2);
+        assert_eq!(ext14.first_captured.as_deref(), Some("2025-05-01"));
+        assert_eq!(ext14.last_captured.as_deref(), Some("2025-05-02"));
     }
 }

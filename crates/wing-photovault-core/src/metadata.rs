@@ -202,6 +202,85 @@ pub fn apply_lens_aliases(meta: &mut ExtractedMetadata, aliases: &HashMap<String
     }
 }
 
+/// Split a combined lens + teleconverter string into `(parent_lens, Option<extender>)`.
+///
+/// Examples:
+/// - `"RF100-500mm F4.5-7.1 L IS USM + EXTENDER RF1.4x"` -> `("RF100-500mm F4.5-7.1 L IS USM", Some("EXTENDER RF1.4x"))`
+/// - `"EF100-400mm f/4.5-5.6L IS II USM +1.4x III"` -> `("EF100-400mm f/4.5-5.6L IS II USM", Some("EXTENDER EF1.4x III"))`
+/// - `"60-600mm F4.5-6.3 DG OS HSM | Sports 018 +2x"` -> `("60-600mm F4.5-6.3 DG OS HSM | Sports 018", Some("Teleconverter 2x"))`
+/// - `"RF24-70mm F2.8 L IS USM"` -> `("RF24-70mm F2.8 L IS USM", None)`
+pub fn split_lens_extender(lens: &str) -> (String, Option<String>) {
+    let trimmed = lens.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+
+    let split = trimmed
+        .rsplit_once(" + ")
+        .or_else(|| trimmed.rsplit_once(" +"));
+
+    if let Some((left, right)) = split {
+        let parent = left.trim();
+        let ext_raw = right.trim();
+        if !parent.is_empty() && !ext_raw.is_empty() && is_extender_token(ext_raw) {
+            return (
+                parent.to_string(),
+                Some(normalize_extender_name(parent, ext_raw)),
+            );
+        }
+    }
+
+    (trimmed.to_string(), None)
+}
+
+fn is_extender_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("extender") || lower.starts_with("teleconverter") {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("tc") {
+        if rest.is_empty()
+            || rest.starts_with(' ')
+            || rest.starts_with('-')
+            || rest.starts_with(|c: char| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    let mult_candidate = lower
+        .strip_prefix("rf")
+        .or_else(|| lower.strip_prefix("ef"))
+        .unwrap_or(&lower)
+        .trim_start();
+    [
+        "1.4x", "1.4×", "1.7x", "1.7×", "2x", "2.0x", "2×", "2.0×",
+    ]
+    .iter()
+    .any(|prefix| mult_candidate.starts_with(prefix))
+}
+
+fn normalize_extender_name(parent: &str, ext_raw: &str) -> String {
+    let lower = ext_raw.to_ascii_lowercase();
+    if lower.starts_with("extender")
+        || lower.starts_with("teleconverter")
+        || lower.starts_with("tc")
+    {
+        return ext_raw.to_string();
+    }
+    if lower.starts_with("rf") || lower.starts_with("ef") {
+        return format!("EXTENDER {ext_raw}");
+    }
+
+    let parent_upper = parent.to_ascii_uppercase();
+    if parent_upper.starts_with("RF") || parent_upper.starts_with("CANON RF") {
+        format!("EXTENDER RF{ext_raw}")
+    } else if parent_upper.starts_with("EF") || parent_upper.starts_with("CANON EF") {
+        format!("EXTENDER EF{ext_raw}")
+    } else {
+        format!("Teleconverter {ext_raw}")
+    }
+}
+
 /// Fast Rust-native EXIF extraction for JPEG, CR2/TIFF, Canon CR3 (ISOBMFF CMT1/CMT2),
 /// and Canon CRW via companion `.THM` (standard JPEG EXIF sidecar).
 pub fn extract_native(path: &Path, ext: &str) -> Option<ExtractedMetadata> {
@@ -1043,5 +1122,59 @@ mod tests {
         apply_lens_aliases(&mut meta, &HashMap::new());
         assert_eq!(meta.lens_model_raw.as_deref(), Some("Unknown 100-400mm"));
         assert_eq!(meta.lens_model.as_deref(), Some("Unknown 100-400mm"));
+    }
+
+    #[test]
+    fn splits_lens_and_extender_variants_cleanly() {
+        assert_eq!(
+            split_lens_extender("RF100-500mm F4.5-7.1 L IS USM + EXTENDER RF1.4x"),
+            (
+                "RF100-500mm F4.5-7.1 L IS USM".to_string(),
+                Some("EXTENDER RF1.4x".to_string())
+            )
+        );
+        assert_eq!(
+            split_lens_extender("RF200-800mm F6.3-9 IS USM + EXTENDER RF2x"),
+            (
+                "RF200-800mm F6.3-9 IS USM".to_string(),
+                Some("EXTENDER RF2x".to_string())
+            )
+        );
+        assert_eq!(
+            split_lens_extender("EF100-400mm f/4.5-5.6L IS II USM +1.4x III"),
+            (
+                "EF100-400mm f/4.5-5.6L IS II USM".to_string(),
+                Some("EXTENDER EF1.4x III".to_string())
+            )
+        );
+        assert_eq!(
+            split_lens_extender("EF100-400mm f/4.5-5.6L IS II USM +2x III"),
+            (
+                "EF100-400mm f/4.5-5.6L IS II USM".to_string(),
+                Some("EXTENDER EF2x III".to_string())
+            )
+        );
+        assert_eq!(
+            split_lens_extender("EF100-400mm f/4.5-5.6L IS USM +1.4x"),
+            (
+                "EF100-400mm f/4.5-5.6L IS USM".to_string(),
+                Some("EXTENDER EF1.4x".to_string())
+            )
+        );
+        assert_eq!(
+            split_lens_extender("60-600mm F4.5-6.3 DG OS HSM | Sports 018 +2x"),
+            (
+                "60-600mm F4.5-6.3 DG OS HSM | Sports 018".to_string(),
+                Some("Teleconverter 2x".to_string())
+            )
+        );
+        assert_eq!(
+            split_lens_extender("RF24-70mm F2.8 L IS USM"),
+            ("RF24-70mm F2.8 L IS USM".to_string(), None)
+        );
+        assert_eq!(
+            split_lens_extender("Some Lens + Hood"),
+            ("Some Lens + Hood".to_string(), None)
+        );
     }
 }

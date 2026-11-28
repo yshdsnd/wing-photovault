@@ -144,6 +144,10 @@ enum Commands {
         /// Show cost per shot for cameras/lenses configured in [stats.camera_prices] / [stats.lens_prices]
         #[arg(long)]
         cost_per_shot: bool,
+
+        /// Split lens + teleconverter entries (e.g. "+ EXTENDER RF1.4x") so both parent lens and extender are counted
+        #[arg(long)]
+        split_extenders: bool,
     },
 
     /// Search indexed files
@@ -231,6 +235,7 @@ fn main() -> Result<()> {
             by_year,
             gear_history,
             cost_per_shot,
+            split_extenders,
         } => cmd_stats(
             &cli.config,
             StatsOpts {
@@ -238,6 +243,7 @@ fn main() -> Result<()> {
                 show_by_year: by_year,
                 show_gear_history: gear_history,
                 show_cost_per_shot: cost_per_shot,
+                split_extenders,
             },
             cli.format,
         ),
@@ -1201,6 +1207,7 @@ struct StatsOpts {
     show_by_year: bool,
     show_gear_history: bool,
     show_cost_per_shot: bool,
+    split_extenders: bool,
 }
 
 fn calc_percent(part: i64, total: i64) -> f64 {
@@ -1315,7 +1322,11 @@ fn format_stats_text(
         let _ = writeln!(out, "  - {:<32} {:>8}{}{}", b.label, b.count, pct_col, cost_col);
     }
 
-    let _ = writeln!(out, "\nBy Lens (Assets):");
+    if opts.split_extenders {
+        let _ = writeln!(out, "\nBy Lens (Assets, split extenders):");
+    } else {
+        let _ = writeln!(out, "\nBy Lens (Assets):");
+    }
     for b in &report.by_lens {
         let pct_col = if show_percent {
             format!("  ({:>6.2}%)", calc_percent(b.count, report.total_assets))
@@ -1378,7 +1389,11 @@ fn format_stats_text(
             );
         }
 
-        let _ = writeln!(out, "\nLens Timeline (by first capture):");
+        if opts.split_extenders {
+            let _ = writeln!(out, "\nLens Timeline (by first capture, split extenders):");
+        } else {
+            let _ = writeln!(out, "\nLens Timeline (by first capture):");
+        }
         for l in &gh.lenses {
             let span = format!(
                 "{} .. {}",
@@ -1464,20 +1479,21 @@ fn format_stats_text(
 fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Result<()> {
     let cfg = load_config_or_default(config_path)?;
     let db = Database::open(&cfg.general.db_path)?;
-    let report = db.stats()?;
+    let report = db.stats_with_options(opts.split_extenders)?;
     let by_year = if opts.show_by_year {
-        Some(db.stats_by_year()?)
+        Some(db.stats_by_year_with_options(opts.split_extenders)?)
     } else {
         None
     };
     let gear_history = if opts.show_gear_history {
-        Some(db.gear_history()?)
+        Some(db.gear_history_with_options(opts.split_extenders)?)
     } else {
         None
     };
 
     let show_percent = opts.show_percent;
     let show_cost = opts.show_cost_per_shot;
+    let split_extenders = opts.split_extenders;
     let currency = if cfg.stats.currency.trim().is_empty() {
         "JPY"
     } else {
@@ -1486,7 +1502,12 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
 
     match format {
         OutputFormat::Json | OutputFormat::Jsonl => {
-            if !show_percent && !show_cost && by_year.is_none() && gear_history.is_none() {
+            if !show_percent
+                && !show_cost
+                && !split_extenders
+                && by_year.is_none()
+                && gear_history.is_none()
+            {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 #[derive(Serialize)]
@@ -1551,6 +1572,8 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                     backed_up_percent: Option<f64>,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     currency: Option<&'a str>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    split_extenders: Option<bool>,
                     by_format: Vec<FormatBucketJson<'a>>,
                     by_camera: Vec<AssetBucketJson<'a>>,
                     by_lens: Vec<AssetBucketJson<'a>>,
@@ -1574,6 +1597,7 @@ fn cmd_stats(config_path: &Path, opts: StatsOpts, format: OutputFormat) -> Resul
                         ))
                     }),
                     currency: show_cost.then_some(currency),
+                    split_extenders: split_extenders.then_some(true),
                     by_format: report
                         .by_format
                         .iter()
@@ -2363,17 +2387,19 @@ backup_mode = "external"
                 show_by_year: true,
                 show_gear_history: true,
                 show_cost_per_shot: true,
+                split_extenders: true,
             },
         );
         assert!(with_pct.contains("Backed-up Contents: 150 / 200 (75.00%)"));
         assert!(with_pct.contains("50.00%"));
         assert!(with_pct.contains("80.00%"));
         assert!(with_pct.contains("75.00%)"));
+        assert!(with_pct.contains("By Lens (Assets, split extenders):"));
         assert!(with_pct.contains("By Year (Assets):"));
         assert!(with_pct.contains("2025"));
         assert!(with_pct.contains("Camera Timeline (by first capture):"));
         assert!(with_pct.contains("2025-01-05 .. 2025-11-20"));
-        assert!(with_pct.contains("Lens Timeline (by first capture):"));
+        assert!(with_pct.contains("Lens Timeline (by first capture, split extenders):"));
         assert!(with_pct.contains("[8000 JPY/shot]"));
         assert!(with_pct.contains("[7200 JPY/shot]"));
         assert!(with_pct.contains("Cost Per Shot Summary (JPY):"));
